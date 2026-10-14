@@ -30,7 +30,9 @@ def run(blocks, env):
             if py or y == 0: raise UB('除数为 0 或毒值')
             outs = [(x // y, px)]
         elif op == 'arith.cmpi':
-            (x, px), (y, py) = a; outs = [(int(x < y), px or py)]
+            (x, px), (y, py) = a; sx, sy = [v - C.M if v >= C.M // 2 else v for v in (x, y)]
+            rel = [x == y, x != y, sx < sy, sx <= sy, sx > sy, sx >= sy, x < y, x <= y, x > y, x >= y]
+            outs = [(int(rel[p['predicate']]), px or py)]
         elif op == 'arith.select':
             (c, pc), (x, px), (y, py) = a; outs = [(x if c else y, pc or (px if c else py))]
         else:
@@ -72,10 +74,10 @@ def gen_block(rng, pfx, pool, comps, depth, uid):
         elif r < 0.6: v = fresh(); ops.append(op2(v, 'arith.divui', pick(), pick())); pool.append(v)
         elif r < 0.7:
             c, v = fresh(), fresh()
-            ops += [op2(c, 'arith.cmpi', pick(), pick(), 'i1'), node(v, 'arith.select', ins=[c, pick(), pick()], outs=[(v, I3)])]
+            ops += [op2(c, 'arith.cmpi', pick(), pick(), 'i1', predicate=rng.randrange(10)), node(v, 'arith.select', ins=[c, pick(), pick()], outs=[(v, I3)])]
             pool.append(v)
         elif r < 0.85 and depth > 0:
-            c, v = fresh(), fresh(); ops.append(op2(c, 'arith.cmpi', pick(), pick(), 'i1'))
+            c, v = fresh(), fresh(); ops.append(op2(c, 'arith.cmpi', pick(), pick(), 'i1', predicate=rng.randrange(10)))
             regs = []
             for side in 'te':
                 bo, bp = gen_block(rng, f'{pfx}{side}{uid[0]}_', list(pool), comps, depth - 1, uid)
@@ -132,7 +134,7 @@ def X2():
     """编辑操作“提取为复合 op”保持语义：if 分支里用到外层值 x（捕获）→ 自动提升为端口（L3）。"""
     def host():
         return [blk('entry', [
-            cst('one', 1), op2('c', 'arith.cmpi', 'one', 'b', 'i1'),
+            cst('one', 1), op2('c', 'arith.cmpi', 'one', 'b', 'i1', predicate=6),
             node('if', 'scf.if', ins=['c'], outs=[('r', I3)], regions=[
                 [blk('t', [op2('s', 'arith.addi', 'x', 'b', nuw=True), op2('d', 'arith.divui', 's', 'b'),
                            node('y1', 'scf.yield', ins=['d'])])],
@@ -148,7 +150,7 @@ def X2():
 def X3():
     """caps 逐层派生：g = b≠0 ? a/b : 0。g 本身在非毒值输入上可推测，体内的 divui 不可以；毒值输入下 g 也不可推测。"""
     g = derive('X3g', [('a', I3), ('b', I3)], [('q', I3)],
-               [blk('entry', [cst('z', 0), op2('c', 'arith.cmpi', 'z', 'b', 'i1'),
+               [blk('entry', [cst('z', 0), op2('c', 'arith.cmpi', 'z', 'b', 'i1', predicate=6),
                               node('if', 'scf.if', ins=['c'], outs=[('r', I3)], regions=[
                                   [blk('t', [op2('d', 'arith.divui', 'a', 'b'), node('y1', 'scf.yield', ins=['d'])])],
                                   [blk('e', [node('y2', 'scf.yield', ins=['z'])])]]),
@@ -162,7 +164,7 @@ def X4():
         ops = [node('m', 'memref.alloc', outs=[('m', 'memref')]), node('st', 'memref.store', ins=['x', 'm']),
                node('ld', 'memref.load', ins=['m'], outs=[('l', I3)])]
         tb = [node('fr', 'memref.dealloc', ins=['m'])] if free_in_branch else []
-        ops += [cst('one', 1), op2('c', 'arith.cmpi', 'one', 'x', 'i1'),
+        ops += [cst('one', 1), op2('c', 'arith.cmpi', 'one', 'x', 'i1', predicate=6),
                 node('if', 'scf.if', ins=['c'], outs=[], regions=[[blk('t', tb + [node('y1', 'scf.yield')])],
                                                                     [blk('e', [node('y2', 'scf.yield')])]])]
         if not free_in_branch: ops.append(node('fr', 'memref.dealloc', ins=['m']))
