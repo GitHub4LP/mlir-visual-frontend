@@ -96,6 +96,8 @@ v0 的局限：维度只支持等式（靠合一）；仅涉及内部变量的�
 
 已核实的 MLIR 不一致：tensor.extract_slice 标为 Pure（TensorOps.td），而 verifier 不检查动态越界；tensor.dim 却在索引未知时返回 NotSpeculatable（TensorOps.cpp DimOp::getSpeculatability）。文档没有说明越界切片是 UB 还是毒值。前端的选择是**毒值**，这与 Pure 一致；读取毒值才是 UB。这是语义决定，需要写进 lowering 义务：不能把越界切片降为会立即访问内存的形式。
 
+> 第 6 轮修订（shapes.md L24）：整个 tensor 层改为没有 UB。越界读取也只得到毒值，而不是 UB；UB 只在降低到 MLIR 或 bufferize 之后出现，由降低守卫承担。
+
 ## 9 统一核心 v3（model/core.py + ods_import.py）与真实 MLIR 差分测试
 - ods_import.py 解析继承链。从真实的 ArithOps.td、TensorOps.td 中正确导入了 addi、subi、divui、dim、extract、extract_slice 的参数和 traits。生产实现应改用 llvm-tblgen -dump-json。
 - core.py：Schema 是唯一的数据结构；复合 op 的推导结果仍然是 Schema。x/(a+nuw b) 的嵌套推导与全内联推导，在 2 层和 3 层嵌套下都判定相等。修掉的 bug 写成了 L1、L2（见 frontend-model §5）。
