@@ -23,15 +23,17 @@ class Pattern:
     out: str = I3
 
 # ───────────────────────── 定义期检查
+TY = [I3]          # 检查时的位宽：pattern 按 i3 书写，check(pt, 'i32') 把 i3 换成 i32（Alive 式的逐位宽有界验证）
+def ty(t): return TY[0] if t == I3 else t
 def _build_lhs(t, env, P, ops, fresh):
     if isinstance(t, str): return env[t]
     if t[0] == 'const':
-        v = fresh(); ops.append(C.cst(v, P[t[1]], t[2])); return v
+        v = fresh(); ops.append(C.cst(v, P[t[1]], ty(t[2]))); return v
     op, pr, kids = t
     ins = [_build_lhs(k, env, P, ops, fresh) for k in kids]
     v = fresh(); props = {k: (P[x[1:]] if isinstance(x, str) and x.startswith('$') else x) for k, x in pr.items()}
-    ty = 'i1' if op == 'arith.cmpi' else C.REG[op].outs[0][1]
-    ops.append(node(v, op, ins=ins, outs=[(v, ty)], props=props)); return v
+    oty = 'i1' if op == 'arith.cmpi' else TY[0]
+    ops.append(node(v, op, ins=ins, outs=[(v, oty)], props=props)); return v
 
 def _fresh(pfx):
     c = itertools.count(); return lambda: f'{pfx}{next(c)}'
@@ -39,16 +41,23 @@ def _fresh(pfx):
 def param_domain(p, P):
     """常量参数取 i3 位模式；谓词参数（k…）取 0..9（由 predicate 的种类定义给出，见 defs.py）；标志参数（f…）是布尔。"""
     if p.startswith('f'): return z3.BoolVal(True)
-    return z3.And(P[p] >= 0, P[p] <= (9 if p.startswith('k') else 7))
+    if not p.startswith('k'): return z3.BoolVal(True)
+    return z3.And(P[p] >= 0, P[p] <= 9)
 
-def check(pt):
+def check(pt, width=I3):
     """返回 True / False / None（None = 有效应，降为 D）。"""
-    P = {p: (z3.Bool if p.startswith('f') else z3.Int)(f'{pt.name}.{p}') for p in pt.params}
-    ins = list(pt.vars.items()); env = {v: v for v in pt.vars}
+    TY[0] = width
+    try: return _check(pt)
+    finally: TY[0] = I3
+def _check(pt):
+    # 常量参数用该位宽的位向量（避免 ℤ↔位向量混合，那会让 z3 在 i8 以上卡住）；谓词参数用 ℤ；标志参数用布尔
+    mk = lambda p: z3.Bool(f'{pt.name}.{p}') if p.startswith('f') else z3.Int(f'{pt.name}.{p}') if p.startswith('k') else z3.BitVec(f'{pt.name}.{p}', C.W(TY[0]))
+    P = {p: mk(p) for p in pt.params}
+    ins = [(v, ty(t)) for v, t in pt.vars.items()]; env = {v: v for v in pt.vars}
     lops = []; lr = _build_lhs(pt.lhs, env, P, lops, _fresh('l'))
     rops, rr = pt.rhs(env, P, _fresh('r'))
-    L = C.derive(f'{pt.name}.L', ins, [('q', pt.out)], [blk('entry', lops + [C.ret('lr', lr)], args=ins)])
-    R = C.derive(f'{pt.name}.R', ins, [('q', pt.out)], [blk('entry', rops + [C.ret('rr', rr)], args=ins)])
+    L = C.derive(f'{pt.name}.L', ins, [('q', ty(pt.out))], [blk('entry', lops + [C.ret('lr', lr)], args=ins)])
+    R = C.derive(f'{pt.name}.R', ins, [('q', ty(pt.out))], [blk('entry', rops + [C.ret('rr', rr)], args=ins)])
     pre = z3.And([param_domain(p, P) for p in pt.params] + ([pt.pre(P)] if pt.pre else []))
     return C.refines(L, R, pre)
 
@@ -69,7 +78,7 @@ def match(t, v, D, env, P):
     if n is None: return False
     if t[0] == 'const':
         if n['op'] != 'arith.constant': return False
-        v = n['props']['value'] % 8
+        v = n['props']['value'] % (1 << C.W(n['props'].get('type', I3)))
         if t[1] in P and P[t[1]] != v: return False          # 同名参数须取同一个值
         P[t[1]] = v; return True
     op, pr, kids = t
@@ -186,7 +195,7 @@ def fold(op, consts, props=None):
     return z3.simplify(outs[0][0]).as_long()
 
 # ───────────────────────── 规则库（arith 的一部分规范化，以及几条错误规则做对照）
-def K(i, v, t=I3): return C.cst(i, v, t)
+def K(i, v, t=None): return C.cst(i, v, ty(t or I3))
 def R(i, op, a, b, **p): return C.op2(i, op, a, b, **p)
 PATTERNS = [
     Pattern('add0', {'x': I3}, ['c', 'f'], ('arith.addi', {'nuw': '$f'}, ['x', ('const', 'c', I3)]),
