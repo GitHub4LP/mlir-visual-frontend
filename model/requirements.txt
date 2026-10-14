@@ -1,0 +1,3 @@
+islpy
+mlir-python-bindings  # pip install mlir-python-bindings -f https://makslevental.github.io/wheels
+z3-solver
