@@ -21,14 +21,14 @@
 ## B 类型与属性
 | # | 机制 | 元模型落点 | 强度 | 状态 | 证据或缺口 |
 |---|---|---|---|---|---|
-| 11 | builtin 类型 | 类型项 | E | ◐ | 只在 solver.py；core 只有 i1/i3/memref 名义类型 |
+| 11 | builtin 类型 | 类型项；值层多 sort（iN 位向量、index 为 ℤ） | E | ◐ | core：任意 iN、index；float/vector/tensor 不在 core |
 | 12 | TypeConstraint（211 个具名定义） | 规范化原子 | 190 E / 21 S | ◐ | normalize_types.py，未接入 core |
 | 13 | 用户定义类型（TypeDef、IRDL、ADT） | define_adt：sort + 生成的 op + 生成的降级 | E | ◐ | definitions.md §5；标量字段、≤2 个变体、无递归 |
 | 14 | Attribute（Integer、Dense、Array、Dict、SymbolRef、Type、AffineMap…） | 静态项，按指称存储（L8） | E | ◐ | D1 与 MLIR 600/600；缺 Dense、Float、AffineMap、Dict |
 | 15 | Properties 与可丢弃 attribute 的区分 | 参数进语义，元数据不进；命名空间分离（L9） | E | ✓ | D2 与 MLIR：不可靠 0 |
 | 16 | AttrConstraint、ConfinedAttr、DefaultValued | 参数值域；复合 op 参数约束推导（L10） | E | ◐ | D3 与 MLIR 16/16；复合 op 默认值推导未做 |
 | 17 | Type/Attr interface（ShapedType 等） | 接口 + 实现表（类型上） | E | ◐ | Monoid 示例；ShapedType 未导入 |
-| 18 | DataLayout | 目标参数 | — | ✗ | index 位宽义务依赖它 |
+| 18 | DataLayout | 目标参数（IW） | E | ◐ | core.IW 决定 index 溢出 UB 的界（L17）；其余布局 ✗ |
 
 ## C 签名
 | # | 机制 | 元模型落点 | 强度 | 状态 | 证据或缺口 |
@@ -46,7 +46,7 @@
 | 25 | Resource、Target 细分 | effect 三元组 | S | ◐ | 只有 Default |
 | 26 | AutomaticAllocationScope、alloca | 透明模式自动包 alloca_scope | E | ◐ | 只在规范 |
 | 27 | 下标、extent（slice、pad…） | Presburger 层 | E | ◐ | shape.py、wp.py，未并入 |
-| 28 | 循环（scf.for、LoopLike、scf.while） | isl power 与声明不变式 | E/S | ◐ | for 在 wp.py；while ✗ |
+| 28 | 循环（scf.for、LoopLike、scf.while） | 静态展开 / 按结构命名的 UF 摘要（L18）/ 归纳检查过的不变式（L19） | E/S/D | ◐ | core 已有 scf.for，loops.md；while ✗；isl power 未并入 |
 | 29 | RegionBranchOpInterface | scf.if 守卫 | E | ✓ | core |
 | 30 | Call、Callable | S4；复合 op 调用 = 代换 | E | ◐ | func.call 的值层未建模 |
 | 31 | 递归 | 必须声明签名 | D | ✗ | |
@@ -89,6 +89,6 @@
 | 51 | 增量查询（增量 ≡ 全量） | ✗ | |
 
 ## 小结
-共 52 项：✓ 13，◐ 28，✗ 10，— 1（2026-10-14，变换层 v0 之后）。
-- 剩下的 ✗：数据布局、递归、方言组织（命名空间、版本、IRDL、方言扩展、bytecode）、transform dialect、数据流分析框架、WASM、编辑期增量。
-- 最大的风险已不在“缺机制”，而在两处“部分”：值层只有固定位宽的标量（i3/i1），index/extent/循环层还没并入 core；编辑期增量（判据“增量 ≡ 全量”）完全没做。
+共 52 项：✓ 13，◐ 29，✗ 9，— 1（2026-10-14，位宽与循环层并入 core 之后）。
+- 剩下的 ✗：递归、方言组织（命名空间、版本、IRDL、方言扩展、bytecode）、transform dialect、数据流分析框架、WASM、编辑期增量。
+- 当前最大的缺口：(1) 编辑期增量（判据“增量 ≡ 全量”）完全没做；(2) 形状/extent 层（tensor、memref 的形状，shape.py）还没接到 core 的 index 值上；(3) scf.while 和多块 CFG 的值层。
