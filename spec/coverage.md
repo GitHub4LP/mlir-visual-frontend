@@ -65,12 +65,12 @@
 ## F 变换
 | # | 机制 | 元模型落点 | 强度 | 状态 | 证据或缺口 |
 |---|---|---|---|---|---|
-| 38 | fold | 部分求值 | S | ✗ | |
-| 39 | Canonicalization | 带契约的图变换 | D | ✗ | |
-| 40 | RewritePattern、PDL/PDLL | 同上 + 匹配语义 | D | ✗ | |
+| 38 | fold | 由 Sem 派生（L15），复合 op 也有 | E | ✓ | transform.md；毒值折为 ub.poison |
+| 39 | Canonicalization | pattern 集 + 终止度量（L16） | E | ◐ | 合流未证明；MLIR canonicalize 的翻译确认 3000/3000 |
+| 40 | RewritePattern、PDL/PDLL | pattern = 模板 + 前提 + 构造，定义期符号证明（L13、L14） | E/D | ◐ | 单根 DAG；有效应降为 D；PDL 未导入 |
 | 41 | Transform dialect | 变换脚本 | — | ✗ | |
 | 42 | Pass、PassManager | 管线契约 Sem(g) ⊑ Sem(pipeline(⟦g⟧)) | — | ◐ | difftest 的 LICM 实例 |
-| 43 | DialectConversion、TypeConverter | ⟦·⟧ | — | ◐ | vslice 的手写发射 |
+| 43 | DialectConversion、TypeConverter | 1:N 类型转换 + 抽象函数精化（L11） | E | ◐ | definitions.md §5；合法性目标未建模 |
 | 44 | Inliner interface | 透明模式 + L3/L4/L5 | E | ◐ | inline_all；规则未接入合法性判断 |
 | 45 | DataFlow 分析框架 | 事实分层求解 | — | ✗ | |
 
@@ -89,6 +89,6 @@
 | 51 | 增量查询（增量 ≡ 全量） | ✗ | |
 
 ## 小结
-共 52 项：✓ 12，◐ 26，✗ 13，— 1（2026-10-14，定义层 v0 之后）。
-- 定义层之后，B 与 E 从“缺”变成“部分”。剩下的 ✗ 集中在 **F 变换**（fold、canonicalization、rewrite、transform、数据流分析）和**方言的组织**（命名空间、版本、IRDL、bytecode）。
-- 下一轮做变换层：L12 已经把“定律 = 定向精化”立起来了，pattern 就是一对参数化复合 op 加前提，正确性 = 前提下的精化，可以像 ADT 降级那样在定义期一次性检查。
+共 52 项：✓ 13，◐ 28，✗ 10，— 1（2026-10-14，变换层 v0 之后）。
+- 剩下的 ✗：数据布局、递归、方言组织（命名空间、版本、IRDL、方言扩展、bytecode）、transform dialect、数据流分析框架、WASM、编辑期增量。
+- 最大的风险已不在“缺机制”，而在两处“部分”：值层只有固定位宽的标量（i3/i1），index/extent/循环层还没并入 core；编辑期增量（判据“增量 ≡ 全量”）完全没做。

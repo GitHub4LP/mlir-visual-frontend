@@ -90,6 +90,16 @@ nat('arith.divui', [('lhs', I3), ('rhs', I3)], [('r', I3)], _div)
 nat('arith.cmpi', [('lhs', I3), ('rhs', I3)], [('r', 'i1')], _cmp)
 nat('arith.select', [('c', 'i1'), ('a', I3), ('b', I3)], [('r', I3)], _sel)
 nat('ub.poison', [], [('r', I3)], _poison)
+def _bin(f, ovf=None):
+    def g(p, a):
+        (x, px), (y, py) = a
+        return [(f(x, y), z3.Or(px, py, z3.And(zb(p.get('nuw', False)), ovf(x, y)) if ovf else F_))], F_
+    return g
+nat('arith.muli', [('lhs', I3), ('rhs', I3)], [('r', I3)], _bin(lambda x, y: x * y, lambda x, y: z3.Not(z3.BVMulNoOverflow(x, y, False))))
+nat('arith.andi', [('lhs', I3), ('rhs', I3)], [('r', I3)], _bin(lambda x, y: x & y))
+nat('arith.ori', [('lhs', I3), ('rhs', I3)], [('r', I3)], _bin(lambda x, y: x | y))
+nat('arith.xori', [('lhs', I3), ('rhs', I3)], [('r', I3)], _bin(lambda x, y: x ^ y))
+nat('arith.extui', [('in', 'i1')], [('r', I3)], lambda p, a: ([(z3.ZeroExt(W(p.get('type', 'i3')) - a[0][0].size(), a[0][0]), a[0][1])], F_))
 _ch = itertools.count()
 def _load(p, a): return [(z3.BitVec(f'load{next(_ch)}', 3), F_)], F_        # 读到的内容：非确定（自由变量）
 nat('memref.alloc', [], [('m', 'memref')], lambda p, a: ([(None, F_)], F_), eff={('Allocate', 'Default', 'm')})
@@ -213,14 +223,16 @@ def caps(s):
     return {'Speculatable': spec, 'Speculatable|非毒值输入': prove(z3.Implies(no_poison(s), z3.Not(s.ubf))),
             'Pure': spec and s.eff != TOP and not s.eff}
 
-def refines(src, tgt):
-    """tgt 精化 src（把 src 改写成 tgt 有效）：src 不 UB ⇒ tgt 不 UB；src 输出不是毒值 ⇒ tgt 输出相同且不是毒值。"""
+def refines(src, tgt, assume=True):
+    """tgt 精化 src（把 src 改写成 tgt 有效）：src 不 UB ⇒ tgt 不 UB；src 输出不是毒值 ⇒ tgt 输出相同且不是毒值。
+    只覆盖值层：任一方有效应时返回 None（值层精化不足以说明删改效应是否合法，须声明）。assume：参数的前提。"""
+    if src.eff or tgt.eff: return None
     pairs = [(ht, hs) for xs, xt in zip(src.holes, tgt.holes) for hs, ht in zip(xs, xt) if hs is not None]
     sb = lambda t: z3.substitute(t, pairs) if pairs else t
     conds = [z3.Not(sb(tgt.ubf))]
     for (vs, ps), (vt, pt) in zip(src.outv, tgt.outv):
         conds.append(z3.Implies(z3.Not(ps), z3.And(z3.Not(sb(pt)), *([sb(vt) == vs] if vs is not None else []))))
-    return prove(z3.Implies(z3.Not(src.ubf), z3.And(conds)))
+    return prove(z3.Implies(z3.And(assume, z3.Not(src.ubf)), z3.And(conds)))
 
 def equivalent(a, b):
     """两个 Schema 的值层是否相同（按端口位置对齐）：UB 相同；不 UB 时毒值相同；不是毒值时值相同。"""
