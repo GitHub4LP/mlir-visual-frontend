@@ -3,7 +3,7 @@
   W2 与真实 MLIR 执行的差分：随机程序（i8/i32/i64/index、类型转换、scf.if、静态 scf.for），LLVM JIT 执行 vs 模型求值
   W3 循环摘要（L18）：确定性、嵌套 ≡ 内联、透明模式调用点特化、不透明模式只可靠
   W4 不变式（L19）：归纳检查、收窄 Pre、错误不变式被拒、公理与具体执行一致
-  W5 index 溢出是前端 UB（L17）：MLIR 的回绕是精化
+  W5 index 溢出是毒值（L17′）：MLIR 的回绕是精化，addi 可推测
 用法：PYTHONPATH=model python3 model/loop_test.py [W2 的程序数]
 """
 import random, sys, ctypes, z3
@@ -187,11 +187,14 @@ def W3():
 
 def W4(rng):
     r = {}
-    good = lambda iv, its, B: z3.And(its[0][0] == iv - B['lb'], z3.Not(its[0][1]), iv >= B['lb'])
+    # L17′ 之后，c+1 溢出是毒值而不是 UB，所以“c 不是毒值”要靠范围事实维持：lb < 0 时 i − lb 可以超过 2^63
+    weak = lambda iv, its, B: z3.And(its[0][0] == iv - B['lb'], z3.Not(its[0][1]), iv >= B['lb'])
+    r['c = i − lb（不带范围）：不是归纳的'] = counter('cnt_weak', mode='opaque', inv=weak).loop_diag
+    good = lambda iv, its, B: z3.And(its[0][0] == iv - B['lb'], z3.Not(its[0][1]), iv >= B['lb'], B['lb'] >= 0)
     ci = counter('cnt_inv', mode='opaque', inv=good)
     v, p = ci.outv[0]; lb, n = ci.holes[0][0], ci.holes[1][0]
     nopz = z3.And(z3.Not(ci.holes[0][1]), z3.Not(ci.holes[1][1]))
-    r['不变式 c = i − lb：n > lb ⇒ 输出 = n − lb'] = C.prove(z3.Implies(z3.And(ci.ax, nopz, n > lb, z3.Not(ci.ubf)), v == n - lb))
+    r['不变式 c = i − lb ∧ lb ≥ 0：n > lb ⇒ 输出 = n − lb'] = C.prove(z3.Implies(z3.And(ci.ax, nopz, n > lb, lb >= 0, z3.Not(ci.ubf)), v == n - lb))
     r['无不变式时同一事实不可证'] = not C.prove(z3.Implies(z3.And(C.REG['cnt_op'].ax, z3.Not(C.REG['cnt_op'].ubf), C.REG['cnt_op'].holes[1][0] > C.REG['cnt_op'].holes[0][0]),
                                                      C.REG['cnt_op'].outv[0][0] == C.REG['cnt_op'].holes[1][0] - C.REG['cnt_op'].holes[0][0]))
     bad = lambda iv, its, B: its[0][0] == iv               # 只有 lb = 0 时成立，且不是归纳的（步长 1 时 c+1 = i+1 是归纳的！）
@@ -227,8 +230,10 @@ def W5():
     rt = C.derive('rt', [('x', I64)], [('q', I64)], [blk('entry', [node('i', 'arith.index_cast', ins=['x'], outs=[('i', IX)]),
                    node('o', 'arith.index_cast', ins=['i'], outs=[('o', I64)]), C.ret('r', 'o')], args=[('x', I64)])])
     nop = z3.And(z3.Not(f.holes[0][1]), z3.Not(f.holes[1][1]))
-    return {'Pre(a + b : index) ⇔ 非毒值 ∧ −2^63 ≤ a + b < 2^63': C.prove(C.user_pre(f) == z3.And(nop, a + b >= C.LO, a + b < C.HI)),
-            '2^62 + 2^62：前端 UB': C.prove(z3.Implies(z3.And(a == 1 << 62, b == 1 << 62, z3.Not(f.holes[0][1]), z3.Not(f.holes[1][1])), f.ubf)),
+    return {'UB ≡ ⊥，MayPoison(a + b : index) ⇔ 输入毒值 ∨ 超出 [−2^63, 2^63)':
+                C.prove(z3.Implies(f.ax, z3.Not(f.ubf))) and C.prove(z3.Implies(f.ax, f.outv[0][1] == z3.Or(z3.Not(nop), a + b < C.LO, a + b >= C.HI))),
+            '2^62 + 2^62：前端毒值': C.prove(z3.Implies(z3.And(a == 1 << 62, b == 1 << 62, nop), f.outv[0][1])),
+            'index addi 可推测（与 MLIR 的 Pure 一致）': C.caps(f)['Speculatable'],
             'MLIR 执行结果（回绕）': wrap - (1 << 64) if wrap >= 1 << 63 else wrap,
             'i64 → index → i64 往返恒等': C.prove(z3.Implies(z3.Not(rt.holes[0][1]), rt.outv[0][0] == rt.holes[0][0]))}
 
