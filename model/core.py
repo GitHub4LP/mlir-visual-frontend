@@ -22,6 +22,12 @@ def hi(t): return 1 if t == 'i1' else MAX
 class ValueUnknown(Exception): pass
 
 def W(t): return 1 if t == 'i1' else 3
+SORTS = {}                            # 用户类型 → z3 sort（由 defs.py 的类型定义登记）
+def zsort(t):
+    if t in ('i3', 'i1'): return z3.BitVecSort(W(t))
+    return SORTS.get(t)
+def zb(x): return z3.BoolVal(x) if isinstance(x, bool) else x               # 参数可以是具体值或符号（复合 op 的参数）
+def zbv(x, t='i3'): return z3.BitVecVal(x, W(t)) if isinstance(x, int) else z3.Int2BV(x, W(t))
 @dataclass
 class Schema:
     name: str
@@ -41,6 +47,8 @@ class Schema:
     holes: list = None                # 摘要里代表输入端口的占位项 [(值, 毒值)]
     outv: list = None                 # 摘要：每个输出的 (值, 毒值)
     ubf: object = None                # 摘要：UB 条件
+    params: list = field(default_factory=list)   # 复合 op 的参数 [(名字, 'int'|'bool')]，摘要对它们是符号的
+    pconsts: dict = field(default_factory=dict)
 
 F_, T_ = z3.BoolVal(False), z3.BoolVal(True)
 def bv(x, t='i3'): return z3.BitVecVal(x, W(t))
@@ -54,25 +62,34 @@ def nat(name, ins, outs, fn, eff=frozenset()):
 I3 = 'i3'
 def _add(p, a):
     (x, px), (y, py) = a
-    return [(x + y, z3.Or(px, py, z3.Not(z3.BVAddNoOverflow(x, y, False)) if p.get('nuw') else F_))], F_
+    return [(x + y, z3.Or(px, py, z3.And(zb(p.get('nuw', False)), z3.Not(z3.BVAddNoOverflow(x, y, False)))))], F_
 def _sub(p, a):
     (x, px), (y, py) = a
-    return [(x - y, z3.Or(px, py, z3.ULT(x, y) if p.get('nuw') else F_))], F_
+    return [(x - y, z3.Or(px, py, z3.And(zb(p.get('nuw', False)), z3.ULT(x, y))))], F_
 def _div(p, a):
     (x, px), (y, py) = a
     return [(z3.UDiv(x, y), px)], z3.Or(py, y == 0)               # 除数为 0 或毒值 ⇒ UB
-def _ult(p, a):
+PRED = ['eq', 'ne', 'slt', 'sle', 'sgt', 'sge', 'ult', 'ule', 'ugt', 'uge']   # arith::CmpIPredicate 的编号
+def _cmp(p, a):
     (x, px), (y, py) = a
-    return [(z3.If(z3.ULT(x, y), bv(1, 'i1'), bv(0, 'i1')), z3.Or(px, py))], F_
+    rel = [x == y, x != y, x < y, x <= y, x > y, x >= y, z3.ULT(x, y), z3.ULE(x, y), z3.UGT(x, y), z3.UGE(x, y)]
+    k = p['predicate']
+    c = rel[k] if isinstance(k, int) else z3.Or([z3.And(k == i, r) for i, r in enumerate(rel)])
+    return [(z3.If(c, bv(1, 'i1'), bv(0, 'i1')), z3.Or(px, py))], F_
 def _sel(p, a):
     (c, pc), (x, px), (y, py) = a
     return [(z3.If(c == 1, x, y), z3.Or(pc, z3.If(c == 1, px, py)))], F_
-nat('arith.constant', [], [('r', I3)], lambda p, a: ([(bv(p['value']), F_)], F_))
+_pz = itertools.count()
+def _poison(p, a):
+    t = p.get('type', 'i3')
+    return [(z3.FreshConst(zsort(t), 'poison'), T_)], F_
+nat('arith.constant', [], [('r', I3)], lambda p, a: ([(zbv(p['value'], p.get('type', 'i3')), F_)], F_))
 nat('arith.addi', [('lhs', I3), ('rhs', I3)], [('r', I3)], _add)
 nat('arith.subi', [('lhs', I3), ('rhs', I3)], [('r', I3)], _sub)
 nat('arith.divui', [('lhs', I3), ('rhs', I3)], [('r', I3)], _div)
-nat('arith.cmpi', [('lhs', I3), ('rhs', I3)], [('r', 'i1')], _ult)         # 只登记 ult
+nat('arith.cmpi', [('lhs', I3), ('rhs', I3)], [('r', 'i1')], _cmp)
 nat('arith.select', [('c', 'i1'), ('a', I3), ('b', I3)], [('r', I3)], _sel)
+nat('ub.poison', [], [('r', I3)], _poison)
 _ch = itertools.count()
 def _load(p, a): return [(z3.BitVec(f'load{next(_ch)}', 3), F_)], F_        # 读到的内容：非确定（自由变量）
 nat('memref.alloc', [], [('m', 'memref')], lambda p, a: ([(None, F_)], F_), eff={('Allocate', 'Default', 'm')})
@@ -83,13 +100,19 @@ nat('memref.store', [('v', I3), ('m', 'memref')], [], lambda p, a: ([], F_), eff
 def instantiate(sch, props, args):
     """复合 op 的摘要实例化 = 项代换（嵌套 ≡ 内联的根据）。"""
     pairs = [(h, a) for hs, as_ in zip(sch.holes, args) for h, a in zip(hs, as_) if h is not None]
+    for nm, kind in sch.params:
+        if nm in props:
+            v = props[nm]
+            pairs.append((sch.pconsts[nm], z3.IntVal(v) if isinstance(v, int) and not isinstance(v, bool) else zb(v)))
     sub = lambda t: z3.substitute(t, pairs) if pairs else t
     return [(sub(v) if v is not None else None, sub(p)) for v, p in sch.outv], sub(sch.ubf)
 def is_comp(sch): return sch.body is not None
 
 # ───────────────────────── 推导：一次遍历
 class Ctx:
-    def __init__(s): s.env, s.ub, s.eff, s.exact = {}, F_, [], True
+    def __init__(s, params=None): s.env, s.ub, s.eff, s.exact, s.params = {}, F_, [], True, params or {}
+    def props(s, n):
+        return {k: s.params[v[1:]] if isinstance(v, str) and v.startswith('$') else v for k, v in n.get('props', {}).items()}
     def walk(s, blocks, g, path):
         if len(blocks) != 1: raise ValueUnknown('多块 CFG 的值层尚未建模')
         for n in blocks[0]['ops']:
@@ -106,7 +129,8 @@ class Ctx:
             sch = REG.get(op)
             if sch is None or not sch.value_known: raise ValueUnknown(op)
             args = [s.env.get(v, (None, F_)) for v in n['ins']]
-            outs, ub = instantiate(sch, n.get('props', {}), args) if is_comp(sch) else sch.fn(n.get('props', {}), args)
+            pr = s.props(n)
+            outs, ub = instantiate(sch, pr, args) if is_comp(sch) else sch.fn(pr, args)
             s.ub = z3.Or(s.ub, z3.And(g, ub))                           # 分支里的 UB 只在该路径上算数
             for (o, _), r in zip(n['outs'], outs): s.env[o] = r
             vids = {p: v for (p, _), v in zip(sch.ins, n['ins'])} | {p: o for (p, _), (o, _) in zip(sch.outs, n['outs'])}
@@ -138,17 +162,19 @@ def compose_eff(effs, boundary):
         out.add((k, res, boundary.get(t, t)))
     return frozenset(out), diag
 
-def derive(name, ins, outs, blocks, mode='transparent'):
+def derive(name, ins, outs, blocks, mode='transparent', params=()):
     """ins/outs: [(端口, 类型)]；blocks: 实现体（入口块参数 = 输入端口）。返回 Schema 并登记。"""
-    sch = Schema(name, ins, outs, trust={'*': 'derived'}, body=blocks, mode=mode)
+    sch = Schema(name, ins, outs, trust={'*': 'derived'}, body=blocks, mode=mode, params=list(params))
+    sch.pconsts = {nm: (z3.Int if k == 'int' else z3.Bool)(f'{name}.${nm}') for nm, k in params}
     # 结构层：把体包成 func 检查 R1–R8，并求结构摘要
     ft = '(' + ', '.join(t for _, t in ins) + ') -> (' + ', '.join(t for _, t in outs) + ')'
     sch.struct_diag = list(ST.check(ST.M(ST.F(name, blocks, ftype=ft))))
     sch.summary = ST.derive_struct(blocks)
-    c = Ctx()
+    c = Ctx(sch.pconsts)
     holes = []
     for (p, ty), (v, _) in zip(ins, blocks[0]['args']):
-        h = (z3.BitVec(f'{name}.{p}', W(ty)), z3.Bool(f'{name}.Z.{p}')) if is_int(ty) else (None, z3.Bool(f'{name}.Z.{p}'))
+        so = zsort(ty)
+        h = (z3.Const(f'{name}.{p}', so) if so is not None else None, z3.Bool(f'{name}.Z.{p}'))
         c.env[v] = h; holes.append(h)
     try: ys = c.walk(blocks, T_, ())
     except ValueUnknown:
@@ -173,11 +199,28 @@ def user_pre(s):
     return z3.simplify(z3.And(no_poison(s), z3.Not(s.ubf)))
 def may_poison(s, j=0): return z3.simplify(z3.And(z3.Not(s.ubf), s.outv[j][1]))
 
+def as_comp(s):
+    """原生 op 包成单节点复合 op，以便用同一套查询（caps、refines）。"""
+    if s.body is not None: return s
+    outs = [(f'o{i}', t) for i, (_, t) in enumerate(s.outs)]
+    return derive(f'wrap[{s.name}]', s.ins, s.outs,
+                  [blk('entry', [node('n', s.name, ins=[p for p, _ in s.ins], outs=outs), ret('r', *[o for o, _ in outs])], args=s.ins)])
+
 def caps(s):
+    s = as_comp(s)
     if not s.value_known: return {'Speculatable': None, 'Pure': None}
     spec = prove(z3.Not(s.ubf))                     # 毒值输入也不得触发 UB（推测执行时输入可能是毒值）
     return {'Speculatable': spec, 'Speculatable|非毒值输入': prove(z3.Implies(no_poison(s), z3.Not(s.ubf))),
             'Pure': spec and s.eff != TOP and not s.eff}
+
+def refines(src, tgt):
+    """tgt 精化 src（把 src 改写成 tgt 有效）：src 不 UB ⇒ tgt 不 UB；src 输出不是毒值 ⇒ tgt 输出相同且不是毒值。"""
+    pairs = [(ht, hs) for xs, xt in zip(src.holes, tgt.holes) for hs, ht in zip(xs, xt) if hs is not None]
+    sb = lambda t: z3.substitute(t, pairs) if pairs else t
+    conds = [z3.Not(sb(tgt.ubf))]
+    for (vs, ps), (vt, pt) in zip(src.outv, tgt.outv):
+        conds.append(z3.Implies(z3.Not(ps), z3.And(z3.Not(sb(pt)), *([sb(vt) == vs] if vs is not None else []))))
+    return prove(z3.Implies(z3.Not(src.ubf), z3.And(conds)))
 
 def equivalent(a, b):
     """两个 Schema 的值层是否相同（按端口位置对齐）：UB 相同；不 UB 时毒值相同；不是毒值时值相同。"""
@@ -190,8 +233,9 @@ def equivalent(a, b):
     return prove(z3.And(conds))
 
 # ───────────────────────── 透明内联（全内联，作为“嵌套 ≡ 内联”的对照）
-def inline_all(blocks, env=None, pfx=''):
-    env = dict(env or {}); out = []
+def inline_all(blocks, env=None, pfx='', penv=None):
+    env = dict(env or {}); out = []; penv = penv or {}
+    sp = lambda pr: {k: penv.get(v[1:], v) if isinstance(v, str) and v.startswith('$') else v for k, v in pr.items()}
     for b in blocks:
         ops = []
         for v, _ in b['args']: env.setdefault(v, pfx + v)
@@ -201,14 +245,14 @@ def inline_all(blocks, env=None, pfx=''):
             if sch is not None and sch.body is not None and sch.mode == 'transparent':
                 inner = dict(zip([v for v, _ in sch.body[0]['args']], [env.get(v, v) for v in n['ins']]))
                 p2 = f"{pfx}{n['id']}."
-                ib = inline_all([dict(sch.body[0], args=[])], inner, p2)[0]
+                ib = inline_all([dict(sch.body[0], args=[])], inner, p2, sp(n.get('props', {})))[0]
                 term = ib['ops'][-1]; ops += ib['ops'][:-1]
                 for (o, _), y in zip(n['outs'], term['ins']): env[o] = y
                 continue
-            m = dict(n, id=pfx + n['id'], ins=[env.get(v, v) for v in n['ins']])
+            m = dict(n, id=pfx + n['id'], ins=[env.get(v, v) for v in n['ins']], props=sp(n.get('props', {})))
             for o, _ in n['outs']: env[o] = pfx + o
             m['outs'] = [(env[o], t) for o, t in n['outs']]
-            m['regions'] = [inline_all(r, env, pfx) for r in n['regions']]
+            m['regions'] = [inline_all(r, env, pfx, penv) for r in n['regions']]
             ops.append(m)
         out.append(dict(b, args=args, ops=ops))
     return out
@@ -249,7 +293,7 @@ def ren(n, pm):
                 regions=[[dict(b, ops=[ren(x, pm) for x in b['ops']]) for b in r] for r in n['regions']])
 
 # ───────────────────────── 小工具
-def cst(i, v, t='i3'): return node(i, 'arith.constant', outs=[(i, t)], props={'value': v})
+def cst(i, v, t='i3'): return node(i, 'arith.constant', outs=[(i, t)], props={'value': v, 'type': t})
 def op2(i, op, a, b, t='i3', **p): return node(i, op, ins=[a, b], outs=[(i, t)], props=p)
 def ret(i, *vs): return node(i, 'func.return', ins=list(vs))
 
@@ -258,7 +302,7 @@ if __name__ == '__main__':
                [blk('entry', [op2('d', 'arith.divui', 'x', 'y'), ret('r', 'd')], args=[('x', I3), ('y', I3)])])
     print('■ f(x,y) = x / y   Pre:', pretty(user_pre(f)), ' caps:', caps(f))
     g = derive('g', [('a', I3), ('b', I3)], [('q', I3)],
-               [blk('entry', [cst('z', 0), op2('c', 'arith.cmpi', 'z', 'b', 'i1'),
+               [blk('entry', [cst('z', 0), op2('c', 'arith.cmpi', 'z', 'b', 'i1', predicate=6),
                               node('if', 'scf.if', ins=['c'], outs=[('r', I3)], regions=[
                                   [blk('t', [op2('d', 'arith.divui', 'a', 'b'), node('y1', 'scf.yield', ins=['d'])])],
                                   [blk('e', [node('y2', 'scf.yield', ins=['z'])])]]),
