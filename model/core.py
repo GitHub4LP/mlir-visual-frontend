@@ -4,7 +4,8 @@ IR：structure.py 的 module/region/block/node 表示，是唯一的图表示（
 Schema v4 = ⟨签名; 值层（每个输出的值与毒值标志、UB，都是“输入值 × 输入毒值标志”的函数）; Eff; Struct; 信任等级; Impl⟩
 derive(体) 一次遍历同时给出 值层 / 效应层 / 结构层 的事实；结果仍是 Schema，可再作为节点使用。
 值层是多 sort 的：iN 用 z3 位向量（任意位宽；i3 便于穷举预言机，见 core_test.py）；index 用数学整数 ℤ，
-溢出出目标位宽 IW 的有符号范围即前端 UB（L17：MLIR 的回绕是它的精化；ℤ 上的线性部分可交给 Presburger）。
+溢出出目标位宽 IW 的有符号范围 ⇒ 结果是毒值（L17′；第 5 轮之前是 UB，那会让 index 上的 addi 不可推测，弱于 MLIR 的 Pure）。
+毒值的值项仍是数学结果，所以 index 的值域公理写成“毒值 ∨ 在范围内”。
 scf.for：静态小循环精确展开；其余用“按结构命名的未解释函数”做摘要（L18，确定性 ⇒ 嵌套 ≡ 内联仍成立），
 可用声明的不变式收窄，不变式在定义期做归纳检查，通过后作为公理进入摘要（L19）。见 spec/loops.md。
 运行：PYTHONPATH=model python3 model/core.py
@@ -18,7 +19,8 @@ M = 8; MAX = M - 1
 TOP = 'Unknown'                       # 未建模效应
 _n = itertools.count()
 def fv(h): return f'{re.sub(r"[^A-Za-z0-9]", "_", h)}_{next(_n)}'
-IW = 64                               # 目标的 index 位宽（前端 UB 的界）
+IW = 64                               # 目标的 index 位宽（超出 ⇒ 毒值）
+IXOVF = 'poison'                      # index 溢出的语义：'poison'（L17′，默认）| 'ub'（旧 L17，只为对照保留）
 KUNROLL = 64                          # 静态循环精确展开的上限
 def is_int(t): return isinstance(t, str) and re.fullmatch(r'i\d+', t) is not None
 def hi(t): return (1 << W(t)) - 1
@@ -30,6 +32,8 @@ SORTS = {}                            # 用户类型 → z3 sort（由 defs.py �
 def zsort(t):
     if is_int(t): return z3.BitVecSort(W(t))
     if t == 'index': return z3.IntSort()
+    tp = tparse(t)
+    if tp is not None: return tsort(len(tp[0]), tp[1])
     return SORTS.get(t)
 def zb(x): return z3.BoolVal(x) if isinstance(x, bool) else x               # 参数可以是具体值或符号（复合 op 的参数）
 def zbv(x, t='i3'):
@@ -42,7 +46,8 @@ LO, HI = -(1 << (IW - 1)), 1 << (IW - 1)
 def U(x): return z3.If(x < 0, x + (1 << IW), x)                             # index 的无符号解释
 def S(x): return z3.If(x >= HI, x - (1 << IW), x)
 def ovf(r): return z3.Or(r < LO, r >= HI)
-def inrange(x): return z3.And(x >= LO, x < HI) if x is not None and z3.is_int(x) else T_   # index 值的良构：总在 IW 位有符号范围内
+def inrange(x): return z3.And(x >= LO, x < HI) if x is not None and z3.is_int(x) else T_   # index 值的良构：在 IW 位有符号范围内
+def wf_ix(v, p): return z3.Or(p, inrange(v)) if v is not None and z3.is_int(v) else T_       # 值域公理：毒值的值项可以越界
 def outty(p, d='i3'): return (p.get('__out') or [p.get('type', d)])[0]
 @dataclass
 class Schema:
@@ -66,6 +71,8 @@ class Schema:
     params: list = field(default_factory=list)   # 复合 op 的参数 [(名字, 'int'|'bool')]，摘要对它们是符号的
     pconsts: dict = field(default_factory=dict)
     ax: object = None                 # 摘要附带的公理（循环不变式在出口成立等），查询时作为假设
+    wf: list = field(default_factory=list)       # L22 静态维的证明义务 [(节点, 公式)]
+    guards: list = field(default_factory=list)   # L24 降低到 MLIR 时的守卫义务 [(节点, 公式)]
 
 F_, T_ = z3.BoolVal(False), z3.BoolVal(True)
 def bv(x, t='i3'): return zbv(x, t)
@@ -77,16 +84,17 @@ def reg(s): REG[s.name] = s; return s
 def nat(name, ins, outs, fn, eff=frozenset()):
     return reg(Schema(name, ins, outs, fn, frozenset(eff), trust={'值层/效应': 'authored', '结构': 'ods'}))
 I3 = 'i3'
-def _ixub(r, px, py): return z3.And(z3.Not(px), z3.Not(py), ovf(r))      # index 溢出 ⇒ 前端 UB（L17）
+def _ixub(r, px, py): return z3.And(z3.Not(px), z3.Not(py), ovf(r)) if IXOVF == 'ub' else F_
+def _ixp(r): return ovf(r) if IXOVF == 'poison' else F_                      # index 溢出 ⇒ 毒值（L17′）
 def _add(p, a):
     (x, px), (y, py) = a
     nuw = zb(p.get('nuw', False))
-    if is_ix(x): r = x + y; return [(r, z3.Or(px, py, z3.And(nuw, U(x) + U(y) >= 1 << IW)))], _ixub(r, px, py)
+    if is_ix(x): r = x + y; return [(r, z3.Or(px, py, _ixp(r), z3.And(nuw, U(x) + U(y) >= 1 << IW)))], _ixub(r, px, py)
     return [(x + y, z3.Or(px, py, z3.And(nuw, z3.Not(z3.BVAddNoOverflow(x, y, False)))))], F_
 def _sub(p, a):
     (x, px), (y, py) = a
     nuw = zb(p.get('nuw', False))
-    if is_ix(x): r = x - y; return [(r, z3.Or(px, py, z3.And(nuw, U(x) < U(y))))], _ixub(r, px, py)
+    if is_ix(x): r = x - y; return [(r, z3.Or(px, py, _ixp(r), z3.And(nuw, U(x) < U(y))))], _ixub(r, px, py)
     return [(x - y, z3.Or(px, py, z3.And(nuw, z3.ULT(x, y))))], F_
 def _div(p, a):
     (x, px), (y, py) = a
@@ -119,7 +127,7 @@ def _bin(f, ovfc=None):
         if is_ix(x):                                              # index 上的位运算：经 IW 位向量
             if ovfc is None: return [(z3.BV2Int(f(z3.Int2BV(x, IW), z3.Int2BV(y, IW)), True), z3.Or(px, py))], F_
             r = x * y                                             # muli
-            return [(r, z3.Or(px, py, z3.And(zb(p.get('nuw', False)), U(x) * U(y) >= 1 << IW)))], _ixub(r, px, py)
+            return [(r, z3.Or(px, py, _ixp(r), z3.And(zb(p.get('nuw', False)), U(x) * U(y) >= 1 << IW)))], _ixub(r, px, py)
         return [(f(x, y), z3.Or(px, py, z3.And(zb(p.get('nuw', False)), ovfc(x, y)) if ovfc else F_))], F_
     return g
 nat('arith.muli', [('lhs', I3), ('rhs', I3)], [('r', I3)], _bin(lambda x, y: x * y, lambda x, y: z3.Not(z3.BVMulNoOverflow(x, y, False))))
@@ -143,6 +151,113 @@ def _cast(kind):
 for k in ('trunci', 'extui', 'extsi', 'index_cast', 'index_castui'):
     nat(f'arith.{k}', [('in', 'T')], [('r', 'T2')], _cast(k))
 ORIG = {}
+
+# ───────────────────────── 形状层（第 6 轮）
+# tensor 值 = ⟨extent ∈ ℤ^r，元素 Array(ℤ^r → E)，元素毒值 Array(ℤ^r → Bool)⟩，另有整体毒值标志。
+# L22 静态维是 extent 的投影：边上的静态维是声明，不符 ⇒ 该值为毒值，且立一条证明义务（诊断）。
+# L23 相等只看域内（域外不可观察）。
+# L24 tensor 层是值语义，没有 UB：越界、负尺寸、形状操作数为毒值 ⇒ 结果为毒值。因此所有 tensor op 都可推测（不弱于 MLIR 的 Pure）；
+#     MLIR 中这些情形是 UB，所以降低时要在不能证明在界内的地方插入守卫（guards 查询）。
+def tparse(t):
+    m = re.fullmatch(r'tensor<((?:(?:\d+|\?)x)+)(\w+)>', t) if isinstance(t, str) else None
+    if not m: return None
+    return [None if d == '?' else int(d) for d in m.group(1).rstrip('x').split('x')], m.group(2)
+_TS, _TM = {}, {}
+def tsort(r, e):
+    if (r, e) not in _TS:
+        D = z3.Datatype(f'tensor{r}_{e}')
+        D.declare('mk', *[(f'd{i}', z3.IntSort()) for i in range(r)],
+                  ('data', z3.ArraySort(*([z3.IntSort()] * r), zsort(e))), ('pz', z3.ArraySort(*([z3.IntSort()] * r), z3.BoolSort())))
+        S_ = D.create(); _TS[(r, e)] = S_; _TM[S_.name()] = (r, e, S_)
+    return _TS[(r, e)]
+def is_t(v): return v is not None and v.sort().name() in _TM
+def rank(v): return _TM[v.sort().name()][0]
+def ext(v): S_ = v.sort(); return [S_.accessor(0, i)(v) for i in range(rank(v))]
+def dat(v): S_ = v.sort(); return S_.accessor(0, rank(v))(v)
+def tpz(v): S_ = v.sort(); return S_.accessor(0, rank(v) + 1)(v)
+def mkt(S_, es, d, pz): return S_.constructor(0)(*es, d, pz)
+def wf(h, ty):
+    """值的良构公理（对所有产生者都成立）：非毒值的 index 在范围内；非毒值 tensor 的 extent 非负且在范围内。静态维不在这里（L22）。"""
+    v, p = h
+    if is_t(v): return z3.Or(p, z3.And([z3.And(e >= 0, e < HI) for e in ext(v)]))
+    return wf_ix(v, p)
+def static_ok(v, ty):
+    tp = tparse(ty)
+    return z3.And([e == k for e, k in zip(ext(v), tp[0]) if k is not None]) if tp and is_t(v) else T_
+def inb(idx, es): return z3.And([z3.And(i >= 0, i < e) for i, e in zip(idx, es)])
+def _ivars(r): return [z3.Int(f'_i{k}') for k in range(r)]
+def veq_obs(a, b):
+    """L23 观察相等：extent 相等，域内元素毒值相同、非毒值元素相同。"""
+    if not is_t(a): return a == b
+    iv = _ivars(rank(a)); I = tuple(iv)
+    return z3.And(*[x == y for x, y in zip(ext(a), ext(b))],
+                  z3.ForAll(iv, z3.Implies(inb(iv, ext(a)), z3.And(tpz(a)[I] == tpz(b)[I], z3.Or(tpz(a)[I], dat(a)[I] == dat(b)[I])))))
+def vref(vs, ps, vt, pt):
+    """tgt 的值精化 src 的值：src 不是毒值 ⇒ tgt 不是毒值且相同；tensor 逐元素（src 元素非毒 ⇒ tgt 元素非毒且相同）。"""
+    if vs is None: return z3.Implies(z3.Not(ps), z3.Not(pt))
+    if not is_t(vs): return z3.Implies(z3.Not(ps), z3.And(z3.Not(pt), vt == vs))
+    iv = _ivars(rank(vs)); I = tuple(iv)
+    return z3.Implies(z3.Not(ps), z3.And(z3.Not(pt), *[x == y for x, y in zip(ext(vs), ext(vt))],
+        z3.ForAll(iv, z3.Implies(z3.And(inb(iv, ext(vs)), z3.Not(tpz(vs)[I])), z3.And(z3.Not(tpz(vt)[I]), dat(vt)[I] == dat(vs)[I])))))
+def _anyp(xs): return z3.Or([p for _, p in xs]) if xs else F_
+def _zero(e): return z3.BitVecVal(0, W(e)) if is_int(e) else z3.IntVal(0)
+def _dyn_ext(ty, dyn):
+    tp = tparse(ty); it = iter(dyn)
+    return [z3.IntVal(k) if k is not None else next(it)[0] for k in tp[0]], tp
+def _fill(p, a, empty):
+    """splat：所有元素 = v；empty：元素全是毒值（MLIR 说内容未指定，毒值是最强的未指定）。"""
+    ty = outty(p); (v, pv), dyn = ((_zero(tparse(ty)[1]), T_), a) if empty else (a[0], a[1:])
+    es, (dims, e) = _dyn_ext(ty, dyn); iv = _ivars(len(dims))
+    return [(mkt(tsort(len(dims), e), es, z3.Lambda(iv, v), z3.Lambda(iv, pv)), z3.Or(_anyp(dyn), *[x < 0 for x, _ in dyn]))], F_
+def _from_elements(p, a):
+    dims, e = tparse(outty(p)); d, pz = z3.K(z3.IntSort(), _zero(e)), z3.K(z3.IntSort(), F_)
+    for k, (v, pv) in enumerate(a): d, pz = z3.Store(d, k, v), z3.Store(pz, k, pv)
+    return [(mkt(tsort(1, e), [z3.IntVal(len(a))], d, pz), F_)], F_
+def _dim(p, a):
+    (t, pt), (i, pi) = a; es = ext(t); val = es[-1]
+    for k in range(len(es) - 2, -1, -1): val = z3.If(i == k, es[k], val)
+    return [(val, z3.Or(pt, pi, i < 0, i >= len(es)))], F_
+def _extract(p, a):
+    (t, pt), idx = a[0], a[1:]; I = tuple(x for x, _ in idx)
+    return [(dat(t)[I], z3.Or(pt, _anyp(idx), z3.Not(inb(I, ext(t))), tpz(t)[I]))], F_
+def _insert(p, a):
+    (v, pv), (t, pt), idx = a[0], a[1], a[2:]; I = tuple(x for x, _ in idx)
+    return [(mkt(t.sort(), ext(t), z3.Store(dat(t), *I, v), z3.Store(tpz(t), *I, pv)), z3.Or(pt, _anyp(idx), z3.Not(inb(I, ext(t)))))], F_
+def _slice_oob(offs, szs, es): return z3.Or([z3.Or(o < 0, n < 0, o + n > e) for o, n, e in zip(offs, szs, es)])
+def _extract_slice(p, a):
+    (t, pt), r = a[0], rank(a[0][0]); offs, szs = a[1:1 + r], a[1 + r:1 + 2 * r]
+    iv = _ivars(r); src = tuple(i + o for i, (o, _) in zip(iv, offs))
+    res = mkt(t.sort(), [n for n, _ in szs], z3.Lambda(iv, dat(t)[src]), z3.Lambda(iv, tpz(t)[src]))
+    return [(res, z3.Or(pt, _anyp(offs + szs), _slice_oob([o for o, _ in offs], [n for n, _ in szs], ext(t))))], F_
+def _insert_slice(p, a):
+    (s_, ps), (t, pt), offs = a[0], a[1], a[2:]; r = rank(t)
+    iv = _ivars(r); I = tuple(iv); J = tuple(i - o for i, (o, _) in zip(iv, offs))
+    win = z3.And([z3.And(i >= o, i < o + n) for i, (o, _), n in zip(iv, offs, ext(s_))])
+    res = mkt(t.sort(), ext(t), z3.Lambda(iv, z3.If(win, dat(s_)[J], dat(t)[I])), z3.Lambda(iv, z3.If(win, tpz(s_)[J], tpz(t)[I])))
+    return [(res, z3.Or(ps, pt, _anyp(offs), _slice_oob([o for o, _ in offs], ext(s_), ext(t))))], F_
+def _tcast(p, a):
+    (t, pt), ty = a[0], outty(p)
+    return [(mkt(zsort(ty), ext(t), dat(t), tpz(t)), z3.Or(pt, z3.Not(static_ok(t, ty))))], F_
+nat('tensor.splat', [('v', 'E'), ('dyn', 'index*')], [('r', 'tensor')], lambda p, a: _fill(p, a, False))
+nat('tensor.empty', [('dyn', 'index*')], [('r', 'tensor')], lambda p, a: _fill(p, a, True))
+nat('tensor.from_elements', [('vs', 'E*')], [('r', 'tensor')], _from_elements)
+nat('tensor.dim', [('t', 'tensor'), ('i', 'index')], [('r', 'index')], _dim)
+nat('tensor.extract', [('t', 'tensor'), ('idx', 'index*')], [('r', 'E')], _extract)
+nat('tensor.insert', [('v', 'E'), ('t', 'tensor'), ('idx', 'index*')], [('r', 'tensor')], _insert)
+nat('tensor.extract_slice', [('t', 'tensor'), ('offs', 'index*'), ('sizes', 'index*')], [('r', 'tensor')], _extract_slice)
+nat('tensor.insert_slice', [('s', 'tensor'), ('t', 'tensor'), ('offs', 'index*')], [('r', 'tensor')], _insert_slice)
+nat('tensor.cast', [('t', 'tensor')], [('r', 'tensor')], _tcast)
+# MLIR 中这些 op 的良定义条件（不满足即 UB）。降低到 MLIR 时，不能证明它成立的地方要插守卫（L24）。
+def _mlir_def(op, a, outs_ty):
+    if op == 'tensor.dim': return z3.And(a[1][0] >= 0, a[1][0] < rank(a[0][0]))
+    if op == 'tensor.extract': return inb(tuple(x for x, _ in a[1:]), ext(a[0][0]))
+    if op == 'tensor.insert': return inb(tuple(x for x, _ in a[2:]), ext(a[1][0]))
+    if op == 'tensor.extract_slice':
+        r = rank(a[0][0]); return z3.Not(_slice_oob([o for o, _ in a[1:1 + r]], [n for n, _ in a[1 + r:1 + 2 * r]], ext(a[0][0])))
+    if op == 'tensor.insert_slice': return z3.Not(_slice_oob([o for o, _ in a[2:]], ext(a[0][0]), ext(a[1][0])))
+    if op in ('tensor.splat', 'tensor.empty'): return z3.And([x >= 0 for x, _ in (a[1:] if op == 'tensor.splat' else a)])
+    if op == 'tensor.cast': return static_ok(a[0][0], outs_ty[0])
+    return None
 _ch = itertools.count()
 def _load(p, a): return [(z3.FreshConst(zsort(outty(p)), f'load{next(_ch)}'), F_)], F_   # 读到的内容：非确定（自由变量）
 nat('memref.alloc', [], [('m', 'memref')], lambda p, a: ([(None, F_)], F_), eff={('Allocate', 'Default', 'm')})
@@ -166,7 +281,14 @@ def is_comp(sch): return sch.body is not None
 
 # ───────────────────────── 推导：一次遍历
 class Ctx:
-    def __init__(s, params=None): s.env, s.ub, s.eff, s.exact, s.params, s.ax, s.diag = {}, F_, [], True, params or {}, [], []
+    def __init__(s, params=None):
+        s.env, s.ub, s.eff, s.exact, s.params, s.ax, s.diag = {}, F_, [], True, params or {}, [], []
+        s.wf, s.guards = [], []       # L22 静态维的证明义务、L24 降低到 MLIR 的守卫义务：[(节点, 公式)]
+    def static_check(s, nid, v, pv, ty, g):
+        """L22：边上的静态维不符 ⇒ 毒值；同时立义务“非毒值时成立”。返回新的毒值标志。"""
+        if not is_t(v) or not tparse(ty) or all(k is None for k in tparse(ty)[0]): return pv
+        c = static_ok(v, ty); s.wf.append((nid, z3.Implies(z3.And(g, z3.Not(pv)), c)))
+        return z3.Or(pv, z3.Not(c))
     def props(s, n):
         p = {k: s.params[v[1:]] if isinstance(v, str) and v.startswith('$') else v for k, v in n.get('props', {}).items()}
         p['__out'] = [t for _, t in n['outs']]
@@ -191,10 +313,16 @@ class Ctx:
             pr = s.props(n)
             if is_comp(sch) and not sch.exact and sch.mode == 'transparent' and sch.body is not None:
                 outs, ub = s.specialize(sch, pr, args, g, path + ((n['id'], 'call'),))   # 透明模式：摘要不精确时在调用点特化（L18）
-            elif is_comp(sch): outs, ub = instantiate(sch, pr, args); s.ax.append(inst_ax(sch, pr, args))
-            else: outs, ub = sch.fn(pr, args)
+            elif is_comp(sch):
+                outs, ub = instantiate(sch, pr, args); s.ax.append(inst_ax(sch, pr, args))
+                for k, ((_, pty), (av, ap)) in enumerate(zip(sch.ins, args)): s.static_check(f"{n['id']}#{k}", av, ap, pty, g)   # 调用点义务
+            else:
+                outs, ub = sch.fn(pr, args)
+                md = _mlir_def(op, args, pr['__out']) if op.startswith('tensor.') else None
+                if md is not None: s.guards.append((n['id'], z3.Implies(z3.And(g, z3.Not(_anyp(args))), md)))
             s.ub = z3.Or(s.ub, z3.And(g, ub))                           # 分支里的 UB 只在该路径上算数
-            for (o, _), r in zip(n['outs'], outs): s.env[o] = r
+            for (o, ty), r in zip(n['outs'], outs):
+                s.env[o] = (r[0], s.static_check(n['id'], r[0], r[1], ty, g)) if r[0] is not None else r
             vids = {p: v for (p, _), v in zip(sch.ins, n['ins'])} | {p: o for (p, _), (o, _) in zip(sch.outs, n['outs'])}
             if sch.eff == TOP: s.eff.append(TOP)
             else: s.eff += [(k, r, vids[p], path, n['id']) for k, r, p in sch.eff]
@@ -246,15 +374,16 @@ class Ctx:
         outs = [(z3.If(nonempty, F(f'v{j}', iv0.sort()), iv0), z3.If(nonempty, F(f'p{j}', z3.BoolSort()), p0))
                 for j, (iv0, p0) in enumerate(inits)]
         fub = F('ub', z3.BoolSort())
-        s.ax += [inrange(v) for v, _ in outs]
+        s.ax += [wf((v, p), None) for v, p in outs]
         s.exact = False
         inv = n.get('props', {}).get('inv')
         if inv is not None:                      # inv(iv, [(值, 毒值)], {'lb','ub','st'}) -> z3 Bool
             B = {'lb': lb, 'ub': ub, 'st': st}
-            pre_body = z3.And(lb <= siv, siv < ub, st > 0, inrange(siv), *[inrange(v) for v, _ in sits], inv(siv, sits, B))
+            pre_body = z3.And(z3.Not(z3.Or(plb, pub, pst)), lb <= siv, siv < ub, st > 0, inrange(siv),   # 边界是毒值时循环本身就是 UB，体的事实只在非毒值时需要
+                                *[wf(h, None) for h in sits], inv(siv, sits, B))
             ok_pres = prove(z3.Implies(z3.And(z3.And(s.ax) if s.ax else T_, pre_body), inv(siv + st, ys, B)))
             ok_ub = ok_pres and prove(z3.Implies(z3.And(z3.And(s.ax) if s.ax else T_, pre_body), z3.Not(bub)))
-            init = z3.And(st > 0, nonempty, inv(lb, inits, B))
+            init = z3.And(z3.Not(z3.Or(plb, pub, pst)), st > 0, nonempty, inv(lb, inits, B))
             if ok_pres:
                 final = lb + ((ub - lb + st - 1) / st) * st
                 s.ax.append(z3.Implies(init, inv(final, outs, B)))
@@ -339,12 +468,16 @@ def derive(name, ins, outs, blocks, mode='transparent', params=()):
         so = zsort(ty)
         h = (z3.Const(f'{name}.{p}', so) if so is not None else None, z3.Bool(f'{name}.Z.{p}'))
         c.env[v] = h; holes.append(h)
-        if ty == 'index': c.ax.append(inrange(h[0]))
-    try: ys = c.walk(blocks, T_, ())
+        c.ax.append(wf(h, ty))
+        if h[0] is not None: c.env[v] = (h[0], c.static_check(f'入口.{p}', h[0], h[1], ty, T_))
+    try:
+        ys = c.walk(blocks, T_, ())
+        ys = [(v, c.static_check(f'出口.{p}', v, pv, ty, T_)) if v is not None else (v, pv) for (p, ty), (v, pv) in zip(outs, ys)]
     except ValueUnknown:
         sch.value_known, sch.exact = False, False
         reg(sch); return sch
     sch.holes, sch.outv, sch.ubf = holes, [(z3.simplify(v) if v is not None else None, z3.simplify(p)) for v, p in ys], z3.simplify(c.ub)
+    sch.wf, sch.guards = c.wf, c.guards
     sch.exact = c.exact; sch.ax = z3.simplify(z3.And(c.ax)) if c.ax else T_; sch.loop_diag = c.diag
     sch.env = {v: c.env[v] for v in _toplevel_vals(blocks) if v in c.env}     # 顶层值的项：补全查询用
     boundary = {v: p for (p, _), (v, _) in zip(ins, blocks[0]['args'])} | {v: p for (p, _), v in zip(outs, _term(blocks))}
@@ -363,6 +496,16 @@ def no_poison(s):
 def user_pre(s):
     """面向用户的前提：输入都不是毒值时不触发 UB。"""
     return z3.simplify(z3.And(no_poison(s), z3.Not(s.ubf)))
+def shape_diag(s):
+    """L22：不能证明的静态维声明（没有真正 UB 时它也不一定成立）⇒ 诊断：改成 ?，或显式插入 tensor.cast。"""
+    if not s.value_known: return None
+    ctx = z3.And(s.ax, no_poison(s), z3.Not(s.ubf))
+    return [nid for nid, f in s.wf if not prove(z3.Implies(ctx, f))]
+def guards(s):
+    """L24：降低到 MLIR 时需要运行期守卫的节点（不能证明 MLIR 的良定义条件成立）。在定义自身的上下文里判定。"""
+    if not s.value_known: return None
+    ctx = z3.And(s.ax, no_poison(s), z3.Not(s.ubf))
+    return [nid for nid, f in s.guards if not prove(z3.Implies(ctx, f))]
 def may_poison(s, j=0): return z3.simplify(z3.And(z3.Not(s.ubf), s.outv[j][1]))
 
 def as_comp(s):
@@ -387,7 +530,7 @@ def refines(src, tgt, assume=True):
     sb = lambda t: z3.substitute(t, pairs) if pairs else t
     conds = [z3.Not(sb(tgt.ubf))]
     for (vs, ps), (vt, pt) in zip(src.outv, tgt.outv):
-        conds.append(z3.Implies(z3.Not(ps), z3.And(z3.Not(sb(pt)), *([sb(vt) == vs] if vs is not None else []))))
+        conds.append(vref(vs, ps, sb(vt) if vt is not None else None, sb(pt)))
     return prove(z3.Implies(z3.And(assume, src.ax, sb(tgt.ax), z3.Not(src.ubf)), z3.And(conds)))
 
 def equivalent(a, b):
@@ -397,7 +540,7 @@ def equivalent(a, b):
     conds = [a.ubf == sb(b.ubf)]
     for (va, pa), (vb, pb) in zip(a.outv, b.outv):
         conds.append(z3.Implies(z3.Not(a.ubf), pa == sb(pb)))
-        if va is not None: conds.append(z3.Implies(z3.And(z3.Not(a.ubf), z3.Not(pa)), va == sb(vb)))
+        if va is not None: conds.append(z3.Implies(z3.And(z3.Not(a.ubf), z3.Not(pa)), veq_obs(va, sb(vb))))
     return prove(z3.Implies(z3.And(a.ax, sb(b.ax)), z3.And(conds)))
 
 # ───────────────────────── 透明内联（全内联，作为“嵌套 ≡ 内联”的对照）
