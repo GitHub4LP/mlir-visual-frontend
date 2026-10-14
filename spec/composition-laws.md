@@ -47,7 +47,7 @@
 ## E 效应 / 推测执行
 | 机制 | 组合律 | 强度 |
 |---|---|---|
-| MemRead/Write/Alloc/Free（含 Resource 和 Target） | 取体内并集；Target 从体内值重定位到边界端口；局部的 alloc+free 互相抵消 | S |
+| MemRead/Write/Alloc/Free（含 Resource 和 Target） | 取体内并集；Target 从体内值重定位到边界端口；局部的 alloc+free 互相抵消，**只限同一块内**（v4 修正 L7） | S |
 | NoMemoryEffect、Pure（= AlwaysSpeculatable ∧ NoMemoryEffect）、RecursiveMemoryEffects | Eff 组合（新缓冲无别名、alloc/free 抵消、⊤ 吸收），Pure ⇔ Speculatable ∧ Eff=∅ | E（相对 Eff 的精度）；llvm.ptr 的逃逸为 S |
 | Conditionally/Always/RecursivelySpeculatable | Speculatable ⇔ Pre ≡ 输入域，并能给出精确的“在 Pre 下可推测” | E（相对 Sem/UB 的精度） |
 | TokenProducer/Consumer、DistinctObjectsTrait | 沿体内数据流传播 | S |

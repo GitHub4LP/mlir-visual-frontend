@@ -83,7 +83,7 @@ v0 的局限：维度只支持等式（靠合一）；仅涉及内部变量的�
 2. **控制层的精度边界**：if 是 E；loop 只有在循环不变或平移型 carried 时是 E；一般情况下 Presburger 对迭代不封闭。补救办法是声明不变式 I，检查 I(x) ∧ R ⇒ I(f)，这个检查可判定。这与“声明 = 对推导的收窄，需要检查”的原则一致。
 3. Wf 不需要在每个复合 op 上重新推导，而是**逐 op 在导入期一次性证明** Def ∧ Canon ⇒ Wf。证不出来的地方就是 lowering 必须处理的特例。
 
-## 8 原型 v3：毒值与效应（model/effects.py，运行通过）
+## 8 原型 v3：毒值与效应（原 model/effects.py，已并入 core v4）
 | 复合 | Pre | 可推测 | 输出可能为毒值 |
 |---|---|---|---|
 | a / (a +nuw b) | a+b≤255 ∧ a+b≠0 | ✗（仅在 Pre 下） | 永不 |
@@ -103,7 +103,7 @@ v0 的局限：维度只支持等式（靠合一）；仅涉及内部变量的�
   1. `tensor.extract_slice %t[0][0][1] : tensor<0xf32>` → 报错 "offset 0 is out-of-bounds: 0 >= 0"，证实了 §7 中引理找到的反例；
   2. LICM 会把 tensor.extract 提到可能 0 次迭代的循环之外，one-shot-bufferize 之后成为无条件的 memref.load。这是语义剖面加管线约束问题，见 frontend-model §3。
 
-## 10 预言机检验（model/test_oracle.py、model/bv.py）
+## 10 预言机检验（原 model/test_oracle.py、model/bv.py，已由 core_test.py 取代）
 - 方法：随机生成 2–6 个 op 的 DAG，op 取自 add、add_nuw、sub、sub_nuw、mul、divui、remui、ult、select、常量；用 W 位的带毒值/UB 解释器穷举全部输入作为真值。
 - 结果：
   - W=6，300 个图：Sem 精确的 82/82 与真值完全一致（Pre 与毒值集合都相等）；含抽象的 218/218 满足可靠方向。

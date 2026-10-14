@@ -1,129 +1,266 @@
-"""统一核心 v3：Schema 是唯一的数据结构；原生 op（ODS 导入 + 语义覆盖层）与复合 op（推导）同构。
-整数层（标量值、index、extent）用 isl；类型层见 solver.py（此处只沿用 ODS 的约束名）。
-每个字段带信任等级：ods（导入）/ authored（人工语义）/ derived（推导）。
+"""统一核心 v4：一种 IR、一种 Schema、一次推导。
+
+IR：structure.py 的 module/region/block/node 表示，是唯一的图表示（v3 的扁平 DAG 已废弃）。
+Schema v4 = ⟨签名; 值层（每个输出的值与毒值标志、UB，都是“输入值 × 输入毒值标志”的函数）; Eff; Struct; 信任等级; Impl⟩
+derive(体) 一次遍历同时给出 值层 / 效应层 / 结构层 的事实；结果仍是 Schema，可再作为节点使用。
+值层用 z3 QF_BV（v3.1 的决定：op 确定 ⇒ wp 只做代换，精确、无量词）。i3 位宽便于穷举预言机（core_test.py）。
+下标 / extent / 循环的 Presburger 层（wp.py、shape.py）尚未并入，见 spec/coverage.md。
+运行：PYTHONPATH=model python3 model/core.py
 """
-import re, itertools, islpy as isl
+import re, itertools, z3
 from dataclasses import dataclass, field
-from ods_import import import_op, KNOWN
+import structure as ST
+from structure import blk, node
 
-BIG = 10**6
+M = 8; MAX = M - 1
+TOP = 'Unknown'                       # 未建模效应
 _n = itertools.count()
+def fv(h): return f'{re.sub(r"[^A-Za-z0-9]", "_", h)}_{next(_n)}'
+def is_int(t): return t in ('i3', 'i1')
+def hi(t): return 1 if t == 'i1' else MAX
 
+class ValueUnknown(Exception): pass
+
+def W(t): return 1 if t == 'i1' else 3
 @dataclass
 class Schema:
     name: str
-    ins: list            # [(端口, 论域上界)]
+    ins: list                         # [(端口, 类型)]
     outs: list
-    sem: str = 'true'    # 关于 {in}/{out} 的 Presburger 公式
-    ub: str = 'false'
-    poison: dict = field(default_factory=dict)   # out -> 公式
-    sensitive: set = field(default_factory=set)
-    eff: frozenset = frozenset()
-    traits_ods: list = field(default_factory=list)
+    fn: object = None                 # 值层：fn(props, [(值, 毒值)]) -> ([(值, 毒值)], UB)，全部是 z3 项
+    eff: object = frozenset()         # {(kind, resource, 端口)} 或 TOP
+    exact: bool = True
     trust: dict = field(default_factory=dict)
-    prop: dict = None    # out -> 毒值传播公式，可引用 {P:port}；None 表示任一输入是毒值则输出是毒值
-    exact: bool = True   # Sem 是否精确（False：被抽象成过近似，比如非线性乘法）
+    value_known: bool = True
+    # 复合 op
+    body: list = None
+    mode: str = 'transparent'
+    summary: object = None            # 结构摘要（structure.StructSummary）
+    struct_diag: list = field(default_factory=list)
+    eff_diag: list = field(default_factory=list)
+    holes: list = None                # 摘要里代表输入端口的占位项 [(值, 毒值)]
+    outv: list = None                 # 摘要：每个输出的 (值, 毒值)
+    ubf: object = None                # 摘要：UB 条件
 
-    def inst(s, binding):
-        """binding: 端口 → 变量名；返回把占位符替换后的 (sem, ub, poison)。"""
-        sub = lambda f: re.sub(r'\{(\w+)\}', lambda m: binding[m.group(1)], f)
-        return sub(s.sem), sub(s.ub), {o: sub(p) for o, p in s.poison.items()}
+F_, T_ = z3.BoolVal(False), z3.BoolVal(True)
+def bv(x, t='i3'): return z3.BitVecVal(x, W(t))
+def anyp(a): return z3.Or([p for _, p in a]) if a else F_
 
-# ---- 原生 op：ODS 事实 + 人工语义覆盖层（authored）
-ARITH = open('inventory/Arith_ArithOps.td').read(); TENSOR = open('inventory/Tensor_TensorOps.td').read()
-U8 = 255
-def native(odsname, src, ins, outs, sem, ub='false', poison=None, sensitive=()):
-    o = import_op(src, odsname, KNOWN)
-    return Schema(odsname, ins, outs, sem, ub, poison or {}, set(sensitive), frozenset(), o['traits'],
-                  {'traits': 'ods', 'sem/ub/poison': 'authored'})
-LIB = {
-  'addi_nuw': native('Arith_AddIOp', ARITH, [('lhs', U8), ('rhs', U8)], [('r', U8)],
-                     '{r} = ({lhs} + {rhs}) mod 256', poison={'r': '{lhs} + {rhs} > 255'}),
-  'subi':     native('Arith_SubIOp', ARITH, [('lhs', U8), ('rhs', U8)], [('r', U8)], '{r} = ({lhs} - {rhs}) mod 256'),
-  'divui':    native('Arith_DivUIOp', ARITH, [('lhs', U8), ('rhs', U8)], [('r', U8)],
-                     '0 <= {r} <= {lhs}', ub='{rhs} = 0', sensitive=['rhs']),
-  'dim':      native('Tensor_DimOp', TENSOR, [('extent', BIG)], [('r', BIG)], '{r} = {extent}'),
-  'extract_slice': native('Tensor_ExtractSliceOp', TENSOR, [('d', BIG), ('o', BIG), ('n', BIG)], [('r', BIG)],
-                     '{r} = {n}', poison={'r': '{o} + {n} > {d}'}),
-  # tensor.extract：语义覆盖层故意写成“越界即 UB”，用来演示与 ODS 的 Pure 冲突会被审计出来
-  'extract':  native('Tensor_ExtractOp', TENSOR, [('t', BIG), ('i', BIG)], [('r', U8)],
-                     '0 <= {r} <= 255', ub='{i} >= {t}', sensitive=['t', 'i']),
-}
+# ───────────────────────── 原生 op（语义为人工覆盖层，结构取自 structure.STRUCT）
+REG = {}
+def reg(s): REG[s.name] = s; return s
+def nat(name, ins, outs, fn, eff=frozenset()):
+    return reg(Schema(name, ins, outs, fn, frozenset(eff), trust={'值层/效应': 'authored', '结构': 'ods'}))
+I3 = 'i3'
+def _add(p, a):
+    (x, px), (y, py) = a
+    return [(x + y, z3.Or(px, py, z3.Not(z3.BVAddNoOverflow(x, y, False)) if p.get('nuw') else F_))], F_
+def _sub(p, a):
+    (x, px), (y, py) = a
+    return [(x - y, z3.Or(px, py, z3.ULT(x, y) if p.get('nuw') else F_))], F_
+def _div(p, a):
+    (x, px), (y, py) = a
+    return [(z3.UDiv(x, y), px)], z3.Or(py, y == 0)               # 除数为 0 或毒值 ⇒ UB
+def _ult(p, a):
+    (x, px), (y, py) = a
+    return [(z3.If(z3.ULT(x, y), bv(1, 'i1'), bv(0, 'i1')), z3.Or(px, py))], F_
+def _sel(p, a):
+    (c, pc), (x, px), (y, py) = a
+    return [(z3.If(c == 1, x, y), z3.Or(pc, z3.If(c == 1, px, py)))], F_
+nat('arith.constant', [], [('r', I3)], lambda p, a: ([(bv(p['value']), F_)], F_))
+nat('arith.addi', [('lhs', I3), ('rhs', I3)], [('r', I3)], _add)
+nat('arith.subi', [('lhs', I3), ('rhs', I3)], [('r', I3)], _sub)
+nat('arith.divui', [('lhs', I3), ('rhs', I3)], [('r', I3)], _div)
+nat('arith.cmpi', [('lhs', I3), ('rhs', I3)], [('r', 'i1')], _ult)         # 只登记 ult
+nat('arith.select', [('c', 'i1'), ('a', I3), ('b', I3)], [('r', I3)], _sel)
+_ch = itertools.count()
+def _load(p, a): return [(z3.BitVec(f'load{next(_ch)}', 3), F_)], F_        # 读到的内容：非确定（自由变量）
+nat('memref.alloc', [], [('m', 'memref')], lambda p, a: ([(None, F_)], F_), eff={('Allocate', 'Default', 'm')})
+nat('memref.dealloc', [('m', 'memref')], [], lambda p, a: ([], F_), eff={('Free', 'Default', 'm')})
+nat('memref.load', [('m', 'memref')], [('r', I3)], _load, eff={('Read', 'Default', 'm')})
+nat('memref.store', [('v', I3), ('m', 'memref')], [], lambda p, a: ([], F_), eff={('Write', 'Default', 'm')})
 
-# ---- 复合 op 推导：结果仍是 Schema，可以再作为节点使用
-def S(vs, cs): return isl.Set('{ [%s] : %s }' % (', '.join(vs), ' and '.join(f'({c})' for c in cs) or 'true'))
-def as_formula(st, names):
-    """把 isl 集合转成以 {port} 为占位符的公式文本，供再次实例化。"""
-    st = st.coalesce()
-    for i, n in enumerate(names): st = st.set_dim_name(isl.dim_type.set, i, f'P_{n}')
-    if st.is_empty(): return 'false'
-    parts = []
-    for bs in st.get_basic_sets():                     # 并集按 basic set 逐个转成析取
-        t = str(bs); parts.append(t[t.index(':') + 1:t.rindex('}')].strip() if ':' in t else 'true')
-    txt = re.sub(r'(\d)P_', r'\1*P_', ' or '.join(f'({x})' for x in parts))    # isl 会打印成 3P_b 这样的并置形式
-    return re.sub(r'(?<![A-Za-z0-9_])P_(\w+)\b', r'{\1}', txt)
+def instantiate(sch, props, args):
+    """复合 op 的摘要实例化 = 项代换（嵌套 ≡ 内联的根据）。"""
+    pairs = [(h, a) for hs, as_ in zip(sch.holes, args) for h, a in zip(hs, as_) if h is not None]
+    sub = lambda t: z3.substitute(t, pairs) if pairs else t
+    return [(sub(v) if v is not None else None, sub(p)) for v, p in sch.outv], sub(sch.ubf)
+def is_comp(sch): return sch.body is not None
 
-def derive(name, ins, outs, nodes):
-    """ins: [(端口, 上界)]；nodes: [(id, schema, {输入端口: 来源})]，来源是边界端口名或 'id.out'；outs: {端口: 'id.out'}"""
-    var = {p: f'{p}_{next(_n)}' for p, _ in ins}; dom = [f'0 <= {var[p]} <= {h}' for p, h in ins]
-    P = {p: 'false' for p, _ in ins}; sem, ub = [], []
-    for nid, sch, wire in nodes:
-        b = {port: var[src] for port, src in wire.items()}
-        for o, h in sch.outs:
-            key = f'{nid}.{o}'; var[key] = f'{nid}_{o}_{next(_n)}'; b[o] = var[key]; dom.append(f'0 <= {var[key]} <= {h}')
-        s, u, po = sch.inst(b); sem.append(f'({s}) or ({u})'); ub.append(u)   # Sem 在 UB 处取全关系，保证 Sem 是全的
-        pin = ' or '.join(f'({P[src]})' for src in wire.values()) or 'false'
-        for o, _ in sch.outs:
-            if sch.prop and o in sch.prop:
-                pin = re.sub(r'\{P:(\w+)\}', lambda m: f'({P[wire[m.group(1)]]})', sch.prop[o])
-                pin = re.sub(r'\{(\w+)\}', lambda m: b[m.group(1)], pin)
-            P[f'{nid}.{o}'] = f'({pin}) or ({po.get(o, "false")})'
-        ub += [P[wire[x]] for x in sch.sensitive]
-    bnd = [var[p] for p, _ in ins]; ov = [var[outs[o]] for o, _ in outs_list(outs, nodes)]
-    rest = [v for v in var.values() if v not in bnd and v not in ov]
-    order = bnd + ov + rest; nb, no = len(bnd), len(ov)
-    proj = lambda X, k: X.project_out(isl.dim_type.set, k, len(order) - k)
-    semS = S(order, sem + dom)
-    bad = proj(semS.intersect(S(order, [' or '.join(f'({u})' for u in ub)])), nb)
-    domb = proj(S(order, dom), nb); pre = domb.subtract(bad)
-    names_in = [p for p, _ in ins]; names_out = list(outs)
-    rel = proj(semS, nb + no)                          # 不能限制到 Pre 上：否则外层会看不到 UB 输入（v3 初版的 bug）
-    poison = {o: as_formula(proj(semS.intersect(S(order, [P[outs[o]]])), nb).intersect(pre), names_in) for o in outs}
-    sch = Schema(name, ins, [(o, BIG) for o in outs], as_formula(rel, names_in + names_out),
-                 as_formula(domb.subtract(pre), names_in), poison, set(), frozenset(), [],
-                 {'*': 'derived'})
-    sch.exact = all(n[1].exact for n in nodes)
-    return sch, pre
+# ───────────────────────── 推导：一次遍历
+class Ctx:
+    def __init__(s): s.env, s.ub, s.eff, s.exact = {}, F_, [], True
+    def walk(s, blocks, g, path):
+        if len(blocks) != 1: raise ValueUnknown('多块 CFG 的值层尚未建模')
+        for n in blocks[0]['ops']:
+            op = n['op']
+            if op in ('scf.yield', 'func.return'): return [s.env[v] for v in n['ins']]
+            if op == 'scf.if':
+                c, pc = s.env[n['ins'][0]]
+                s.ub = z3.Or(s.ub, z3.And(g, pc))                       # 以毒值为条件分支 ⇒ UB
+                t = s.walk(n['regions'][0], z3.And(g, c == 1), path + ((n['id'], 1),))
+                e = s.walk(n['regions'][1], z3.And(g, c == 0), path + ((n['id'], 0),))
+                for (o, _), (tv, tp), (ev, ep) in zip(n['outs'], t, e):
+                    s.env[o] = (z3.If(c == 1, tv, ev), z3.Or(pc, z3.If(c == 1, tp, ep)))
+                continue
+            sch = REG.get(op)
+            if sch is None or not sch.value_known: raise ValueUnknown(op)
+            args = [s.env.get(v, (None, F_)) for v in n['ins']]
+            outs, ub = instantiate(sch, n.get('props', {}), args) if is_comp(sch) else sch.fn(n.get('props', {}), args)
+            s.ub = z3.Or(s.ub, z3.And(g, ub))                           # 分支里的 UB 只在该路径上算数
+            for (o, _), r in zip(n['outs'], outs): s.env[o] = r
+            vids = {p: v for (p, _), v in zip(sch.ins, n['ins'])} | {p: o for (p, _), (o, _) in zip(sch.outs, n['outs'])}
+            if sch.eff == TOP: s.eff.append(TOP)
+            else: s.eff += [(k, r, vids[p], path, n['id']) for k, r, p in sch.eff]
+            s.exact &= sch.exact
+        raise ValueUnknown('块没有终结子')
 
-def outs_list(outs, nodes): return [(o, None) for o in outs]
+def prove(f):
+    sv = z3.Solver(); sv.add(z3.Not(f)); return sv.check() == z3.unsat
 
-def caps(s, ins_dom):
-    spec = s.ub == 'false'
-    return {'Speculatable': spec, 'Pure': spec and not s.eff,
-            'MayPoison': {o: p for o, p in s.poison.items() if p != 'false'}}
+def compose_eff(effs, boundary):
+    """效应组合（v4：区域感知）。effs: [(kind, res, 值, 区域路径, 节点)]；boundary: 值 → 边界端口。
+    新缓冲在返回前无外部别名 ⇒ 对它的 Read/Write 不可见；Allocate 与 Free 只在**同一块**内才抵消，
+    只在某一分支里释放 ⇒ 其余路径泄漏（v3 的“局部 alloc+free 抵消”不看控制流，是不可靠的）。"""
+    if TOP in effs: return TOP, []
+    alloc = {t: p for k, _, t, p, _ in effs if k == 'Allocate'}
+    frees = {}
+    for k, _, t, p, _ in effs:
+        if k == 'Free': frees.setdefault(t, []).append(p)
+    out, diag = set(), []
+    for k, res, t, p, nid in effs:
+        if t in alloc:
+            if k in ('Read', 'Write', 'Free'): continue
+            if t in boundary: out.add(('Allocate', res, boundary[t])); continue
+            if alloc[t] in frees.get(t, []): continue
+            diag.append(f'{nid}: {t} ' + ('只在部分路径上释放，其余路径泄漏' if t in frees else '分配后既不释放也不逃逸（泄漏）'))
+            continue
+        out.add((k, res, boundary.get(t, t)))
+    return frozenset(out), diag
 
-def audit(lib):
-    """ODS 声明的 caps 与人工语义是否一致：声明 Pure/AlwaysSpeculatable 却有非空 UB ⇒ 冲突。"""
-    for k, s in lib.items():
-        if ('Pure' in s.traits_ods or 'AlwaysSpeculatable' in s.traits_ods) and s.ub != 'false':
-            print(f'  ✗ {k}: ODS 声明 Pure，语义覆盖层却有 UB「{s.ub}」 → 二者必有一错')
-        elif 'ConditionallySpeculatable' in s.traits_ods and s.ub == 'false':
-            print(f'  · {k}: ODS 为 ConditionallySpeculatable，语义上恒可推测 → 可以加强')
-        else: print(f'  ✓ {k}: {s.traits_ods}')
+def derive(name, ins, outs, blocks, mode='transparent'):
+    """ins/outs: [(端口, 类型)]；blocks: 实现体（入口块参数 = 输入端口）。返回 Schema 并登记。"""
+    sch = Schema(name, ins, outs, trust={'*': 'derived'}, body=blocks, mode=mode)
+    # 结构层：把体包成 func 检查 R1–R8，并求结构摘要
+    ft = '(' + ', '.join(t for _, t in ins) + ') -> (' + ', '.join(t for _, t in outs) + ')'
+    sch.struct_diag = list(ST.check(ST.M(ST.F(name, blocks, ftype=ft))))
+    sch.summary = ST.derive_struct(blocks)
+    c = Ctx()
+    holes = []
+    for (p, ty), (v, _) in zip(ins, blocks[0]['args']):
+        h = (z3.BitVec(f'{name}.{p}', W(ty)), z3.Bool(f'{name}.Z.{p}')) if is_int(ty) else (None, z3.Bool(f'{name}.Z.{p}'))
+        c.env[v] = h; holes.append(h)
+    try: ys = c.walk(blocks, T_, ())
+    except ValueUnknown:
+        sch.value_known, sch.exact = False, False
+        reg(sch); return sch
+    sch.holes, sch.outv, sch.ubf = holes, [(z3.simplify(v) if v is not None else None, z3.simplify(p)) for v, p in ys], z3.simplify(c.ub)
+    sch.exact = c.exact
+    boundary = {v: p for (p, _), (v, _) in zip(ins, blocks[0]['args'])} | {v: p for (p, _), v in zip(outs, _term(blocks))}
+    sch.eff, sch.eff_diag = compose_eff(c.eff, boundary)
+    sch.eff = sch.eff if sch.eff == TOP else frozenset((k, r, p) for k, r, p in sch.eff)
+    reg(sch); return sch
+
+def _term(blocks): return blocks[0]['ops'][-1]['ins'] if blocks[0]['ops'] else []
+def pretty(f):
+    g = z3.Goal(); g.add(f); r = z3.Tactic('ctx-solver-simplify')(g)[0]
+    return str(z3.And(*r) if len(r) != 1 else r[0]) if len(r) else 'True'
+
+def no_poison(s):
+    return z3.And([z3.Not(p) for _, p in s.holes]) if s.holes else T_
+def user_pre(s):
+    """面向用户的前提：输入都不是毒值时不触发 UB。"""
+    return z3.simplify(z3.And(no_poison(s), z3.Not(s.ubf)))
+def may_poison(s, j=0): return z3.simplify(z3.And(z3.Not(s.ubf), s.outv[j][1]))
+
+def caps(s):
+    if not s.value_known: return {'Speculatable': None, 'Pure': None}
+    spec = prove(z3.Not(s.ubf))                     # 毒值输入也不得触发 UB（推测执行时输入可能是毒值）
+    return {'Speculatable': spec, 'Speculatable|非毒值输入': prove(z3.Implies(no_poison(s), z3.Not(s.ubf))),
+            'Pure': spec and s.eff != TOP and not s.eff}
+
+def equivalent(a, b):
+    """两个 Schema 的值层是否相同（按端口位置对齐）：UB 相同；不 UB 时毒值相同；不是毒值时值相同。"""
+    pairs = [(hb, ha) for xa, xb in zip(a.holes, b.holes) for ha, hb in zip(xa, xb) if ha is not None]
+    sb = lambda t: z3.substitute(t, pairs)
+    conds = [a.ubf == sb(b.ubf)]
+    for (va, pa), (vb, pb) in zip(a.outv, b.outv):
+        conds.append(z3.Implies(z3.Not(a.ubf), pa == sb(pb)))
+        if va is not None: conds.append(z3.Implies(z3.And(z3.Not(a.ubf), z3.Not(pa)), va == sb(vb)))
+    return prove(z3.And(conds))
+
+# ───────────────────────── 透明内联（全内联，作为“嵌套 ≡ 内联”的对照）
+def inline_all(blocks, env=None, pfx=''):
+    env = dict(env or {}); out = []
+    for b in blocks:
+        ops = []
+        for v, _ in b['args']: env.setdefault(v, pfx + v)
+        args = [(env[v], t) for v, t in b['args']]
+        for n in b['ops']:
+            sch = REG.get(n['op'])
+            if sch is not None and sch.body is not None and sch.mode == 'transparent':
+                inner = dict(zip([v for v, _ in sch.body[0]['args']], [env.get(v, v) for v in n['ins']]))
+                p2 = f"{pfx}{n['id']}."
+                ib = inline_all([dict(sch.body[0], args=[])], inner, p2)[0]
+                term = ib['ops'][-1]; ops += ib['ops'][:-1]
+                for (o, _), y in zip(n['outs'], term['ins']): env[o] = y
+                continue
+            m = dict(n, id=pfx + n['id'], ins=[env.get(v, v) for v in n['ins']])
+            for o, _ in n['outs']: env[o] = pfx + o
+            m['outs'] = [(env[o], t) for o, t in n['outs']]
+            m['regions'] = [inline_all(r, env, pfx) for r in n['regions']]
+            ops.append(m)
+        out.append(dict(b, args=args, ops=ops))
+    return out
+
+# ───────────────────────── 编辑操作：提取为复合 op（带契约的图变换）
+def extract(name, block, lo, hi_, types, mode='transparent'):
+    """把 block['ops'][lo:hi_] 提取为复合 op。捕获的值提升为输入端口（L3），后面还会用到的值成为输出端口。
+    契约：提取前后，宿主的 Pre 与 MayPoison 相等（core_test.py 用 z3 判定等价）。"""
+    seg = block['ops'][lo:hi_]
+    defined, used = {}, []
+    def scan(ops):
+        for n in ops:
+            for v in n['ins']:
+                if v not in defined and v not in used: used.append(v)
+            for v, t in n['outs']: defined[v] = t
+            for r in n['regions']:
+                for b in r:
+                    for v, t in b['args']: defined[v] = t
+                    scan(b['ops'])
+    scan(seg)
+    later = set()
+    def uses(ops):
+        for n in ops:
+            later.update(n['ins'])
+            for r in n['regions']:
+                for b in r: uses(b['ops'])
+    uses(block['ops'][hi_:])
+    caps_ = [v for v in used if v not in defined]
+    outs = [v for v in defined if v in later and any(v == o for n in seg for o, _ in n['outs'])]
+    pm = {v: f'{name}_in{i}' for i, v in enumerate(caps_)}
+    body_ops = [ren(n, pm) for n in seg] + [node(f'{name}_ret', 'func.return', ins=[pm.get(v, v) for v in outs])]
+    body = [blk('entry', body_ops, args=[(pm[v], types[v]) for v in caps_])]
+    s = derive(name, [(pm[v], types[v]) for v in caps_], [(f'o{i}', types[v]) for i, v in enumerate(outs)], body, mode)
+    call = node(f'{name}_call', name, ins=caps_, outs=[(v, types[v]) for v in outs])
+    return s, dict(block, ops=block['ops'][:lo] + [call] + block['ops'][hi_:])
+def ren(n, pm):
+    return dict(n, ins=[pm.get(v, v) for v in n['ins']],
+                regions=[[dict(b, ops=[ren(x, pm) for x in b['ops']]) for b in r] for r in n['regions']])
+
+# ───────────────────────── 小工具
+def cst(i, v, t='i3'): return node(i, 'arith.constant', outs=[(i, t)], props={'value': v})
+def op2(i, op, a, b, t='i3', **p): return node(i, op, ins=[a, b], outs=[(i, t)], props=p)
+def ret(i, *vs): return node(i, 'func.return', ins=list(vs))
 
 if __name__ == '__main__':
-    print('■ ODS caps 与语义覆盖层的一致性审计'); audit(LIB)
-
-    # 闭包测试：内层复合 op 当作节点使用，与“全部内联”的推导结果比较
-    inner, _ = derive('sum_nuw', [('a', U8), ('b', U8)], {'s': 'add.r'},
-                      [('add', LIB['addi_nuw'], {'lhs': 'a', 'rhs': 'b'})])
-    print('■ 内层 sum_nuw:', caps(inner, None), ' sem:', inner.sem)
-    nested, pre_n = derive('f_nested', [('x', U8), ('a', U8), ('b', U8)], {'q': 'div.r'},
-                           [('s', inner, {'a': 'a', 'b': 'b'}), ('div', LIB['divui'], {'lhs': 'x', 'rhs': 's.s'})])
-    flat, pre_f = derive('f_flat', [('x', U8), ('a', U8), ('b', U8)], {'q': 'div.r'},
-                         [('add', LIB['addi_nuw'], {'lhs': 'a', 'rhs': 'b'}), ('div', LIB['divui'], {'lhs': 'x', 'rhs': 'add.r'})])
-    print('■ x / (a +nuw b)  Pre(嵌套):', pre_n.coalesce())
-    print('  嵌套推导 ≡ 全内联推导:', pre_n.is_equal(pre_f.reset_space(pre_n.get_space())), ' caps:', caps(nested, None))
-    # 再套一层：复合中的复合中的复合
-    g, pre_g = derive('g', [('x', U8), ('a', U8), ('b', U8)], {'q': 'f.q'}, [('f', nested, {'x': 'x', 'a': 'a', 'b': 'b'})])
-    print('  三层嵌套 ≡ 全内联:', pre_g.is_equal(pre_f.reset_space(pre_g.get_space())))
+    f = derive('f', [('x', I3), ('y', I3)], [('q', I3)],
+               [blk('entry', [op2('d', 'arith.divui', 'x', 'y'), ret('r', 'd')], args=[('x', I3), ('y', I3)])])
+    print('■ f(x,y) = x / y   Pre:', pretty(user_pre(f)), ' caps:', caps(f))
+    g = derive('g', [('a', I3), ('b', I3)], [('q', I3)],
+               [blk('entry', [cst('z', 0), op2('c', 'arith.cmpi', 'z', 'b', 'i1'),
+                              node('if', 'scf.if', ins=['c'], outs=[('r', I3)], regions=[
+                                  [blk('t', [op2('d', 'arith.divui', 'a', 'b'), node('y1', 'scf.yield', ins=['d'])])],
+                                  [blk('e', [node('y2', 'scf.yield', ins=['z'])])]]),
+                              ret('rr', 'r')], args=[('a', I3), ('b', I3)])])
+    print('■ g(a,b) = 0<b ? a/b : 0   Pre:', pretty(user_pre(g)), ' caps:', caps(g), ' 结构违例:', g.struct_diag)
