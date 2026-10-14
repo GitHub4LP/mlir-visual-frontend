@@ -346,11 +346,13 @@ def derive(name, ins, outs, blocks, mode='transparent', params=()):
         reg(sch); return sch
     sch.holes, sch.outv, sch.ubf = holes, [(z3.simplify(v) if v is not None else None, z3.simplify(p)) for v, p in ys], z3.simplify(c.ub)
     sch.exact = c.exact; sch.ax = z3.simplify(z3.And(c.ax)) if c.ax else T_; sch.loop_diag = c.diag
+    sch.env = {v: c.env[v] for v in _toplevel_vals(blocks) if v in c.env}     # 顶层值的项：补全查询用
     boundary = {v: p for (p, _), (v, _) in zip(ins, blocks[0]['args'])} | {v: p for (p, _), v in zip(outs, _term(blocks))}
     sch.eff, sch.eff_diag = compose_eff(c.eff, boundary)
     sch.eff = sch.eff if sch.eff == TOP else frozenset((k, r, p) for k, r, p in sch.eff)
     reg(sch); return sch
 
+def _toplevel_vals(blocks): return [v for v, _ in blocks[0]['args']] + [o for n in blocks[0]['ops'] for o, _ in n['outs']]
 def _term(blocks): return blocks[0]['ops'][-1]['ins'] if blocks[0]['ops'] else []
 def pretty(f):
     g = z3.Goal(); g.add(f); r = z3.Tactic('ctx-solver-simplify')(g)[0]
