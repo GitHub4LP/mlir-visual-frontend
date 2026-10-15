@@ -162,7 +162,9 @@ def check(S, ins, outs, levels=('ods', 'cpred')):
     """ins/outs：按端口分组的类型列表（[[t…] 每组]）。返回违例列表。"""
     bad = []
     env = {}
-    for (nm, p, m, _), ts in zip(S['ins'] + S['outs'], ins + outs):
+    partial = outs is None                       # 结果端口组无法绑定：只检查操作数一侧（仍是上近似）
+    if partial: outs = []
+    for (nm, p, m, _), ts in zip(S['ins'] + (S['outs'] if not partial else []), ins + outs):
         env[nm] = ts
         if m == 'one' and len(ts) != 1 or m == 'optional' and len(ts) > 1: bad.append(f'{nm}: 个数'); continue
         if not all(p(t) for t in ts): bad.append(f'{nm}: 端口约束')
@@ -173,7 +175,10 @@ def check(S, ins, outs, levels=('ods', 'cpred')):
     E = lambda t: t[2] if shaped(t) else t
     for x in S['rel']:
         if x[2] not in levels: continue
-        k = x[0]; groups = [get(a) for a in x[1]]; ts = [t for g in groups for t in g]
+        k = x[0]
+        if partial and (not x[1] and k not in ('same_ops', 'shape_ops', 'elt_ops') or
+                        any(a[0] == 'res' or a[0] == 'name' and a[1] not in [n for n, *_ in S['ins']] for a in x[1])): continue
+        groups = [get(a) for a in x[1]]; ts = [t for g in groups for t in g]
         if k == 'samec_all':
             al = opd + res
             ok = all(E(a) == E(b) and compat_shape(a, b) and a[0] == b[0] for a, b in itertools.combinations(al, 2))
@@ -201,7 +206,7 @@ def check(S, ins, outs, levels=('ods', 'cpred')):
             c, rr = groups; ok = bool(c) and bool(rr) and (c[0] == ('i', 1, '') or (shaped(c[0]) and shaped(rr[0]) and ranked(c[0]) and ranked(rr[0]) and c[0][1] == rr[0][1]))
         else: ok = True
         if not ok: bad.append(f'{k}({",".join(str(a[1]) for a in x[1])})')
-    if S['infer'] and 'ods' in levels:
+    if S['infer'] and 'ods' in levels and not partial:
         for nm, rl in S['infer'].items():
             if rl[0] == 'build': want = BUILD.get(rl[1].strip())
             elif rl[0] == 'copy': want = (env.get(rl[1]) or [None])[0]
@@ -217,3 +222,25 @@ def ledger(dialect, opname):
     S = sig(dialect, opname)
     cls = 'unknown' if S['unknown'] else 'declared' if S['declared'] else 'cpred' if any(x[2] == 'cpred' for x in S['rel']) else 'auto'
     return cls, S
+
+# ── 供 core 使用：按 op 名查签名；把扁平的操作数/结果表绑定到端口组 ──────────────────
+@functools.lru_cache(None)
+def lookup(op):
+    dia = op.split('.')[0]
+    if dia not in O.DIALECTS or op not in O.ops(dia): return None
+    return ledger(dia, op)
+
+def bind(S, flat, ports, seg=None):
+    """flat：类型列表；ports：S['ins'] 或 S['outs']。只有一个非 one 组时可唯一绑定；否则需 seg（各组个数）。不可绑定 ⇒ None。"""
+    if seg is not None:
+        if len(seg) != len(ports) or sum(seg) != len(flat): return None
+        out, i = [], 0
+        for k in seg: out.append(flat[i:i + k]); i += k
+        return out
+    multi = [j for j, p in enumerate(ports) if p[2] != 'one']
+    fixed = len(ports) - len(multi)
+    if len(multi) > 1: return None
+    if not multi: return [[t] for t in flat] if len(flat) == fixed else None
+    k = len(flat) - fixed
+    if k < 0 or (ports[multi[0]][2] == 'optional' and k > 1): return None
+    j = multi[0]; return [[t] for t in flat[:j]] + [flat[j:j + k]] + [[t] for t in flat[j + k:]]

@@ -455,28 +455,71 @@ def compose_eff(effs, boundary):
         out.add((k, res, boundary.get(t, t)))
     return frozenset(out), diag
 
-def typecheck(blocks):
-    """类型层（第 7 轮，typesig.py）：有签名的 op 逐节点检查；有违例 ⇒ 不进值层（值层只对良类型图有定义）。
-    core 的切片 op 省略了步长（恒为 1）与 insert_slice 的尺寸（取源的 extent），这里补成 MLIR 的端口组再检查。"""
-    import typesig as TSg
+ORACLE_ON = True       # 预言机层开关（oracle.py）；关掉后只剩符号层
+TC_STATS = {'节点': 0, '自动签名': 0, '无法绑定': 0, '需预言机的体': 0, '预言机调用': 0, '预言机不可用→人工签名': 0, '预言机不可用→仅符号层': 0,
+            '人工签名误拒（预言机接受）': 0, '人工签名误收（预言机拒绝）': 0}
+def typecheck(blocks, ftype=None):
+    """类型层的判定次序（第 10 轮，import.md §6、oracle.md）：
+      1 自动签名（odssig.py，tblgen 导入）。它对一切 op 是上近似（L29），对 auto 账目精确（L28）⇒ 它的拒绝是终判，auto op 不再问别人。
+      2 体内有 declared/unknown 的 op，或端口组无法绑定 ⇒ 整个体交给预言机（oracle.py，同一提交的 MLIR verifier）。预言机是终判。
+      3 预言机不可用（体内有 MLIR 不认识的 op、core 的简写形式、多块）⇒ 退回人工精度签名（typesig.py），并标明“未经预言机”。
+    人工精度签名不参与可用预言机时的判定：第 10 轮发现它误拒 0 维向量（vector<i32>），说明人工声明必须被审计，而不能当权威。
+    预言机可用时顺便审计人工签名，分歧计入 TC_STATS。
+    core 的切片 op 省略了步长（恒为 1）与 insert_slice 的尺寸（取源的 extent），人工签名检查前补成 MLIR 的端口组。"""
+    import typesig as TSg, odssig as G
     sigs, tys, out = TSg.load(), {}, []
+    need, hand = [], []
+    def hand_check(n, ins, outs_):
+        seg = None
+        if n['op'] == 'tensor.extract_slice':
+            r = (len(ins) - 1) // 2; ins = ins + [('index',)] * r; seg = [1, r, r, r]
+        if n['op'] == 'tensor.insert_slice':
+            r = len(ins) - 2; ins = ins + [('index',)] * (2 * r); seg = [1, 1, r, r, r]
+        return [(n['id'], f'{src}（人工签名，未经预言机）: {msg}') for src, msg in TSg.check(n['op'], ins, outs_, TSg.LEVELS, seg)]
     def walk(bs):
         for b in bs:
             for v, t in b['args']: tys[v] = t
             for n in b['ops']:
                 for o, t in n['outs']: tys[o] = t
                 for r in n['regions']: walk(r)
-                if n['op'] not in sigs: continue
+                if n['op'] in ('func.return', 'func.call', 'scf.yield'): continue      # 由结构层（structure.py R1–R8）负责
+                TC_STATS['节点'] += 1
+                lk = G.lookup(n['op'])
                 try:
                     ins = [TSg.parse(tys[v]) for v in n['ins']]; outs_ = [TSg.parse(t) for _, t in n['outs']]
-                except (KeyError, ValueError, AttributeError): out.append((n['id'], '类型无法解析')); continue
-                seg = None
-                if n['op'] == 'tensor.extract_slice':
-                    r = (len(ins) - 1) // 2; ins = ins + [('index',)] * r; seg = [1, r, r, r]
-                if n['op'] == 'tensor.insert_slice':
-                    r = len(ins) - 2; ins = ins + [('index',)] * (2 * r); seg = [1, 1, r, r, r]
-                out.extend((n['id'], f'{src}: {msg}') for src, msg in TSg.check(n['op'], ins, outs_, TSg.LEVELS, seg))
-    walk(blocks); return out
+                except (KeyError, ValueError, AttributeError):
+                    if lk is not None: need.append(n['id'])
+                    continue
+                if lk is None:
+                    if n['op'] in sigs: hand.extend(hand_check(n, ins, outs_)); need.append(n['id'])
+                    continue                                                             # 复合 op：由其 Schema 负责
+                cls, S = lk; TC_STATS['自动签名'] += 1
+                gi, go = G.bind(S, ins, S['ins'], n.get('seg')), G.bind(S, outs_, S['outs'])
+                if gi is not None: out.extend((n['id'], f'ods: {m}') for m in G.check(S, gi, go))
+                if gi is None or go is None: TC_STATS['无法绑定'] += 1
+                if cls != 'auto' or gi is None or go is None:
+                    need.append(n['id'])
+                    if n['op'] in sigs: hand.extend(hand_check(n, ins, outs_))
+    walk(blocks)
+    if out or not need: return out
+    import oracle as OR
+    text = OR.emit_core(blocks, ftype or _ftype_of(blocks, tys)) if ORACLE_ON else None
+    if text is not None:
+        TC_STATS['需预言机的体'] += 1; TC_STATS['预言机调用'] += 1
+        st, diags = OR.get().verify(text)
+        if st == 'parse': TC_STATS.setdefault('发射缺陷', []).append(diags[0][1][:80]); text = None
+        else:
+            res = [(nid or need[0], f'oracle/{st}: {m}') for nid, m in diags] if st != 'ok' else []
+            if hand and not res: TC_STATS['人工签名误拒（预言机接受）'] += 1; TC_STATS.setdefault('人工签名误拒例', []).append(hand[0])
+            hn = {n['id'] for b in blocks for n in b['ops'] if n['op'] in sigs}
+            if res and not hand and any(nid in hn for nid, _ in res): TC_STATS['人工签名误收（预言机拒绝）'] += 1
+            return res
+    if ORACLE_ON: TC_STATS['预言机不可用→人工签名' if hand else '预言机不可用→仅符号层'] += 1
+    return hand
+
+def _ftype_of(blocks, tys):
+    rets = [n for n in blocks[-1]['ops'] if n['op'] == 'func.return']
+    return '() -> (' + ', '.join(tys.get(v, '?') for v in (rets[0]['ins'] if rets else [])) + ')'
 
 def derive(name, ins, outs, blocks, mode='transparent', params=()):
     """ins/outs: [(端口, 类型)]；blocks: 实现体（入口块参数 = 输入端口）。返回 Schema 并登记。"""
@@ -486,7 +529,7 @@ def derive(name, ins, outs, blocks, mode='transparent', params=()):
     ft = '(' + ', '.join(t for _, t in ins) + ') -> (' + ', '.join(t for _, t in outs) + ')'
     sch.struct_diag = list(ST.check(ST.M(ST.F(name, blocks, ftype=ft))))
     sch.summary = ST.derive_struct(blocks)
-    sch.type_diag = typecheck(blocks)
+    sch.type_diag = typecheck(blocks, ft)
     if sch.type_diag:
         sch.value_known, sch.exact = False, False
         reg(sch); return sch
