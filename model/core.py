@@ -455,6 +455,7 @@ def compose_eff(effs, boundary):
         out.add((k, res, boundary.get(t, t)))
     return frozenset(out), diag
 
+TYPE_WARN = []         # 人工签名的提示：未经证实，不作拒绝（第 12 轮）
 ORACLE_ON = True       # 预言机层开关（oracle.py）；关掉后只剩符号层
 TC_STATS = {'节点': 0, '自动签名': 0, '无法绑定': 0, '需预言机的体': 0, '预言机调用': 0, '预言机不可用→人工签名': 0, '预言机不可用→仅符号层': 0,
             '人工签名误拒（预言机接受）': 0, '人工签名误收（预言机拒绝）': 0}
@@ -462,7 +463,9 @@ def typecheck(blocks, ftype=None):
     """类型层的判定次序（第 10 轮，import.md §6、oracle.md）：
       1 自动签名（odssig.py，tblgen 导入）。它对一切 op 是上近似（L29），对 auto 账目精确（L28）⇒ 它的拒绝是终判，auto op 不再问别人。
       2 体内有 declared/unknown 的 op，或端口组无法绑定 ⇒ 整个体交给预言机（oracle.py，同一提交的 MLIR verifier）。预言机是终判。
-      3 预言机不可用（体内有 MLIR 不认识的 op、core 的简写形式、多块）⇒ 退回人工精度签名（typesig.py），并标明“未经预言机”。
+      3 预言机不可用（体内有 MLIR 不认识的 op、core 的简写形式、多块）⇒ 人工精度签名（typesig.py）只给提示（TYPE_WARN），不拒绝。
+        第 12 轮：人工签名在 MLIR 自己的合法测试 IR 上误拒 203 个函数（corpus_test C2），而自动签名与结构层误拒 0；
+        只有证明过不误拒的层（结构层、自动签名、预言机）才有权拒绝。
     人工精度签名不参与可用预言机时的判定：第 10 轮发现它误拒 0 维向量（vector<i32>），说明人工声明必须被审计，而不能当权威。
     预言机可用时顺便审计人工签名，分歧计入 TC_STATS。
     core 的切片 op 省略了步长（恒为 1）与 insert_slice 的尺寸（取源的 extent），人工签名检查前补成 MLIR 的端口组。"""
@@ -515,7 +518,8 @@ def typecheck(blocks, ftype=None):
             if res and not hand and any(nid in hn for nid, _ in res): TC_STATS['人工签名误收（预言机拒绝）'] += 1
             return res
     if ORACLE_ON: TC_STATS['预言机不可用→人工签名' if hand else '预言机不可用→仅符号层'] += 1
-    return hand
+    if hand: TYPE_WARN.extend(hand); TC_STATS['人工签名提示（不拒绝）'] = TC_STATS.get('人工签名提示（不拒绝）', 0) + 1
+    return []
 
 def _ftype_of(blocks, tys):
     rets = [n for n in blocks[-1]['ops'] if n['op'] == 'func.return']

@@ -24,3 +24,11 @@ sh scripts/fetch_tools.sh && PYTHONPATH=model python3 model/odssig_test.py 40
 PYTHONPATH=model python3 model/oracle_test.py 1000
 PYTHONPATH=model python3 model/vslice_demo.py
 ```
+
+
+## 独立差分：MLIR 自己的测试集（第 12 轮）
+```
+sh scripts/fetch_corpus.sh            # mlir/test/Dialect/*，与绑定同一提交，不入库
+PYTHONPATH=model python3 model/corpus_test.py
+```
+见 spec/corpus.md。

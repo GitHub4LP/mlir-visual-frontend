@@ -104,8 +104,8 @@ ATOM_RE = [   # (正则, 由匹配组生成谓词)；作用于规范化（去空
     (r'\(::llvm::isa<::mlir::IndexType>\(\$_self\)\)', lambda: lambda t: t[0] == 'index'),
     (r'\(\$_self\.isSignlessIntOrIndex\(\)\)', lambda: lambda t: (_I(t) and t[2] == '') or t[0] == 'index'),
     (r'\(::llvm::isa<::mlir::VectorType>\(\$_self\)\)', lambda: lambda t: t[0] == 'vector'),
-    (r'\(::llvm::isa<::mlir::FixedVectorType>\(\$_self\)\)', lambda: lambda t: t[0] == 'vector'),
-    (r'\(::llvm::isa<::mlir::ScalableVectorType>\(\$_self\)\)', lambda: lambda t: False),          # 类型池不含可伸缩向量
+    (r'\(::llvm::isa<::mlir::FixedVectorType>\(\$_self\)\)', lambda: lambda t: t[0] == 'vector' and not _scal(t)),
+    (r'\(::llvm::isa<::mlir::ScalableVectorType>\(\$_self\)\)', lambda: lambda t: t[0] == 'vector' and _scal(t)),   # 第 12 轮：真实 IR 有可伸缩向量
     (r'\(::llvm::isa<::mlir::RankedTensorType>\(\$_self\)\)', lambda: lambda t: t[0] == 'tensor' and t[1] is not None),
     (r'\(::llvm::isa<::mlir::UnrankedTensorType>\(\$_self\)\)', lambda: lambda t: t[0] == 'tensor' and t[1] is None),
     (r'\(::llvm::isa<::mlir::TensorType>\(\$_self\)\)', lambda: lambda t: t[0] == 'tensor'),
@@ -129,6 +129,7 @@ ATOM_RE = [   # (正则, 由匹配组生成谓词)；作用于规范化（去空
 ]
 XFORM = {norm('::llvm::cast<::mlir::ShapedType>($_self).getElementType()'): lambda t: t[2] if shaped(t) else None,
          norm('::llvm::cast<::mlir::ComplexType>($_self).getElementType()'): lambda t: t[1] if t[0] == 'complex' else None}
+def _scal(t): return len(t) > 3 and any(dict(t[3][1]).get('scalable', ()))
 class _AtomTable(dict):
     def __contains__(self, k): return self.get(k) is not None
     def get(self, k, default=None):

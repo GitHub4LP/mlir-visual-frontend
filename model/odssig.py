@@ -245,3 +245,23 @@ def bind(S, flat, ports, seg=None):
     k = len(flat) - fixed
     if k < 0 or (ports[multi[0]][2] == 'optional' and k > 1): return None
     j = multi[0]; return [[t] for t in flat[:j]] + [flat[j:j + k]] + [[t] for t in flat[j + k:]]
+
+
+def region_cons(opname):
+    """ODS 的区域约束 → [(名字, 下界块数, 上界块数或 None, 可变个数)]。没有导入该 op ⇒ None。
+    SizedRegion<n>：恰 n 块；MaxSizedRegion<n>：至多 n 块（可为空）；AnyRegion：任意（可为空）；VariadicRegion<R>：R 可重复。"""
+    import re as _re
+    dia = opname.split('.')[0]
+    if dia not in O.DIALECTS: return None
+    d = O.records(dia); ops = O.ops(dia)
+    if opname not in ops: return None
+    out = []
+    for c, nm in O.dag_args(d[ops[opname]]['regions']):
+        r = d.get(c, {}); sc = r.get('!superclasses', []); sm = r.get('summary', '') or ''
+        var = 'VariadicRegion' in sc
+        m = _re.search(r'with (at most )?(\d+) blocks?', sm)
+        if m and not m.group(1) and 'MaxSizedRegion' not in sc: lo, hi = int(m.group(2)), int(m.group(2))
+        elif m: lo, hi = 0, int(m.group(2))
+        else: lo, hi = 0, None
+        out.append((nm, lo, hi, var))
+    return out

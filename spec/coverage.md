@@ -91,4 +91,8 @@
 ## 小结
 共 52 项：✓ 16，◐ 27，✗ 8，— 1（2026-10-15，导入面之后）。
 - 剩下的 ✗：递归、方言组织（命名空间、版本、IRDL、方言扩展、bytecode）、transform dialect、数据流分析框架、WASM。
-- 当前最大的缺口（按 review-r7.md 的新路线）：(1) 属性层：op 参数集合从 ODS 导入（oracle.md §8）；(2) attribute/property 的验证差分；(3) trait/interface 作为查询的导入与审计。
+- 当前最大的缺口（按 review-r7.md 的新路线）：(1) 属性层：op 参数集合从 ODS 导入（oracle.md §8），方言资源表、类型/属性良构性改用 MLIR 构造器（corpus.md §5）；(2) attribute/property 的验证差分；(3) trait/interface 作为查询的导入与审计。
+
+
+## 第 12 轮
+真实 IR 导入（irimport.py）：MLIR 测试集 2111 段中 2108 段往返逐字相同；3487 个函数结构层与自动签名误拒 0。类型文法、区域块数、终结子性质改由 MLIR/ODS 导入。人工签名失去拒绝权（L33）。详见 corpus.md。
