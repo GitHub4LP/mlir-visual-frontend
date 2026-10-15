@@ -91,4 +91,4 @@
 ## 小结
 共 52 项：✓ 16，◐ 27，✗ 8，— 1（2026-10-15，导入面之后）。
 - 剩下的 ✗：递归、方言组织（命名空间、版本、IRDL、方言扩展、bytecode）、transform dialect、数据流分析框架、WASM。
-- 当前最大的缺口（按 review-r7.md 的新路线）：(1) 预言机覆盖 region/后继/多块与复合 op 内联（oracle.md §5）；(2) attribute/property 的验证差分；(3) trait/interface 作为查询的导入与审计。
+- 当前最大的缺口（按 review-r7.md 的新路线）：(1) 属性层：op 参数集合从 ODS 导入（oracle.md §8）；(2) attribute/property 的验证差分；(3) trait/interface 作为查询的导入与审计。
