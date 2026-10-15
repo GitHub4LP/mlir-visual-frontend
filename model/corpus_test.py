@@ -80,15 +80,16 @@ def run_file(path, q):
         except Exception as e:
             st['C1 往返失败'] += 1; note('C1 往返失败', f'{os.path.basename(path)}#{k}: {str(e)[:120]}'); continue
         # C2
+        try: mod_sd = list(ST.check(g))
+        except Exception as e:
+            st['C2 结构层异常'] += 1; note('C2 结构层异常', f'{os.path.basename(path)}#{k}: {type(e).__name__} {str(e)[:100]}'); mod_sd = None
         for f in funcs(g):
             st['C2 函数'] += 1
             ftype = f['props']['_attrs'].get('function_type', '() -> ()')
             body = f['regions'][0] if f['regions'] and f['regions'][0] else None
             if body is None: st['C2 声明（无体）'] += 1; continue
-            try:
-                sd = list(ST.check(ST.M(ST.F(f['props']['_attrs'].get('sym_name', '"f"').strip('"'), body, ftype=ftype))))
-            except Exception as e:
-                st['C2 结构层异常'] += 1; note('C2 结构层异常', f'{os.path.basename(path)}#{k}: {type(e).__name__} {str(e)[:100]}'); sd = None
+            # 第 14 轮：结构层（含符号义务）对整个模块判定一次；此前把单个函数装进新模块，符号上下文丢失、且 S1–S4 在导入节点上从未触发
+            sd = [x for x in mod_sd if x[0] in fids(f)] if mod_sd is not None else None
             try:
                 C.TYPE_WARN.clear(); td = C.typecheck(body, ftype)
             except Exception as e:
@@ -99,6 +100,14 @@ def run_file(path, q):
                 st['C2 自动签名误拒'] += 1; note('C2 自动签名误拒', f'{os.path.basename(path)}#{k}: {td[0]}'[:200])
             if sd == [] and td == []: st['C2 两层都接受'] += 1
     q.put((dict(st), dict(ex)))
+
+def fids(f):
+    """函数 f 自身及其内部所有节点 / 块的诊断定位名。"""
+    out = {f['id']}
+    for r in f['regions']:
+        for b in r:
+            for m in b['ops']: out |= fids(m); out.add(f"{f['id']}/{b['name']}")
+    return out
 
 def funcs(n):
     if n['op'] == 'func.func': yield n; return
