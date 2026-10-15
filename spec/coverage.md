@@ -22,7 +22,7 @@
 | # | 机制 | 元模型落点 | 强度 | 状态 | 证据或缺口 |
 |---|---|---|---|---|---|
 | 11 | builtin 类型 | 类型项；值层多 sort（iN 位向量、index 为 ℤ、tensor 为 ⟨extent, 元素, 元素毒值⟩） | E | ◐ | core：任意 iN、index、tensor（shapes.md）；float/vector/memref 形状不在 core |
-| 12 | TypeConstraint（211 个具名定义） | 规范化原子 | 190 E / 21 S | ◐ | normalize_types.py，未接入 core |
+| 12 | TypeConstraint（211 个具名定义） | 端口谓词，来源分级 ods/cpred/declared | 190 E / 21 S | ◐ | typesig.py 接入 core：23 个 op 与 MLIR verifier 6696/6696（只用 ODS 时误收 582）；其余 op 未导入 |
 | 13 | 用户定义类型（TypeDef、IRDL、ADT） | define_adt：sort + 生成的 op + 生成的降级 | E | ◐ | definitions.md §5；标量字段、≤2 个变体、无递归 |
 | 14 | Attribute（Integer、Dense、Array、Dict、SymbolRef、Type、AffineMap…） | 静态项，按指称存储（L8） | E | ◐ | D1 与 MLIR 600/600；缺 Dense、Float、AffineMap、Dict |
 | 15 | Properties 与可丢弃 attribute 的区分 | 参数进语义，元数据不进；命名空间分离（L9） | E | ✓ | D2 与 MLIR：不可靠 0 |
@@ -33,9 +33,9 @@
 ## C 签名
 | # | 机制 | 元模型落点 | 强度 | 状态 | 证据或缺口 |
 |---|---|---|---|---|---|
-| 19 | Variadic、Optional、segment | 端口组 | E | ◐ | 只在规范 |
-| 20 | InferTypeOpInterface | 类型推导 | E | ◐ | solver.py |
-| 21 | 签名 trait（SameOperandsAndResultType…） | Φ 上的蕴含查询 | E | ◐ | solver.py |
+| 19 | Variadic、Optional、segment | 端口组 | E | ◐ | typesig.bind：单变长组与段属性；复合 op 的变长端口未做 |
+| 20 | InferTypeOpInterface | 类型推导 | E | ◐ | typesig.infer：239/239 被 MLIR 接受；ODS 自动生成的 InferType 是“结果相等”条件；复合 op 的多态推导未并入 |
+| 21 | 签名 trait（SameOperandsAndResultType…） | 端口间关系 | E | ✓ | typesig.py：7 种 trait 自动导入，按 MLIR 的实现语义（不是名字的字面意思）检验 |
 
 ## D 语义与效应
 | # | 机制 | 元模型落点 | 强度 | 状态 | 证据或缺口 |
@@ -89,6 +89,6 @@
 | 51 | 增量查询（增量 ≡ 全量） | ◐ | edit.md：Merkle 键 + 指纹早截断（L21），720 次编辑 0 不一致；定义内部不细分 |
 
 ## 小结
-共 52 项：✓ 13，◐ 30，✗ 8，— 1（2026-10-14，形状层 v0 之后；#27 仍为 ◐，但覆盖面扩大）。
+共 52 项：✓ 14，◐ 29，✗ 8，— 1（2026-10-15，类型层 v0 之后）。
 - 剩下的 ✗：递归、方言组织（命名空间、版本、IRDL、方言扩展、bytecode）、transform dialect、数据流分析框架、WASM。
-- 当前最大的缺口：(1) scf.while 和多块 CFG 的值层；(2) memref 的形状与别名（bufferization 契约）；(3) 区域内部的编辑、签名变更的传播。
+- 当前最大的缺口（按 review-r7.md 的新路线）：(1) 复合 op 的多态签名与导入面（全方言）；(2) attribute/property 的验证差分；(3) trait/interface 作为查询的导入与审计。
