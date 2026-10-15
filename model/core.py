@@ -71,6 +71,7 @@ class Schema:
     params: list = field(default_factory=list)   # 复合 op 的参数 [(名字, 'int'|'bool')]，摘要对它们是符号的
     pconsts: dict = field(default_factory=dict)
     ax: object = None                 # 摘要附带的公理（循环不变式在出口成立等），查询时作为假设
+    type_diag: list = field(default_factory=list)  # 类型层违例 [(节点, 说明)]（typesig.py）
     wf: list = field(default_factory=list)       # L22 静态维的证明义务 [(节点, 公式)]
     guards: list = field(default_factory=list)   # L24 降低到 MLIR 时的守卫义务 [(节点, 公式)]
 
@@ -454,6 +455,29 @@ def compose_eff(effs, boundary):
         out.add((k, res, boundary.get(t, t)))
     return frozenset(out), diag
 
+def typecheck(blocks):
+    """类型层（第 7 轮，typesig.py）：有签名的 op 逐节点检查；有违例 ⇒ 不进值层（值层只对良类型图有定义）。
+    core 的切片 op 省略了步长（恒为 1）与 insert_slice 的尺寸（取源的 extent），这里补成 MLIR 的端口组再检查。"""
+    import typesig as TSg
+    sigs, tys, out = TSg.load(), {}, []
+    def walk(bs):
+        for b in bs:
+            for v, t in b['args']: tys[v] = t
+            for n in b['ops']:
+                for o, t in n['outs']: tys[o] = t
+                for r in n['regions']: walk(r)
+                if n['op'] not in sigs: continue
+                try:
+                    ins = [TSg.parse(tys[v]) for v in n['ins']]; outs_ = [TSg.parse(t) for _, t in n['outs']]
+                except (KeyError, ValueError, AttributeError): out.append((n['id'], '类型无法解析')); continue
+                seg = None
+                if n['op'] == 'tensor.extract_slice':
+                    r = (len(ins) - 1) // 2; ins = ins + [('index',)] * r; seg = [1, r, r, r]
+                if n['op'] == 'tensor.insert_slice':
+                    r = len(ins) - 2; ins = ins + [('index',)] * (2 * r); seg = [1, 1, r, r, r]
+                out.extend((n['id'], f'{src}: {msg}') for src, msg in TSg.check(n['op'], ins, outs_, TSg.LEVELS, seg))
+    walk(blocks); return out
+
 def derive(name, ins, outs, blocks, mode='transparent', params=()):
     """ins/outs: [(端口, 类型)]；blocks: 实现体（入口块参数 = 输入端口）。返回 Schema 并登记。"""
     sch = Schema(name, ins, outs, trust={'*': 'derived'}, body=blocks, mode=mode, params=list(params))
@@ -462,6 +486,10 @@ def derive(name, ins, outs, blocks, mode='transparent', params=()):
     ft = '(' + ', '.join(t for _, t in ins) + ') -> (' + ', '.join(t for _, t in outs) + ')'
     sch.struct_diag = list(ST.check(ST.M(ST.F(name, blocks, ftype=ft))))
     sch.summary = ST.derive_struct(blocks)
+    sch.type_diag = typecheck(blocks)
+    if sch.type_diag:
+        sch.value_known, sch.exact = False, False
+        reg(sch); return sch
     c = Ctx(sch.pconsts)
     holes = []
     for (p, ty), (v, _) in zip(ins, blocks[0]['args']):
