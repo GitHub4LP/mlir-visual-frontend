@@ -32,3 +32,9 @@ sh scripts/fetch_corpus.sh            # mlir/test/Dialect/*，与绑定同一提
 PYTHONPATH=model python3 model/corpus_test.py
 ```
 见 spec/corpus.md。
+
+## 属性层（第 13 轮）
+```
+PYTHONPATH=model python3 model/attrsig_test.py 3     # A0 导入账 / A1 真实属性不误拒 / A2 变异差分（需 corpus/）
+```
+属性值由 MLIR 属性解析器承载，属性参数与约束从 ODS 导入（model/attrsig.py）；core 参数 → MLIR 属性只有一个翻译函数 attrsig.from_core。见 spec/attributes.md。
