@@ -22,7 +22,7 @@
 | # | 机制 | 元模型落点 | 强度 | 状态 | 证据或缺口 |
 |---|---|---|---|---|---|
 | 11 | builtin 类型 | 类型项；值层多 sort（iN 位向量、index 为 ℤ、tensor 为 ⟨extent, 元素, 元素毒值⟩） | E | ◐ | core：任意 iN、index、tensor（shapes.md）；float/vector/memref 形状不在 core |
-| 12 | TypeConstraint（211 个具名定义） | 端口谓词，来源分级 ods/cpred/declared | 190 E / 21 S | ◐ | typesig.py 接入 core：23 个 op 与 MLIR verifier 6696/6696（只用 ODS 时误收 582）；其余 op 未导入 |
+| 12 | TypeConstraint（211 个具名定义） | 端口谓词：Pred 树 + 35 个内建原子（import.md） | E | ✓ | 11 方言 305 op 的 744 个端口约束全部可解释；auto 账目 147 op 与 verifier 5880/5880 |
 | 13 | 用户定义类型（TypeDef、IRDL、ADT） | define_adt：sort + 生成的 op + 生成的降级 | E | ◐ | definitions.md §5；标量字段、≤2 个变体、无递归 |
 | 14 | Attribute（Integer、Dense、Array、Dict、SymbolRef、Type、AffineMap…） | 静态项，按指称存储（L8） | E | ◐ | D1 与 MLIR 600/600；缺 Dense、Float、AffineMap、Dict |
 | 15 | Properties 与可丢弃 attribute 的区分 | 参数进语义，元数据不进；命名空间分离（L9） | E | ✓ | D2 与 MLIR：不可靠 0 |
@@ -57,8 +57,8 @@
 |---|---|---|---|---|---|
 | 32 | Dialect（命名空间、注册、版本） | 节点库 | — | ✗ | |
 | 33 | Op/Type/Attr interface、external model、promised interface | 声明与实现表分开；derived/checked/declared；定律为定向精化（L12） | E/D | ◐ | D5；op interface 只有派生的 MemoryEffects、Speculatable |
-| 34 | Native trait | 导入为声明，并与派生 caps 审计 | D→E | ◐ | ods_import、审计规则 |
-| 35 | ODS/TableGen 导入 | Schema 导入器 | — | ◐ | 迷你解析器；生产用 tblgen JSON |
+| 34 | Native trait | 已知实现的 trait 导入为关系；其余记 unknown | D→E | ◐ | odssig.NATIVE_OK 7 个；SameVariadicResultSize 等未覆盖 |
+| 35 | ODS/TableGen 导入 | tblgen -dump-json（与被测 MLIR 同一提交）→ 自动签名 + 导入账 | E/D | ◐ | import.md：auto 161 / declared 135 / unknown 9；region/后继 op 未差分 |
 | 36 | IRDL、动态方言 | 复合 op 的不透明身份 | — | ✗ | 只在规范（落地方案 c） |
 | 37 | 方言扩展、延迟注册 | 节点库组合 | — | ✗ | |
 
@@ -89,6 +89,6 @@
 | 51 | 增量查询（增量 ≡ 全量） | ◐ | edit.md：Merkle 键 + 指纹早截断（L21），720 次编辑 0 不一致；定义内部不细分 |
 
 ## 小结
-共 52 项：✓ 15，◐ 28，✗ 8，— 1（2026-10-15，类型层 v1 之后）。
+共 52 项：✓ 16，◐ 27，✗ 8，— 1（2026-10-15，导入面之后）。
 - 剩下的 ✗：递归、方言组织（命名空间、版本、IRDL、方言扩展、bytecode）、transform dialect、数据流分析框架、WASM。
-- 当前最大的缺口（按 review-r7.md 的新路线）：(1) 导入面（全方言，统计只靠 ODS 的一致率）；(2) attribute/property 的验证差分；(3) trait/interface 作为查询的导入与审计。
+- 当前最大的缺口（按 review-r7.md 的新路线）：(1) 预言机层（MLIR verifier 作为 declared 的权威，import.md §6）与 region/后继 op 的差分；(2) attribute/property 的验证差分；(3) trait/interface 作为查询的导入与审计。
