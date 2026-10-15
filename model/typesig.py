@@ -10,28 +10,90 @@ import re, itertools, time
 import ods_import as O
 
 # ───────────────────────── 类型项
-def parse(s):
+def _parse_simple(s):
     s = s.strip()
     m = re.fullmatch(r'([su]?)i(\d+)', s)
     if m: return ('i', int(m.group(2)), m.group(1))
     if s == 'index': return ('index',)
     if s in ('f16', 'bf16', 'f32', 'f64'): return ('f', s)
     m = re.fullmatch(r'complex<(.*)>', s)
-    if m: return ('complex', parse(m.group(1)))
+    if m: return ('complex', _parse_simple(m.group(1)))
     m = re.fullmatch(r'!shape\.(\w+)', s)
     if m: return ('shape.' + m.group(1),)
     m = re.fullmatch(r'(tensor|vector|memref)<(.*)>', s)
     if m:
         k, body = m.groups()
-        if body.startswith('*x'): return (k, None, parse(body[2:]))
-        mm = re.fullmatch(r'((?:(?:\d+|\?)x)*)(.+)', body)
+        if body.startswith('*x'): return (k, None, _parse_simple(body[2:]))
+        if '[' in body: raise ValueError(s)
+        mm = re.fullmatch(r'((?:(?:\d+|\?)x)*)([^,<>]+|complex<[^,]*>)', body)
+        if not mm: raise ValueError(s)
         dims = tuple(None if d == '?' else int(d) for d in mm.group(1).split('x')[:-1])
-        return (k, dims, parse(mm.group(2)))
+        return (k, dims, _parse_simple(mm.group(2)))
     raise ValueError(s)
+
+# 第 12 轮：类型文法改由 MLIR 自己的类型解析器给出（真实 IR 里有编码、可伸缩维、布局、内存空间、方言类型、各种浮点）。
+# 简单类型的表示与第 7 轮相同；带非缺省修饰的类型在末尾附 ('mlir', 规范文本, 修饰) —— 整型比较时修饰也参与比较，
+# 与 MLIR 的类型相等一致；只看 t[0..2] 的谓词把修饰当作不存在（上近似，不会因此误拒）。
+_CTX = []
+def _mlir_parse(s):
+    import mlir.ir as ir
+    if not _CTX: _CTX.append(ir.Context()); _CTX[0].allow_unregistered_dialects = True
+    ctx = _CTX[0]
+    with ctx:
+        t = ir.Type.parse(s)
+        return _from_mlir(t, ir)
+
+def _from_mlir(t, ir):
+    txt = str(t)
+    if ir.IntegerType.isinstance(t):
+        it = ir.IntegerType(t); return ('i', it.width, 's' if it.is_signed else 'u' if it.is_unsigned else '')
+    if ir.IndexType.isinstance(t): return ('index',)
+    if ir.FloatType.isinstance(t): return ('f', txt)
+    if ir.ComplexType.isinstance(t): return ('complex', _from_mlir(ir.ComplexType(t).element_type, ir))
+    if ir.NoneType.isinstance(t): return ('none',)
+    if txt.startswith('!shape.') and re.fullmatch(r'!shape\.\w+', txt): return ('shape.' + txt[7:],)
+    for K, k in ((ir.RankedTensorType, 'tensor'), (ir.VectorType, 'vector'), (ir.MemRefType, 'memref')):
+        if K.isinstance(t):
+            st = K(t); sh = ir.ShapedType(t)
+            dims = tuple(None if sh.is_dynamic_dim(i) else sh.get_dim_size(i) for i in range(sh.rank))
+            base = (k, dims, _from_mlir(sh.element_type, ir)); mods = []
+            if k == 'tensor' and st.encoding is not None: mods.append(('encoding', str(st.encoding)))
+            if k == 'vector' and any(st.scalable_dims): mods.append(('scalable', tuple(st.scalable_dims)))
+            if k == 'memref':
+                lay = st.layout
+                ident = ir.AffineMapAttr.isinstance(lay) and ir.AffineMapAttr(lay).value == ir.AffineMap.get_identity(sh.rank)
+                if not ident: mods.append(('layout', str(lay)))
+                if st.memory_space is not None: mods.append(('space', str(st.memory_space)))
+            return base + (('mods', tuple(mods)),) if mods else base
+    if ir.UnrankedTensorType.isinstance(t): return ('tensor', None, _from_mlir(ir.ShapedType(t).element_type, ir))
+    if ir.UnrankedMemRefType.isinstance(t):
+        u = ir.UnrankedMemRefType(t); base = ('memref', None, _from_mlir(ir.ShapedType(t).element_type, ir))
+        return base + (('mods', (('space', str(u.memory_space)),)),) if u.memory_space is not None else base
+    if ir.TupleType.isinstance(t): return ('tuple', txt)
+    if ir.FunctionType.isinstance(t): return ('fn', txt)
+    return ('opaque', txt)
+
+import functools as _ft
+@_ft.lru_cache(maxsize=1 << 16)
+def parse(s):
+    try: return _parse_simple(s)
+    except ValueError: pass
+    try: return _mlir_parse(s.strip())
+    except ImportError: raise ValueError(s)
+    except Exception: raise ValueError(s)
+
 def show(t):
+    if len(t) > 3:                                       # 带修饰的 shaped 类型：按 MLIR 的打印规则重建（修饰与元素类型分开存，变换元素类型时修饰保留）
+        m = dict(t[3][1]); sc = m.get('scalable') or (False,) * len(t[1] or ())
+        dims = '*x' if t[1] is None else ''.join((f'[{d}]' if s_ else ('?' if d is None else str(d))) + 'x' for d, s_ in zip(t[1], sc))
+        extra = [m[k] for k in ('encoding', 'layout') if k in m]
+        if 'space' in m: extra.append(re.sub(r'^(\d+) : i64$', r'\1', m['space']))
+        return f'{t[0]}<{dims}{show(t[2])}' + ''.join(', ' + x for x in extra) + '>'
     if t[0] == 'i': return f'{t[2]}i{t[1]}'
     if t[0] == 'index': return 'index'
     if t[0] == 'f': return t[1]
+    if t[0] == 'none': return 'none'
+    if t[0] in ('tuple', 'fn', 'opaque'): return t[1]
     if t[0] == 'complex': return f'complex<{show(t[1])}>'
     if t[0].startswith('shape.'): return '!' + t[0]
     if t[1] is None: return f'{t[0]}<*x{show(t[2])}>'
@@ -75,7 +137,7 @@ def _elementwise(ins, outs):
     if not mi or not mo or len(mo) != len(outs): return False
     ts = mi + mo
     return all(base(t) == base(ts[0]) for t in ts) and all(compat_shape(a, b) for a, b in itertools.combinations(ts, 2))
-def i1same(t): return (t[0], t[1], ('i', 1, '')) if shaped(t) else ('i', 1, '')
+def i1same(t): return (t[0], t[1], ('i', 1, '')) + tuple(t[3:]) if shaped(t) else ('i', 1, '')   # 与 MLIR getI1SameShape 一样保留编码与可伸缩维
 XF = {'$_self': lambda t: [t], 'getElementType': lambda t: [t[2]] if shaped(t) else None,
       'getI1SameShape': lambda t: [i1same(t)],
       'getNumElements': lambda t: [t[2]] * _numel(t) if ranked(t) and None not in t[1] else None}
