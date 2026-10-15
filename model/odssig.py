@@ -81,7 +81,8 @@ def sig(dialect, opname):
         if 'TypeConstraint' in sc:
             b, m = _base(d, c); S['ins'].append((nm, O.type_pred(dialect, b, O.ATOM, O.XFORM), m, b))
         else:
-            req = not any(k in sc for k in ('OptionalAttr', 'DefaultValuedAttr', 'DefaultValuedOptionalAttr', 'UnitAttr'))
+            req = not (any(k in sc for k in ('OptionalAttr', 'DefaultValuedAttr', 'DefaultValuedOptionalAttr', 'UnitAttr', 'UnitProp'))
+                       or c in ('UnitAttr', 'UnitProp') or d.get(c, {}).get('isOptional') == 1)       # UnitAttr 缺省即 false
             S['attrs'].append((nm, c, sc[-1] if sc else '?', req))
     for c, nm in O.dag_args(r['results']):
         b, m = _base(d, unwrap(c)); S['outs'].append((nm, O.type_pred(dialect, b, O.ATOM, O.XFORM), m, b))
