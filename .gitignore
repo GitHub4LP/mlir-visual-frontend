@@ -2,3 +2,4 @@ __pycache__/
 *.pyc
 inventory/
 tools/
+corpus/
