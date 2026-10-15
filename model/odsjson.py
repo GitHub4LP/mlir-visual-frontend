@@ -16,7 +16,7 @@ TOOLS = glob.glob(f'{_ROOT}/tools/mlir_native_tools-*.data/data/bin') + glob.glo
 CACHE = '/tmp/odsjson'
 DIALECTS = {'arith': 'Arith/IR/ArithOps', 'math': 'Math/IR/MathOps', 'index': 'Index/IR/IndexOps', 'complex': 'Complex/IR/ComplexOps',
             'tensor': 'Tensor/IR/TensorOps', 'memref': 'MemRef/IR/MemRefOps', 'scf': 'SCF/IR/SCFOps', 'func': 'Func/IR/FuncOps',
-            'cf': 'ControlFlow/IR/ControlFlowOps', 'vector': 'Vector/IR/VectorOps', 'shape': 'Shape/IR/ShapeOps'}
+            'cf': 'ControlFlow/IR/ControlFlowOps', 'vector': 'Vector/IR/VectorOps', 'shape': 'Shape/IR/ShapeOps', 'ub': 'UB/IR/UBOps'}
 
 @functools.lru_cache(None)
 def records(dialect):
