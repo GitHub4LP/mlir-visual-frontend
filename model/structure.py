@@ -57,7 +57,14 @@ STRUCT = {
 }
 def st(op):
     """未登记的 op（含未注册方言）结构未知：区域个数、终结子都不约束，按 SSACFG、非隔离处理。"""
-    return STRUCT.get(op) or StructSchema(op, regions=None)
+    if op in STRUCT: return STRUCT[op]
+    # 第 12 轮：未手工登记的 op，终结子性质取自 ODS 的 IsTerminator；ODS 也没有的（未导入方言、未注册 op）⇒ 未知，不判 R2
+    try:
+        import odssig as G
+        lk = G.lookup(op)
+    except Exception: lk = None
+    term = None if lk is None else any('IsTerminator' in t for t in lk[1]['structural'])
+    return StructSchema(op, regions=None, terminator=term, succs=(0, 10 ** 9))
 def region_specs(s, n): return s.regions if s.regions is not None else [RegionSpec(term='?')] * len(n['regions'])
 
 # ───────────────────────── 2 图表示
@@ -202,10 +209,15 @@ def _check_node(n, d, scope_vals, tables, types, path):
     specs = region_specs(s, n)
     if len(n['regions']) != len(specs):
         d.add(n['id'], 'R1', f"{n['op']} 需要 {len(specs)} 个区域，给了 {len(n['regions'])} 个")
+    rc = _ods_regions(n['op'], len(n['regions']))      # 第 12 轮：区域块数取自 ODS 的区域约束（真实 IR：scf.if 的 else 可为空）
     for ri, (blocks, spec) in enumerate(zip(n['regions'], specs)):
+        lo = rc[ri][0] if rc else 1
         if not blocks:
-            d.add(n['id'], 'R1', f"区域 #{ri} 为空"); continue
-        if spec.single_block and len(blocks) > 1:
+            if lo > 0: d.add(n['id'], 'R1', f"区域 #{ri} 为空")
+            continue
+        if rc and rc[ri][1] is not None and len(blocks) > rc[ri][1]:
+            d.add(n['id'], 'R1', f"区域 #{ri} 至多 {rc[ri][1]} 个块")
+        elif not rc and spec.single_block and len(blocks) > 1:
             d.add(n['id'], 'R1', f"区域 #{ri} 只允许一个块")
         names = {b['name'] for b in blocks}
         inner_defs = _defs_of(blocks)
@@ -215,7 +227,7 @@ def _check_node(n, d, scope_vals, tables, types, path):
         dom = _idom(blocks)
         for b in blocks:
             if spec.term is None or spec.term == '?': pass     # NoTerminator / 父 op 未知
-            elif not b['ops'] or not st(b['ops'][-1]['op']).terminator:
+            elif not b['ops'] or st(b['ops'][-1]['op']).terminator is False:
                 d.add(f"{n['id']}/{b['name']}", 'R2', "块没有终结子")
             elif spec.term and b['ops'][-1]['op'] != spec.term and spec.single_block:
                 d.add(f"{n['id']}/{b['name']}", 'R2', f"终结子应为 {spec.term}，实为 {b['ops'][-1]['op']}")
@@ -232,6 +244,7 @@ def _check_node(n, d, scope_vals, tables, types, path):
                         d.add(o['id'], 'R3', f"后继 ^{sn} 不在同一区域"); continue
                     tgt = next(b2 for b2 in blocks if b2['name'] == sn)
                     if len(sargs) != len(tgt['args']):
+                        if o.get('props', {}).get('_succ_opaque'): continue      # 未知 op 的后继实参划分未知
                         d.add(o['id'], 'R4', f"后继 #{si} 参数个数 {len(sargs)} ≠ ^{sn} 的 {len(tgt['args'])}")
                     else:
                         for ai, (v, (_, ty)) in enumerate(zip(sargs, tgt['args'])):
@@ -266,7 +279,7 @@ def _check_node(n, d, scope_vals, tables, types, path):
                     if got != outs_t: d.add(b['ops'][-1]['id'], 'R8', f"return {got} ≠ 函数结果 {outs_t}")
         if s.branch == 'for':
             iters = [t for _, t in n['outs']]
-            want = ['index'] + iters
+            want = [types.get(n['ins'][0], 'index')] + iters    # 第 12 轮：归纳变量的类型 = 边界的类型（index 或无符号整数），不恒为 index
             got = [t for _, t in blocks[0]['args']]
             if got != want: d.add(n['id'], 'R8', f"循环入口块参数 {got} ≠ {want}")
             for b in blocks:
@@ -274,10 +287,45 @@ def _check_node(n, d, scope_vals, tables, types, path):
                     y = [inner_types.get(v) for v in b['ops'][-1]['ins']]
                     if y != iters: d.add(b['ops'][-1]['id'], 'R8', f"yield 类型 {y} ≠ 迭代参数 {iters}")
 
+def _split_top(s, sep):
+    out, d, cur, i = [], 0, '', 0
+    while i < len(s):
+        ch = s[i]
+        if ch in '<([{': d += 1
+        elif ch in '>)]}' and not (ch == '>' and i > 0 and s[i - 1] == '-'): d -= 1
+        if d == 0 and s.startswith(sep, i):
+            out.append(cur); cur = ''; i += len(sep); continue
+        cur += ch; i += 1
+    out.append(cur); return out
+
 def _ftype(f):
-    a, r = f.split('->')
-    sp = lambda x: [t.strip() for t in x.strip().strip('()').split(',') if t.strip()]
+    """函数类型 → (输入, 结果)。按括号深度切分（第 12 轮：真实 IR 的类型里有逗号与 ->，如 tensor<8xf32, "foo">、(i8) -> i8 作参数）。"""
+    a, r = _split_top(f, '->')[:2] if len(_split_top(f, '->')) >= 2 else (f, '()')
+    def sp(x):
+        x = x.strip()
+        if x.startswith('(') and x.endswith(')') and len(_split_top(x[1:-1], '->')) == 1 or (x.startswith('(') and _close(x) == len(x) - 1): x = x[1:-1]
+        return [t.strip() for t in _split_top(x, ',') if t.strip()]
     return sp(a), sp(r)
+
+def _close(x):
+    d = 0
+    for i, ch in enumerate(x):
+        if ch == '(': d += 1
+        elif ch == ')':
+            d -= 1
+            if d == 0: return i
+    return -1
+
+def _ods_regions(op, k):
+    try:
+        import odssig as G
+        rc = G.region_cons(op)
+    except Exception: return None
+    if not rc: return None
+    if any(v for *_, v in rc):                            # 可变区域：按位置展开（ODS 规定可变区域只能在最后）
+        fixed = [r for r in rc if not r[3]]; var = [r for r in rc if r[3]][0]
+        return [(lo, hi) for _, lo, hi, _ in fixed] + [(var[1], var[2])] * max(0, k - len(fixed))
+    return [(lo, hi) for _, lo, hi, _ in rc] if len(rc) == k else None
 
 # ───────────────────────── 4 推导：复合 op 的结构摘要
 
