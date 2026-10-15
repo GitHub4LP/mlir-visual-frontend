@@ -14,7 +14,7 @@
 | 5 | Successor、非结构化 CFG | 控制边 | 结构 E / 值层 ✗ | ◐ | 多块 CFG 的值层是 Unknown |
 | 6 | Dominance | R5（只看可达块） | E | ✓ | 差分 0 不可靠 |
 | 7 | IsolatedFromAbove、捕获 | R6、结构摘要 captures | E | ✓ | L3、extract |
-| 8 | Symbol、SymbolTable、可见性、嵌套引用 | S1–S3 | E | ✓ | L4（X6） |
+| 8 | Symbol、SymbolTable、可见性、嵌套引用、SymbolUserOpInterface 使用义务 | S1–S4（symtab.py：定义者/表/使用者取自 ODS 接口闭包） | E | ✓ | L4（X6）；第 14 轮修正：此前的 ✓ 只有自测，真实 IR 上从未触发（symbols.md §1）。现 Y1 整模块 2108 误拒 0、Y2 变异 6089/6089（L36a/b）；嵌套引用的接受方向无外部真值 |
 | 9 | Location、诊断回映 | 节点 id → loc | E | ◐ | 规范 §3；没有和 MLIR 诊断联测 |
 | 10 | 未注册 op 与方言 | 结构保守（R2 拒绝）、值层 Unknown | S | ◐ | 策略已定，规范需写明 |
 
@@ -91,7 +91,7 @@
 ## 小结
 共 52 项：✓ 17，◐ 26，✗ 8，— 1（2026-10-15，第 13 轮属性层之后）。
 - 剩下的 ✗：递归、方言组织（命名空间、版本、IRDL、方言扩展、bytecode）、transform dialect、数据流分析框架、WASM。
-- 当前最大的缺口：(1) 符号上下文义务（func.call / func.constant / memref.get_global，C3 中 auto 账未抓住的 6 例全是这一类）；(2) core 节点内部改用 ODS 属性名作参数（attributes.md §8）；(3) 方言资源表；(4) trait/interface 作为查询的导入与审计。
+- 当前最大的缺口：(1) 预言机按模块发射（func.call 仍不可发射到预言机；符号义务已在结构层，symbols.md）；(2) core 节点内部改用 ODS 属性名作参数（attributes.md §8）；(3) 方言资源表；(4) trait/interface 作为查询的导入与审计。
 
 
 ## 第 12 轮
