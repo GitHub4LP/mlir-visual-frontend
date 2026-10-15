@@ -196,7 +196,7 @@ def fold(op, consts, props=None):
 
 # ───────────────────────── 规则库（arith 的一部分规范化，以及几条错误规则做对照）
 def K(i, v, t=None): return C.cst(i, v, ty(t or I3))
-def R(i, op, a, b, **p): return C.op2(i, op, a, b, **p)
+def R(i, op, a, b, **p): return C.op2(i, op, a, b, ty(I3), **p)   # 第 7 轮类型层发现：原先缺 ty，非 i3 位宽下右侧结果标成 i3
 PATTERNS = [
     Pattern('add0', {'x': I3}, ['c', 'f'], ('arith.addi', {'nuw': '$f'}, ['x', ('const', 'c', I3)]),
             lambda e, P, f: ([], e['x']), pre=lambda P: P['c'] == 0),
