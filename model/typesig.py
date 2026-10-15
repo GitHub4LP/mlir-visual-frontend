@@ -16,6 +16,10 @@ def parse(s):
     if m: return ('i', int(m.group(2)), m.group(1))
     if s == 'index': return ('index',)
     if s in ('f16', 'bf16', 'f32', 'f64'): return ('f', s)
+    m = re.fullmatch(r'complex<(.*)>', s)
+    if m: return ('complex', parse(m.group(1)))
+    m = re.fullmatch(r'!shape\.(\w+)', s)
+    if m: return ('shape.' + m.group(1),)
     m = re.fullmatch(r'(tensor|vector|memref)<(.*)>', s)
     if m:
         k, body = m.groups()
@@ -28,6 +32,8 @@ def show(t):
     if t[0] == 'i': return f'{t[2]}i{t[1]}'
     if t[0] == 'index': return 'index'
     if t[0] == 'f': return t[1]
+    if t[0] == 'complex': return f'complex<{show(t[1])}>'
+    if t[0].startswith('shape.'): return '!' + t[0]
     if t[1] is None: return f'{t[0]}<*x{show(t[2])}>'
     return f'{t[0]}<' + ''.join(('?' if d is None else str(d)) + 'x' for d in t[1]) + show(t[2]) + '>'
 def shaped(t): return t[0] in ('tensor', 'vector', 'memref')
