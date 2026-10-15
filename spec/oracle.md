@@ -48,3 +48,41 @@
 - 预言机还不覆盖带 region/后继的 op 和多块体：发射器只处理单块直线体。
 - core 的简写形式（切片 op 等）和符号参数需要先降级才能交给预言机。复合 op 实例要内联后才能交给预言机（compsig C1 已有内联发射，尚未并入 core）。
 - 参与差分的必需属性仍只有 I64Enum 一种。
+
+---
+
+# 第 11 轮：预言机覆盖区域、后继、多块；复合 op 内联；切片简写降级
+
+## 6 发射器扩展（oracle.emit_core）
+- **区域与后继**：scf.if、scf.for 等带区域的 op 用通用形式发射，区域入口块写出块参数；cf.br、cf.cond_br 用 `[^块]` 列出后继，cond_br 自动补上分段属性；多块函数体照常发射。
+- **透明复合 op**：先用 `core.inline_all` 内联再发射。不透明复合 op 仍然拒发，它们的类型事实由 compsig 的 Φ 负责。
+- **切片简写降级**：
+  - core 的 `extract_slice(t, offs, sizes)` 写成 MLIR 形式：`static_offsets`、`static_sizes` 全部取 kDynamic，`static_strides` 全为 1。
+  - `insert_slice(s, t, offs)` 的尺寸取源的 extent：静态维直接写进 `static_sizes`，动态维插入 `arith.constant` 和 `tensor.dim`（这些 op 与原节点共用 loc）。
+  - 降级之后，形状层的回归第一次全部经过了预言机：shape_test 调用 596 次，人工切片签名与预言机的分歧为 0。
+- **参数归属守卫**：core 的参数只有在这个 op 的 MLIR 版本里也有对应属性时才翻译；op 是否有某个属性，直接取自 ODS 导入的属性表。
+
+### 发现：core 的参数空间比 MLIR 大
+edit_test 生成了带 `nuw` 的 `arith.xori`。core 的值层接受它，MLIR 却根本没有这个属性：xori 不带 `overflowFlags`。这个问题和第 7 轮发现的“手写方言语义”是同一类，只是这次出在参数上：**op 的参数集合也应当从 ODS 导入，而不是由 core 自己定义**。这一项归入下一轮的属性层。
+
+### 导入修正
+- `UnitAttr` 原来被当作必需属性，导致 scf.for 的 `unsignedCmp` 被误判为必需。修正后，可参与差分的 op 增加了 4 个。
+- 新导入 ub 方言（`ub.poison`，core 里经常用到）。导入账变为：12 个方言，共 307 个 op，其中 auto 163、declared 135、unknown 9。差分：auto 6080/6080 一致，全体误拒 0。
+
+## 7 检验
+| 检验 | 结果 |
+|---|---|
+| O1 直线图（984 个） | 符号层 + 预言机与 MLIR **984/984** 一致；只用符号层时误拒 0、误收 49 |
+| O5 区域/后继/多块图（1000 个，其中 488 个多块，带类型扰动） | 结构层 ∧ 类型层（含预言机）与 MLIR **1000/1000** 一致；不用预言机也是 **1000/1000**。拒绝的分布：结构层 493、符号层 249、预言机 0 |
+| 回归测试中预言机不可用的次数（第 10 轮 → 第 11 轮） | core 598→2，shape 420→0，transform 175→15，loop 174→61，defs 110→59，edit 1074→465 |
+| 回归测试中人工签名与预言机的分歧 | 0 |
+
+- 剩下的不可用情形：edit 里的占位 op `edit.hole`（447 次）、模式变量与符号参数、core 的抽象类型 `memref`、option.* 定义层 op、memref.atomic_rmw（缺必需属性 kind）。
+
+**L32：在随机分布下，区域与后继 op 的类型义务全部由结构层（R1–R8）和自动签名承担，预言机没有补上任何拒绝。** 也就是说，scf/cf/func 里写在 C++ 中的 verify 检查的是 yield/后继实参与结果类型、循环边界类型这类事实，结构层已经覆盖了。这是一个“没有发现”的结论，只在这个生成分布下成立：生成器没有覆盖 scf.while、scf.forall、scf.index_switch，也没有覆盖 func.call 的符号解析。
+
+## 8 下一轮
+属性层：
+- op 的参数集合从 ODS 导入，取代 core 自定义的参数（例如上面 xori 的 nuw）；
+- 为 DenseI64Array、SymbolRef、AffineMap、TypeAttr 生成属性实例，并与 MLIR 做差分；
+- memref.atomic_rmw、切片的静态偏移等必需属性随之可以发射。
