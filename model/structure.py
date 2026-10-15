@@ -150,57 +150,90 @@ def _visible_syms(table_node):
                 if n.get('sym'): out[n['sym']] = (n.get('vis', 'public'), n)
     return out
 
+def _same_ty(x, y):
+    """两个类型文本是否同一类型：都能解析 ⇒ 比较 core 类型项（修饰单存）；否则比较文本；任一缺失 ⇒ None（不判）。"""
+    if x is None or y is None: return None
+    try:
+        import typesig as TSg
+        return TSg.parse(x) == TSg.parse(y)
+    except Exception: return x.replace(' ', '') == y.replace(' ', '')
+
 def _symbols(root, d):
-    """义务 S1 重名、S2 解析、S3 可见性。
-    已用真实 MLIR 确认的事实：func.call 的 callee 是平坦符号引用，只在最近的符号表里解析，
-    既不向外层符号表上溯，也看不见嵌套符号表内部；private 在本符号表内（含其中的非符号表区域）可见。"""
-    def walk(tnode, chain):
+    """义务 S1 重名、S2 解析、S3 可见性、S4 使用义务。
+    第 14 轮：定义者 / 符号表 / 使用者 / 名字 / 可见性 / 引用全部经 symtab.py 从 ODS 的 trait/interface 与 _attrs 读出；
+    手工字段（sym、vis、callee、ftype）仍可用（core 原生图）。第 12、13 轮真实 IR 上这些义务从未触发（见 spec/symbols.md）。
+    已用真实 MLIR 确认的事实：扁平引用只在使用者的最近符号表里解析，既不向外层上溯，也看不见嵌套符号表内部；
+    private 在本符号表内（含其中的非符号表区域）可见。"""
+    import symtab as SY
+    def table_of(n): return n['op'] in STRUCT and any(r.table for r in (STRUCT[n['op']].regions or [])) or SY.is_table(n['op'])
+    def walk(tnode):
         syms = {}
         for r in tnode['regions']:
             for b in r:
                 for n in b['ops']:
-                    if n.get('sym'):
-                        if n['sym'] in syms:
-                            d.add(n['id'], 'S1', f"符号 @{n['sym']} 在同一符号表内重名")
-                        syms[n['sym']] = (n.get('vis', 'public'), n)
-        # 本表内所有引用（深入到非符号表的区域，遇到嵌套符号表则递归）
-        def refs(ops, inside_table):
+                    nm = SY.sym_of(n)
+                    if nm:
+                        if nm in syms: d.add(n['id'], 'S1', f"符号 @{nm} 在同一符号表内重名")
+                        syms[nm] = (SY.vis_of(n), n)
+        def inner_syms(t):
+            out = {}
+            for r in t['regions']:
+                for b in r:
+                    for n in b['ops']:
+                        nm = SY.sym_of(n)
+                        if nm: out[nm] = (SY.vis_of(n), n)
+            return out
+        def use(n, tys):
+            ref = SY.ref_of(n)
+            if not ref or not isinstance(ref, str) or not ref.startswith('@'): return
+            parts = [p.strip('"') for p in ref.lstrip('@').split('::@')]
+            tgt = None
+            if len(parts) == 1:
+                got = syms.get(parts[0])
+                if not got: d.add(n['id'], 'S2', f"@{parts[0]} 在最近的符号表里不存在（不会上溯到外层）"); return
+                tgt = got[1]
+            else:
+                got = syms.get(parts[0])
+                if not got or not table_of(got[1]):
+                    d.add(n['id'], 'S2', f"@{parts[0]} 不是可解析的嵌套符号表"); return
+                inner = inner_syms(got[1]).get(parts[1])
+                if not inner: d.add(n['id'], 'S2', f"@{parts[0]}::@{parts[1]} 不存在"); return
+                if inner[0] in ('private', 'nested'):
+                    d.add(n['id'], 'S3', f"@{parts[1]} 的可见性是 {inner[0]}，外部不可引用"); return
+                tgt = inner[1]
+            want_op, rel = (SY.USES[n['op']][1:] if n['op'] in SY.USES else ('func.func', 'call'))
+            if tgt['op'] != want_op:
+                d.add(n['id'], 'S2', f"@{parts[-1]} 是 {tgt['op']}，{n['op']} 需要 {want_op}"); return
+            outs = [t for _, t in n['outs']]
+            if rel == 'call':
+                ft = SY.ftype_of(tgt)
+                if ft is None: return
+                wi, wo = _ftype(ft)
+                gi = [tys.get(v) for v in n['ins']]
+                if len(gi) != len(wi) or len(outs) != len(wo):
+                    d.add(n['id'], 'S4', f"调用的操作数/结果个数 {len(gi)}/{len(outs)} 与 @{parts[-1]} 的 {len(wi)}/{len(wo)} 不符"); return
+                for k, (x, y) in enumerate(zip(gi + outs, wi + wo)):
+                    if _same_ty(x, y) is False:
+                        d.add(n['id'], 'S4', f"调用的第 {k} 个端口类型 {x} 与 @{parts[-1]} 的 {y} 不符"); return
+            elif rel == 'fn':
+                if outs and _same_ty(outs[0], SY.ftype_of(tgt)) is False:
+                    d.add(n['id'], 'S4', f"结果类型 {outs[0]} 与 @{parts[-1]} 的函数类型 {SY.ftype_of(tgt)} 不符")
+            elif rel == 'ty':
+                gt = (tgt.get('props', {}).get('_attrs') or {}).get('type')
+                if outs and _same_ty(outs[0], gt) is False:
+                    d.add(n['id'], 'S4', f"结果类型 {outs[0]} 与全局 @{parts[-1]} 的类型 {gt} 不符")
+        def refs(ops, tys):
+            # 值名只在隔离区域内唯一（真实 IR 每个函数都有 %arg0）⇒ 类型表随区域下行，不能用模块级的全局表
             for n in ops:
-                if n.get('callee'):
-                    parts = n['callee'].lstrip('@').split('::@')
-                    tgt, cur = None, syms
-                    if len(parts) == 1:
-                        got = cur.get(parts[0])
-                        if not got: d.add(n['id'], 'S2', f"@{parts[0]} 在最近的符号表里不存在（不会上溯到外层）")
-                        else:
-                            vis, tgt = got
-                            if vis == 'private' and not inside_table:
-                                d.add(n['id'], 'S3', f"@{parts[0]} 是 private，不能跨符号表引用")
-                    else:
-                        got = cur.get(parts[0])
-                        if not got or not any(r.table for r in (st(got[1]['op']).regions or [])):
-                            d.add(n['id'], 'S2', f"@{parts[0]} 不是可解析的嵌套符号表")
-                        else:
-                            inner = _visible_syms(got[1]).get(parts[1])
-                            if not inner: d.add(n['id'], 'S2', f"@{parts[0]}::@{parts[1]} 不存在")
-                            elif inner[0] in ('private', 'nested'):
-                                d.add(n['id'], 'S3', f"@{parts[1]} 的可见性是 {inner[0]}，外部不可引用")
-                            else: tgt = inner[1]
-                    if tgt is not None and tgt['op'] == 'func.func':      # CallOpInterface ↔ CallableOpInterface
-                        want = _ftype(tgt.get('ftype', '() -> ()'))
-                        got = ([TYPES.get(v) for v in n['ins']], [t for _, t in n['outs']])
-                        if got != want:
-                            d.add(n['id'], 'S4', f"调用签名 {got} 与 @{parts[-1]} 的 {want} 不符")
-                    elif tgt is not None:
-                        d.add(n['id'], 'S2', f"@{parts[-1]} 不是可调用的符号")
+                use(n, tys)
+                if table_of(n): walk(n); continue
                 for r in n['regions']:
-                    is_t = any(x.table for x in (st(n['op']).regions or []))
-                    if is_t: walk(n, chain + [n])
-                    else:
-                        for b in r: refs(b['ops'], inside_table)
+                    t2 = _types_of(r, {} if n['op'] == 'func.func' or 'IsIsolatedFromAbove' in (SY.interfaces(n['op']) or ()) else dict(tys))
+                    for b in r: refs(b['ops'], t2)
         for r in tnode['regions']:
-            for b in r: refs(b['ops'], True)
-    walk(root, [root])
+            t0 = _types_of(r)
+            for b in r: refs(b['ops'], t0)
+    walk(root)
 
 def _check_node(n, d, scope_vals, tables, types, path):
     """义务 R1 区域个数、R2 终结子、R3 后继合法、R4 后继参数类型、R5 支配、R6 捕获/隔离、
@@ -211,7 +244,7 @@ def _check_node(n, d, scope_vals, tables, types, path):
         d.add(n['id'], 'R1', f"{n['op']} 需要 {len(specs)} 个区域，给了 {len(n['regions'])} 个")
     rc = _ods_regions(n['op'], len(n['regions']))      # 第 12 轮：区域块数取自 ODS 的区域约束（真实 IR：scf.if 的 else 可为空）
     for ri, (blocks, spec) in enumerate(zip(n['regions'], specs)):
-        lo = rc[ri][0] if rc else 1
+        lo = rc[ri][0] if rc else (1 if s.regions is not None else 0)   # 第 14 轮：未知 op 的空区域不判（真实 IR：transform 方言）
         if not blocks:
             if lo > 0: d.add(n['id'], 'R1', f"区域 #{ri} 为空")
             continue
@@ -270,7 +303,8 @@ def _check_node(n, d, scope_vals, tables, types, path):
                     if got != want:
                         d.add(b['ops'][-1]['id'], 'R8', f"沿控制流边到父结果：{got} ≠ {want}")
         if n['op'] == 'func.func':                   # 父 op ↔ 入口块参数、ReturnLike ↔ 父结果
-            ins_t, outs_t = _ftype(n.get('ftype', '() -> ()'))
+            import symtab as SY                       # 第 14 轮：导入节点的函数类型在 _attrs['function_type']
+            ins_t, outs_t = _ftype(SY.ftype_of(n) or '() -> ()')
             if [t for _, t in blocks[0]['args']] != ins_t:
                 d.add(n['id'], 'R8', f"入口块参数 {[t for _, t in blocks[0]['args']]} ≠ 函数输入 {ins_t}")
             for b in blocks:
@@ -352,7 +386,9 @@ def derive_struct(blocks):
                 if n['succs']: jumps = True
                 for v in n['ins']:
                     if v not in here and v not in caps: caps.append(v)
-                if n.get('callee') and n['callee'] not in syms: syms.append(n['callee'])
+                import symtab as SY
+                r_ = SY.ref_of(n)
+                if r_ and r_ not in syms: syms.append(r_)
                 nreg += len(n['regions'])
                 for r in n['regions']: walk(r, set() if any(x.isolated for x in (st(n['op']).regions or [])) else here)
     walk(blocks, set())

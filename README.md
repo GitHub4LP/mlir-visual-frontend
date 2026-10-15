@@ -33,6 +33,11 @@ PYTHONPATH=model python3 model/corpus_test.py
 ```
 见 spec/corpus.md。
 
+## 符号层（第 14 轮）
+
+符号定义者 / 符号表 / 使用者取自 ODS 的 trait/interface 闭包，名字、可见性、引用取自真实属性（model/symtab.py）；结构层 S1–S4 以整模块判定。
+复盘：此前 S1–S4 只读手工字段，真实 IR 上从未触发。检验：`PYTHONPATH=model python3 model/symtab_test.py 60`（需 corpus/）——Y1 2108 个模块误拒 0（修前 2031），Y2 符号变异 6089/6089 与 MLIR 一致。见 spec/symbols.md。
+
 ## 属性层（第 13 轮）
 ```
 PYTHONPATH=model python3 model/attrsig_test.py 3     # A0 导入账 / A1 真实属性不误拒 / A2 变异差分（需 corpus/）
