@@ -1,3 +1,3 @@
 islpy
-mlir-python-bindings  # PyPI 上同名包是占位符；要从 https://makslevental.github.io/wheels 按平台选 wheel 直接安装
+mlir-python-bindings==22.0.0.2025112901+9bae84b0  # 固定提交（与 scripts/fetch_tools.sh 的 tblgen 一致）；PyPI 同名包是占位符，从 https://makslevental.github.io/wheels 按平台取 wheel
 z3-solver
