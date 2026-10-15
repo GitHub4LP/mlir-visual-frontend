@@ -34,7 +34,7 @@
 | # | 机制 | 元模型落点 | 强度 | 状态 | 证据或缺口 |
 |---|---|---|---|---|---|
 | 19 | Variadic、Optional、segment | 端口组 | E | ◐ | typesig.bind：单变长组与段属性；复合 op 的变长端口未做 |
-| 20 | InferTypeOpInterface | 类型推导 | E | ◐ | typesig.infer：239/239 被 MLIR 接受；ODS 自动生成的 InferType 是“结果相等”条件；复合 op 的多态推导未并入 |
+| 20 | InferTypeOpInterface | 类型推导 | E | ✓ | typesig.infer 239/239；复合 op 的结果写成端口表达式，自动获得 InferType（compsig.md） |
 | 21 | 签名 trait（SameOperandsAndResultType…） | 端口间关系 | E | ✓ | typesig.py：7 种 trait 自动导入，按 MLIR 的实现语义（不是名字的字面意思）检验 |
 
 ## D 语义与效应
@@ -50,7 +50,7 @@
 | 29 | RegionBranchOpInterface | scf.if 守卫 | E | ✓ | core |
 | 30 | Call、Callable | S4；复合 op 调用 = 代换 | E | ◐ | func.call 的值层未建模 |
 | 31 | 递归 | 必须声明签名 | D | ✗ | |
-| 52 | 泛型复合 op（接口约束的多态） | 单态化 + 实现表 | E | ◐ | 泛型本身没有摘要 |
+| 52 | 泛型复合 op（接口约束的多态） | 推导签名：端口表达式上的 Φ（L25–L27） | E | ◐ | compsig.md：Φ≡体≡MLIR 1043/1043，嵌套≡展开 900/900；值层仍单态化；接口约束的多态未做 |
 
 ## E 扩展机制
 | # | 机制 | 元模型落点 | 强度 | 状态 | 证据或缺口 |
@@ -89,6 +89,6 @@
 | 51 | 增量查询（增量 ≡ 全量） | ◐ | edit.md：Merkle 键 + 指纹早截断（L21），720 次编辑 0 不一致；定义内部不细分 |
 
 ## 小结
-共 52 项：✓ 14，◐ 29，✗ 8，— 1（2026-10-15，类型层 v0 之后）。
+共 52 项：✓ 15，◐ 28，✗ 8，— 1（2026-10-15，类型层 v1 之后）。
 - 剩下的 ✗：递归、方言组织（命名空间、版本、IRDL、方言扩展、bytecode）、transform dialect、数据流分析框架、WASM。
-- 当前最大的缺口（按 review-r7.md 的新路线）：(1) 复合 op 的多态签名与导入面（全方言）；(2) attribute/property 的验证差分；(3) trait/interface 作为查询的导入与审计。
+- 当前最大的缺口（按 review-r7.md 的新路线）：(1) 导入面（全方言，统计只靠 ODS 的一致率）；(2) attribute/property 的验证差分；(3) trait/interface 作为查询的导入与审计。
