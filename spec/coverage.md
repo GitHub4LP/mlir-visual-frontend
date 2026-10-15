@@ -24,9 +24,9 @@
 | 11 | builtin 类型 | 类型项；值层多 sort（iN 位向量、index 为 ℤ、tensor 为 ⟨extent, 元素, 元素毒值⟩） | E | ◐ | core：任意 iN、index、tensor（shapes.md）；float/vector/memref 形状不在 core |
 | 12 | TypeConstraint（211 个具名定义） | 端口谓词：Pred 树 + 35 个内建原子（import.md） | E | ✓ | 11 方言 305 op 的 744 个端口约束全部可解释；auto 账目 147 op 与 verifier 5880/5880；core.typecheck = 自动签名 + 预言机，与 verifier 987/987（oracle.md） |
 | 13 | 用户定义类型（TypeDef、IRDL、ADT） | define_adt：sort + 生成的 op + 生成的降级 | E | ◐ | definitions.md §5；标量字段、≤2 个变体、无递归 |
-| 14 | Attribute（Integer、Dense、Array、Dict、SymbolRef、Type、AffineMap…） | 静态项，按指称存储（L8） | E | ◐ | D1 与 MLIR 600/600；缺 Dense、Float、AffineMap、Dict |
+| 14 | Attribute（Integer、Dense、Array、Dict、SymbolRef、Type、AffineMap…） | 静态项，按指称存储（L8） | E | ◐ | 第 13 轮：属性值改由 MLIR 属性解析器承载（attributes.md §1），全部种类可表示；缺方言资源表（dense_resource） |
 | 15 | Properties 与可丢弃 attribute 的区分 | 参数进语义，元数据不进；命名空间分离（L9） | E | ✓ | D2 与 MLIR：不可靠 0 |
-| 16 | AttrConstraint、ConfinedAttr、DefaultValued | 参数值域；复合 op 参数约束推导（L10） | E | ◐ | D3 与 MLIR 16/16；复合 op 默认值推导未做 |
+| 16 | AttrConstraint、ConfinedAttr、DefaultValued | 参数值域；复合 op 参数约束推导（L10） | E | ✓ | 第 13 轮：ODS 导入 225 参数（精确 224、上近似 1）；A1 真实 14065 实例误拒 0；A2 变异 18145 例误拒 0、ODS 层漏判仅上近似 9（attributes.md） |
 | 17 | Type/Attr interface（ShapedType 等） | 接口 + 实现表（类型上） | E | ◐ | Monoid 示例；ShapedType 未导入 |
 | 18 | DataLayout | 目标参数（IW） | E | ◐ | core.IW 决定 index 溢出成毒值的界（L17′）；其余布局 ✗ |
 
@@ -89,9 +89,9 @@
 | 51 | 增量查询（增量 ≡ 全量） | ◐ | edit.md：Merkle 键 + 指纹早截断（L21），720 次编辑 0 不一致；定义内部不细分 |
 
 ## 小结
-共 52 项：✓ 16，◐ 27，✗ 8，— 1（2026-10-15，导入面之后）。
+共 52 项：✓ 17，◐ 26，✗ 8，— 1（2026-10-15，第 13 轮属性层之后）。
 - 剩下的 ✗：递归、方言组织（命名空间、版本、IRDL、方言扩展、bytecode）、transform dialect、数据流分析框架、WASM。
-- 当前最大的缺口（按 review-r7.md 的新路线）：(1) 属性层：op 参数集合从 ODS 导入（oracle.md §8），方言资源表、类型/属性良构性改用 MLIR 构造器（corpus.md §5）；(2) attribute/property 的验证差分；(3) trait/interface 作为查询的导入与审计。
+- 当前最大的缺口：(1) 符号上下文义务（func.call / func.constant / memref.get_global，C3 中 auto 账未抓住的 6 例全是这一类）；(2) core 节点内部改用 ODS 属性名作参数（attributes.md §8）；(3) 方言资源表；(4) trait/interface 作为查询的导入与审计。
 
 
 ## 第 12 轮
