@@ -469,7 +469,7 @@ def typecheck(blocks, ftype=None):
     人工精度签名不参与可用预言机时的判定：第 10 轮发现它误拒 0 维向量（vector<i32>），说明人工声明必须被审计，而不能当权威。
     预言机可用时顺便审计人工签名，分歧计入 TC_STATS。
     core 的切片 op 省略了步长（恒为 1）与 insert_slice 的尺寸（取源的 extent），人工签名检查前补成 MLIR 的端口组。"""
-    import typesig as TSg, odssig as G
+    import typesig as TSg, odssig as G, attrsig as A
     sigs, tys, out = TSg.load(), {}, []
     need, hand = [], []
     def hand_check(n, ins, outs_):
@@ -499,6 +499,7 @@ def typecheck(blocks, ftype=None):
                 cls, S = lk; TC_STATS['自动签名'] += 1
                 gi, go = G.bind(S, ins, S['ins'], n.get('seg')), G.bind(S, outs_, S['outs'])
                 if gi is not None: out.extend((n['id'], f'ods: {m}') for m in G.check(S, gi, go))
+                out.extend((n['id'], f'attr: {m}') for m in A.node_check(n, ins, outs_))      # 第 13 轮：属性层（attrsig.py），与自动签名同级
                 if gi is None or go is None: TC_STATS['无法绑定'] += 1
                 if cls != 'auto' or gi is None or go is None:
                     need.append(n['id'])

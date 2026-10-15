@@ -79,22 +79,11 @@ def emit_core(blocks, ftype, name='f'):
     def bname(b): return '^' + re.sub(r'[^\w]', '_', b)
     def fresh(): cnt[0] += 1; return f'%_o{cnt[0]}'
     def attrs(n):
-        """core 的参数 → MLIR 属性。只翻译登记过的参数；有未登记的参数 ⇒ 不发射（宁可预言机不可用，也不发出错误的文本）。"""
-        p = dict(n.get('props', {})); out = []
-        lk = G.lookup(n['op']); names = {nm for nm, *_ in lk[1]['attrs']} if lk else set()
-        def own(a):                                        # core 的参数只有在 MLIR 这个 op 也有对应属性时才能翻译
-            if a not in names: raise LookupError(f'core 参数在 MLIR {n["op"]} 上没有对应属性（{a}）')
-        if 'value' in p and not (isinstance(p['value'], (int, bool)) or re.fullmatch(r'-?\d+|true|false', str(p['value']))):
-            raise LookupError('符号参数（如模式变量、复合 op 参数）不是具体常量')
-        if 'value' in p: own('value'); out.append(f'value = {p.pop("value")} : {p.get("type") or n["outs"][0][1]}')
-        p.pop('type', None)
-        fl = [k for k in ('nsw', 'nuw') if p.pop(k, False) is True]
-        if fl: own('overflowFlags'); out.append(f'overflowFlags = #arith.overflow<{", ".join(fl)}>')
-        if 'predicate' in p and isinstance(p['predicate'], int): own('predicate'); out.append(f'predicate = {p.pop("predicate")} : i64')
-        if 'exact' in p:
-            if p.pop('exact') is True: own('isExact'); out.append('isExact')
-        if p: raise LookupError(f'未登记的参数 {sorted(p)}')
-        return out
+        """core 的参数 → MLIR 属性：统一由 attrsig.from_core 翻译（第 13 轮）。翻不了 ⇒ 不发射。"""
+        import attrsig as A
+        try: at = A.from_core(n)
+        except (A.NotMLIR, A.Symbolic) as e: raise LookupError(str(e))
+        return [k if v == 'unit' else f'{k} = {v}' for k, v in at.items()]
     def line(ind, outs, op, ins, props, regions, succs, nid):
         res = ', '.join(val(o) for o, _ in outs)
         sc = ('[' + ', '.join(bname(b) for b, _ in succs) + ']') if succs else ''
