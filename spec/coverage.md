@@ -9,7 +9,7 @@
 |---|---|---|---|---|---|
 | 1 | Operation、operand、result | Node、端口 | E | ✓ | core |
 | 2 | SSA use-def | 数据边 | E | ✓ | core、R5/R6 |
-| 3 | Block、块参数 | Blk | E | ✓ | R1–R4 |
+| 3 | Block、块参数 | Blk | E | ✓ | R1–R4；第 15 轮触发数与变异差分见 obligations.md（R2 通用化：非 NoTerminator 须以终结子结尾、SingleBlockImplicitTerminator<X> 须以 X 结尾，取自 ODS） |
 | 4 | Region（SSACFG / Graph） | RegionSpec.kind | E | ✓ | R1、R7、L5 |
 | 5 | Successor、非结构化 CFG | 控制边 | 结构 E / 值层 ✗ | ◐ | 多块 CFG 的值层是 Unknown |
 | 6 | Dominance | R5（只看可达块） | E | ✓ | 差分 0 不可靠 |
@@ -47,7 +47,7 @@
 | 26 | AutomaticAllocationScope、alloca | 透明模式自动包 alloca_scope | E | ◐ | 只在规范 |
 | 27 | 下标、extent（slice、pad…） | extent 是 index 值（ℤ），静态维是投影（L22） | E | ◐ | shapes.md：9 个 tensor op 并入 core，bufferize 后 JIT 差分 1049/1049；pad、多维 stride、memref 形状未做；Presburger 显示层未接 |
 | 28 | 循环（scf.for、LoopLike、scf.while） | 静态展开 / 按结构命名的 UF 摘要（L18）/ 归纳检查过的不变式（L19） | E/S/D | ◐ | core 已有 scf.for，loops.md；while ✗；isl power 未并入 |
-| 29 | RegionBranchOpInterface | scf.if 守卫 | E | ✓ | core |
+| 29 | RegionBranchOpInterface | scf.if 守卫；R8 控制流边类型 | E | ◐ | 第 15 轮更正：R8 只覆盖 func/scf.if/scf.for/scf.execute_region（3949 实例），scf.while、scf.parallel、tensor.pad 等 914 实例的边类型是 C++（declared），交预言机；Z2 漏判 57 全在此（obligations.md） |
 | 30 | Call、Callable | S4；复合 op 调用 = 代换 | E | ◐ | func.call 的值层未建模 |
 | 31 | 递归 | 必须声明签名 | D | ✗ | |
 | 52 | 泛型复合 op（接口约束的多态） | 推导签名：端口表达式上的 Φ（L25–L27） | E | ◐ | compsig.md：Φ≡体≡MLIR 1043/1043，嵌套≡展开 900/900；值层仍单态化；接口约束的多态未做 |

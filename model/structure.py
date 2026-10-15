@@ -36,6 +36,8 @@ class StructSchema:
     ref: str = None             # 引用符号：'flat' | 'nested'
     branch: str = None          # 控制流边规则：'if' | 'for' | None
     pure_graph_ok: bool = True  # 可否出现在 Graph 区域里
+    term_op: str = None         # 第 15 轮：SingleBlockImplicitTerminator<X> 的 X（ODS）
+    need_term: bool = None      # 第 15 轮：区域块须以终结子结尾（ODS：已导入、非 NoTerminator、无 RegionKindInterface）；None = 未知
 
 def ssacfg(term, **kw): return RegionSpec(kind='SSACFG', term=term, **kw)
 
@@ -64,7 +66,14 @@ def st(op):
         lk = G.lookup(op)
     except Exception: lk = None
     term = None if lk is None else any('IsTerminator' in t for t in lk[1]['structural'])
-    return StructSchema(op, regions=None, terminator=term, succs=(0, 10 ** 9))
+    need = None
+    try:
+        import symtab as SY
+        it = SY.interfaces(op)
+        if it is not None and not any(x in it for x in ('NoTerminator', 'RegionKindInterface')): need = True
+        to = SY.implicit_terminator(op)
+    except Exception: to = None
+    return StructSchema(op, regions=None, terminator=term, succs=(0, 10 ** 9), need_term=need, term_op=to)
 def region_specs(s, n): return s.regions if s.regions is not None else [RegionSpec(term='?')] * len(n['regions'])
 
 # ───────────────────────── 2 图表示
@@ -79,6 +88,9 @@ def node(i, op, ins=(), outs=(), regions=(), succs=(), **kw):
 
 # ───────────────────────── 3 判定：Wf_struct
 
+import collections
+CHECKED = collections.Counter()   # 第 15 轮：每条义务实际被求值的次数（防空检验：0 误拒必须连同触发数一起报告）
+
 class Diag(list):
     def add(s, where, obligation, msg): s.append((where, obligation, msg))
 
@@ -91,13 +103,16 @@ def _defs_of(blocks):
             for v, _ in n['outs']: d[v] = (b['name'], k)
     return d
 
-def _types_of(blocks, out=None):
+def _types_of(blocks, out=None, deep=True):
+    """值名 → 类型。deep=False 只收本区域（块参数与顶层 op 结果）。
+    第 15 轮：真实 IR 中兄弟区域会复用值名（scf.while 的 before/after 都有 %1），深收集会互相覆盖 ⇒ 判定一律逐区域下行用 deep=False。"""
     t = {} if out is None else out
     for b in blocks:
         t.update(dict(b['args']))
         for n in b['ops']:
             t.update(dict(n['outs']))
-            for r in n['regions']: _types_of(r, t)
+            if deep:
+                for r in n['regions']: _types_of(r, t)
     return t
 
 def _reach(blocks):
@@ -134,9 +149,8 @@ def _idom(blocks):
 def check(root, diag=None):
     """root 是一个 builtin.module 节点。返回 Diag（空表示结构良构）。"""
     d = diag if diag is not None else Diag()
-    _check_node(root, d, scope_vals=set(), tables=[], types=_types_of(root['regions'][0]) | dict(
+    _check_node(root, d, scope_vals=set(), tables=[], types=_types_of(root['regions'][0], deep=False) | dict(
         (v, t) for v, t in []), path='')
-    global TYPES; TYPES = _types_of(root['regions'][0])
     _symbols(root, d)
     return d
 TYPES = {}
@@ -172,7 +186,12 @@ def _symbols(root, d):
             for b in r:
                 for n in b['ops']:
                     nm = SY.sym_of(n)
+                    if nm and SY._has(n['op'], 'FunctionOpInterface'):
+                        CHECKED['S5'] += 1
+                        if not (n['regions'] and n['regions'][0]) and SY.vis_of(n) == 'public':
+                            d.add(n['id'], 'S5', f"@{nm} 是声明（无函数体），不能是 public")
                     if nm:
+                        CHECKED['S1'] += 1
                         if nm in syms: d.add(n['id'], 'S1', f"符号 @{nm} 在同一符号表内重名")
                         syms[nm] = (SY.vis_of(n), n)
         def inner_syms(t):
@@ -186,7 +205,7 @@ def _symbols(root, d):
         def use(n, tys):
             ref = SY.ref_of(n)
             if not ref or not isinstance(ref, str) or not ref.startswith('@'): return
-            parts = [p.strip('"') for p in ref.lstrip('@').split('::@')]
+            parts = [p.strip('"') for p in ref.lstrip('@').split('::@')]; CHECKED['S2'] += 1
             tgt = None
             if len(parts) == 1:
                 got = syms.get(parts[0])
@@ -204,7 +223,7 @@ def _symbols(root, d):
             want_op, rel = (SY.USES[n['op']][1:] if n['op'] in SY.USES else ('func.func', 'call'))
             if tgt['op'] != want_op:
                 d.add(n['id'], 'S2', f"@{parts[-1]} 是 {tgt['op']}，{n['op']} 需要 {want_op}"); return
-            outs = [t for _, t in n['outs']]
+            outs = [t for _, t in n['outs']]; CHECKED['S4'] += 1
             if rel == 'call':
                 ft = SY.ftype_of(tgt)
                 if ft is None: return
@@ -228,10 +247,10 @@ def _symbols(root, d):
                 use(n, tys)
                 if table_of(n): walk(n); continue
                 for r in n['regions']:
-                    t2 = _types_of(r, {} if n['op'] == 'func.func' or 'IsIsolatedFromAbove' in (SY.interfaces(n['op']) or ()) else dict(tys))
+                    t2 = _types_of(r, {} if n['op'] == 'func.func' or 'IsIsolatedFromAbove' in (SY.interfaces(n['op']) or ()) else dict(tys), deep=False)
                     for b in r: refs(b['ops'], t2)
         for r in tnode['regions']:
-            t0 = _types_of(r)
+            t0 = _types_of(r, deep=False)
             for b in r: refs(b['ops'], t0)
     walk(root)
 
@@ -242,6 +261,7 @@ def _check_node(n, d, scope_vals, tables, types, path):
     specs = region_specs(s, n)
     if len(n['regions']) != len(specs):
         d.add(n['id'], 'R1', f"{n['op']} 需要 {len(specs)} 个区域，给了 {len(n['regions'])} 个")
+    if n['regions'] or s.regions: CHECKED['R1'] += 1
     rc = _ods_regions(n['op'], len(n['regions']))      # 第 12 轮：区域块数取自 ODS 的区域约束（真实 IR：scf.if 的 else 可为空）
     for ri, (blocks, spec) in enumerate(zip(n['regions'], specs)):
         lo = rc[ri][0] if rc else (1 if s.regions is not None else 0)   # 第 14 轮：未知 op 的空区域不判（真实 IR：transform 方言）
@@ -254,12 +274,20 @@ def _check_node(n, d, scope_vals, tables, types, path):
             d.add(n['id'], 'R1', f"区域 #{ri} 只允许一个块")
         names = {b['name'] for b in blocks}
         inner_defs = _defs_of(blocks)
-        inner_types = dict(types); _types_of(blocks, inner_types)
+        inner_types = dict(types); _types_of(blocks, inner_types, deep=False)
         visible = set(inner_defs) if spec.isolated else scope_vals | set(inner_defs)
         reach = _reach(blocks)
         dom = _idom(blocks)
         for b in blocks:
+            if spec.term == '?' and s.need_term:            # 第 15 轮：MLIR 核心规则——非 NoTerminator 的已注册 op，其区域的块必须以终结子结尾
+                CHECKED['R2'] += 1
+                if not b['ops']: d.add(f"{n['id']}/{b['name']}", 'R2', "空块：至少要有终结子")
+                elif s.term_op not in (None, '?') and b['ops'][-1]['op'] != s.term_op:   # 名字比较：末 op 未导入也成立
+                    d.add(f"{n['id']}/{b['name']}", 'R2', f"区域须以 {s.term_op} 结尾，实为 {b['ops'][-1]['op']}")
+                elif st(b['ops'][-1]['op']).terminator is False:   # 末 op 未知（未导入方言）⇒ 不判
+                    d.add(f"{n['id']}/{b['name']}", 'R2', f"块没有终结子（末 op {b['ops'][-1]['op']} 不是终结子）")
             if spec.term is None or spec.term == '?': pass     # NoTerminator / 父 op 未知
+            elif CHECKED.update(['R2']): pass
             elif not b['ops'] or st(b['ops'][-1]['op']).terminator is False:
                 d.add(f"{n['id']}/{b['name']}", 'R2', "块没有终结子")
             elif spec.term and b['ops'][-1]['op'] != spec.term and spec.single_block:
@@ -270,6 +298,7 @@ def _check_node(n, d, scope_vals, tables, types, path):
                     d.add(o['id'], 'R2', "终结子不在块尾")
                 if not (os_.succs[0] <= len(o['succs']) <= os_.succs[1]):
                     d.add(o['id'], 'R3', f"{o['op']} 需要 {os_.succs} 个后继，给了 {len(o['succs'])}")
+                if o['succs']: CHECKED['R3'] += 1
                 if o['succs'] and spec.kind != 'SSACFG':
                     d.add(o['id'], 'R7', "Graph 区域里不允许块间跳转")
                 for si, (sn, sargs) in enumerate(o['succs']):
@@ -280,14 +309,17 @@ def _check_node(n, d, scope_vals, tables, types, path):
                         if o.get('props', {}).get('_succ_opaque'): continue      # 未知 op 的后继实参划分未知
                         d.add(o['id'], 'R4', f"后继 #{si} 参数个数 {len(sargs)} ≠ ^{sn} 的 {len(tgt['args'])}")
                     else:
+                        CHECKED['R4'] += 1
                         for ai, (v, (_, ty)) in enumerate(zip(sargs, tgt['args'])):
                             if inner_types.get(v) != ty:
                                 d.add(o['id'], 'R4', f"后继 #{si} 第 {ai} 个参数类型 {inner_types.get(v)} ≠ {ty}")
                 for v in o['ins'] + [x for _, sa in o['succs'] for x in sa]:   # 后继操作数也是使用
+                    CHECKED['R6'] += 1
                     if v not in visible:
                         d.add(o['id'], 'R6', f"{v} 在此处不可见"
                               + ("（跨越了 IsolatedFromAbove 边界）" if v in scope_vals else ""))
                     elif v in inner_defs and b['name'] in reach and spec.kind == 'SSACFG':
+                        CHECKED['R5'] += 1
                         db, di = inner_defs[v]
                         if db == b['name']:
                             if di >= k: d.add(o['id'], 'R5', f"{v} 的定义不支配这次使用（同块靠后）")
@@ -298,13 +330,14 @@ def _check_node(n, d, scope_vals, tables, types, path):
         if s.branch == 'if':
             for b in blocks:
                 if b['ops'] and b['ops'][-1]['op'] == (spec.term or ''):
+                    CHECKED['R8'] += 1
                     got = [inner_types.get(v) for v in b['ops'][-1]['ins']]
                     want = [t for _, t in n['outs']]
                     if got != want:
                         d.add(b['ops'][-1]['id'], 'R8', f"沿控制流边到父结果：{got} ≠ {want}")
         if n['op'] == 'func.func':                   # 父 op ↔ 入口块参数、ReturnLike ↔ 父结果
             import symtab as SY                       # 第 14 轮：导入节点的函数类型在 _attrs['function_type']
-            ins_t, outs_t = _ftype(SY.ftype_of(n) or '() -> ()')
+            ins_t, outs_t = _ftype(SY.ftype_of(n) or '() -> ()'); CHECKED['R8'] += 1
             if [t for _, t in blocks[0]['args']] != ins_t:
                 d.add(n['id'], 'R8', f"入口块参数 {[t for _, t in blocks[0]['args']]} ≠ 函数输入 {ins_t}")
             for b in blocks:
@@ -314,7 +347,7 @@ def _check_node(n, d, scope_vals, tables, types, path):
         if s.branch == 'for':
             iters = [t for _, t in n['outs']]
             want = [types.get(n['ins'][0], 'index')] + iters    # 第 12 轮：归纳变量的类型 = 边界的类型（index 或无符号整数），不恒为 index
-            got = [t for _, t in blocks[0]['args']]
+            got = [t for _, t in blocks[0]['args']]; CHECKED['R8'] += 1
             if got != want: d.add(n['id'], 'R8', f"循环入口块参数 {got} ≠ {want}")
             for b in blocks:
                 if b['ops'] and b['ops'][-1]['op'] == 'scf.yield':

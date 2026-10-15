@@ -43,3 +43,5 @@ PYTHONPATH=model python3 model/corpus_test.py
 PYTHONPATH=model python3 model/attrsig_test.py 3     # A0 导入账 / A1 真实属性不误拒 / A2 变异差分（需 corpus/）
 ```
 属性值由 MLIR 属性解析器承载，属性参数与约束从 ODS 导入（model/attrsig.py）；core 参数 → MLIR 属性只有一个翻译函数 attrsig.from_core。见 spec/attributes.md。
+
+- 第 15 轮：结构义务审计（spec/obligations.md，model/obligations_test.py）：R1–R8、S1–S5 在真实 IR 上的触发数与逐义务变异差分（8858 例，误拒 0，漏判 249 全部归因于未导入方言或 C++ declared 义务）。

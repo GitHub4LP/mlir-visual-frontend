@@ -489,7 +489,9 @@ def typecheck(blocks, ftype=None):
                 TC_STATS['节点'] += 1
                 lk = G.lookup(n['op'])
                 try:
-                    ins = [TSg.parse(tys[v]) for v in n['ins']]; outs_ = [TSg.parse(t) for _, t in n['outs']]
+                    # 第 15 轮：ODS 的操作数表含后继实参（cf.cond_br 的 trueDestOperands…）⇒ 绑定用 ins + 后继实参（按序展平）
+                    flat = n['ins'] + [v for _, sa in n.get('succs', []) for v in sa] if not n.get('props', {}).get('_succ_opaque') else n['ins']
+                    ins = [TSg.parse(tys[v]) for v in flat]; outs_ = [TSg.parse(t) for _, t in n['outs']]
                 except (KeyError, ValueError, AttributeError):
                     if lk is not None: need.append(n['id'])
                     continue
@@ -497,7 +499,10 @@ def typecheck(blocks, ftype=None):
                     if n['op'] in sigs: hand.extend(hand_check(n, ins, outs_)); need.append(n['id'])
                     continue                                                             # 复合 op：由其 Schema 负责
                 cls, S = lk; TC_STATS['自动签名'] += 1
-                gi, go = G.bind(S, ins, S['ins'], n.get('seg')), G.bind(S, outs_, S['outs'])
+                seg = n.get('seg')
+                if seg is None and (n.get('props', {}).get('_attrs') or {}).get('operandSegmentSizes'):
+                    import irimport as _I; seg = _I._segs(n['props']['_attrs']['operandSegmentSizes']) or None
+                gi, go = G.bind(S, ins, S['ins'], seg), G.bind(S, outs_, S['outs'])
                 if gi is not None: out.extend((n['id'], f'ods: {m}') for m in G.check(S, gi, go))
                 out.extend((n['id'], f'attr: {m}') for m in A.node_check(n, ins, outs_))      # 第 13 轮：属性层（attrsig.py），与自动签名同级
                 if gi is None or go is None: TC_STATS['无法绑定'] += 1
