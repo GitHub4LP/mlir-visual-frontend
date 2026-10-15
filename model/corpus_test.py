@@ -36,6 +36,7 @@ def run_file(path, q):
             g = parse_generic_line(line)
             if g is None: st['C3 op 带区域/无法重建'] += 1; continue
             opn, tins, touts, attrs = g
+            if attrs is None: st['C3 属性文本无法重建'] += 1; continue
             nd = ST.node('n0', opn, ins=[f'a{i}' for i in range(len(tins))], outs=[(f'r{i}', t) for i, t in enumerate(touts)],
                          props={'_attrs': attrs, '_types': tins})
             bs = [ST.blk('entry', [nd, ST.node('ret', 'func.return', ins=[])], args=[(f'a{i}', t) for i, t in enumerate(tins)])]
@@ -51,7 +52,14 @@ def run_file(path, q):
                 st['C3 core 异常'] += 1; note('C3 core 异常', f'{opn}: {type(e2).__name__} {str(e2)[:80]}'); continue
             import odssig as G
             kind = (G.lookup(opn) or ('无签名',))[0]
-            if d: st['C3 符号层抓住'] += 1; st[f'C3 抓住/{kind}'] += 1
+            if d:
+                st['C3 符号层抓住'] += 1; st[f'C3 抓住/{kind}'] += 1
+                am = [m for _, m in d if m.startswith('attr:')]
+                if am and not [m for _, m in d if not m.startswith('attr:')]:      # 只由属性层抓住：检查理由是否与 MLIR 的诊断一致
+                    nm = re.findall(r"'(\w+)'", am[0])
+                    same = any(f"'{x}'" in first or f"{x}" in first for x in nm) or '类型不同' in am[0] and 'same type' in first
+                    st['C3 属性层抓住' + ('（理由与 MLIR 一致）' if same else '（理由不同）')] += 1
+                    if not same: note('C3 属性层抓住但理由不同', f'{opn}: 我们 {am[0][:70]} ‖ MLIR {first[:80]}')
             else:
                 st['C3 符号层未抓住'] += 1; st[f'C3 未抓住/{kind}'] += 1
                 note(f'C3 未抓住/{kind}', f'{opn}: {first[:90]}')
@@ -116,8 +124,31 @@ def parse_generic_line(line):
         return out
     outs = tm.group(2).strip()
     outs = split(outs[1:-1]) if outs.startswith('(') else [outs]
-    attrs = rest[:tm.start()].strip()
-    return m.group(1), split(tm.group(1)), outs, {'_raw': attrs}
+    raw = rest[:tm.start()].strip()
+    return m.group(1), split(tm.group(1)), outs, raw_attrs(raw)
+
+def raw_attrs(raw):
+    """'<{a = 1 : i64}> {b}' → {'a': '1 : i64', 'b': 'unit'}：两个字典都交给 MLIR 的属性解析器（第 13 轮；此前 C3 不重建属性）。
+    解析不了 ⇒ None（该例不参与属性层统计）。"""
+    import mlir.ir as ir, attrsig as A
+    out, rest = {}, raw.strip()
+    try:
+        while rest:
+            if rest.startswith('<{'):
+                d, k = 0, 0
+                for k, ch in enumerate(rest):
+                    d += ch in '<([{'; d -= ch in '>)]}'
+                    if d == 0: break
+                body, rest = rest[1:k], rest[k + 1:].strip()
+            elif rest.startswith('{'):
+                body, rest = rest, ''
+            else: return None
+            with A._ctx():
+                da = ir.DictAttr(ir.Attribute.parse(body))
+                for i in range(len(da)):
+                    na = da[i]; v = str(na.attr); out[na.name] = 'unit' if v == 'unit' else v
+    except Exception: return None
+    return out
 
 if __name__ == '__main__':
     root = sys.argv[1] if len(sys.argv) > 1 else 'corpus'
