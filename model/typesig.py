@@ -138,7 +138,9 @@ def _tdims(a, b):
     return sh(a) == sh(b)
 def _cond_or_shape(c, r):              # AllShapesMatch 是 getShape 逐项相等；无秩时 MLIR 同样会崩溃，保守拒绝
     return c == ('i', 1, '') or (shaped(c) and shaped(r) and c[1] == r[1] and (c[1] is not None or c[0] == r[0] == 'tensor'))
-def _width(rel): return lambda a, b: elt(a)[0] == 'i' and elt(b)[0] == 'i' and rel(elt(b)[1], elt(a)[1])
+def _width(rel, name):
+    f = lambda a, b: elt(a)[0] == 'i' and elt(b)[0] == 'i' and rel(elt(b)[1], elt(a)[1])
+    f.__name__ = name; return f
 def _ixcast(a, b):
     ea, eb = elt(a), elt(b)
     return (ea[0] == 'index') != (eb[0] == 'index') and all(e[0] in ('index', 'i') for e in (ea, eb))
@@ -152,9 +154,9 @@ def _islice(src, dst, offs, szs, strs):
     return ranked(src) and ranked(dst) and len(offs) == len(szs) == len(strs) == len(dst[1]) == len(src[1]) \
         and src[2] == dst[2] and all(d is None for d in src[1])
 EXTRA = {
-    'Arith_TruncIOp': [('pred', ['in', 'out'], _tdims, 'cpred'), ('pred', ['in', 'out'], _width(lambda o, i: o < i), 'declared')],
-    'Arith_ExtUIOp': [('pred', ['in', 'out'], _tdims, 'cpred'), ('pred', ['in', 'out'], _width(lambda o, i: o > i), 'declared')],
-    'Arith_ExtSIOp': [('pred', ['in', 'out'], _tdims, 'cpred'), ('pred', ['in', 'out'], _width(lambda o, i: o > i), 'declared')],
+    'Arith_TruncIOp': [('pred', ['in', 'out'], _tdims, 'cpred'), ('pred', ['in', 'out'], _width(lambda o, i: o < i, 'narrower'), 'declared')],
+    'Arith_ExtUIOp': [('pred', ['in', 'out'], _tdims, 'cpred'), ('pred', ['in', 'out'], _width(lambda o, i: o > i, 'wider'), 'declared')],
+    'Arith_ExtSIOp': [('pred', ['in', 'out'], _tdims, 'cpred'), ('pred', ['in', 'out'], _width(lambda o, i: o > i, 'wider'), 'declared')],
     'Arith_IndexCastOp': [('pred', ['in', 'out'], _tdims, 'cpred'), ('pred', ['in', 'out'], _ixcast, 'declared')],
     'Arith_IndexCastUIOp': [('pred', ['in', 'out'], _tdims, 'cpred'), ('pred', ['in', 'out'], _ixcast, 'declared')],
     'SelectOp': [('pred', ['condition', 'result'], _cond_or_shape, 'cpred')],
@@ -203,41 +205,49 @@ def bind(sig, ins, outs):
         return env if k == len(vals) else None
     return b(sig['ins'], ins, sig.get('seg')), b(sig['outs'], outs)
 
+def items(sig, levels=LEVELS):
+    """签名的全部条目：('port', 端口, 约束) 与关系。复合 op 的推导签名（compsig.py）按条目逐一代换。"""
+    return [('port', n, c) for n, c, _ in sig['ins'] + sig['outs'] if c in PORT] + [r for r in sig['rel'] if r[-1] in levels]
+
+def ok(sig, r, env):
+    """一个条目在 env（端口名 → 类型列表）下是否成立；端口类型未定义（None）⇒ 不成立。"""
+    if any(t is None for ts in env.values() for t in ts): return False
+    if r[0] == 'port': return all(PORT[r[2]](t) for t in env[r[1]])
+    if r[0] == 'same':
+        ts = [t for p in r[1] for t in env.get(p, [])]; return all(t == ts[0] for t in ts)
+    if r[0] == 'samec':
+        ts = [t for p in r[1] for t in env.get(p, [])]
+        return all(elt(a) == elt(b) and compat_shape(a, b) and a[0] == b[0] for a, b in itertools.combinations(ts, 2))
+    if r[0] == 'elementwise':
+        return _elementwise([t for n, *_ in sig['ins'] for t in env[n]], [t for n, *_ in sig['outs'] for t in env[n]])
+    if r[0] == 'shape':
+        ts = [t for p in r[1] for t in env.get(p, [])]; return all(compat_shape(a, b) for a, b in itertools.combinations(ts, 2))
+    if r[0] == 'match':
+        _, a, b, k, _ = r
+        if not env.get(a): return True
+        want = XF[k](env[a][0]); return want is not None and list(env[b]) == want
+    if r[0] == 'pred': return bool(r[2](*[env[p][0] for p in r[1]]))
+    if r[0] == 'predv':
+        var = {nn for nn, _, m in sig['ins'] + sig['outs'] if m != 'one'}
+        return bool(r[2](*[env[p] if p in var else env[p][0] for p in r[1]]))
+    return True
+
+def label(r):
+    if r[0] == 'port': return ('ods', f'{r[1]}: 不满足 {r[2]}')
+    if r[0] in ('pred', 'predv'): return (r[-1], f'{r[1]} 不满足 {r[2].__name__}')
+    if r[0] == 'match': return (r[-1], f'{r[2]} 须为 {r[3]}({r[1]})')
+    return (r[-1], {'same': '类型须相同', 'samec': '元素类型须相同且形状相容', 'shape': '形状须相容',
+                    'elementwise': 'Elementwise：非标量端口须同为一种容器且形状相容'}.get(r[0], r[0]) + f': {r[1]}')
+
+COMPS = {}          # 复合 op 的推导签名（compsig.py 注册），与原生签名走同一个 check
 def check(op, ins, outs, levels=LEVELS, seg=None):
     """返回违例列表 [(来源, 说明)]；空表 = 接受。ins/outs：类型项列表。"""
+    if op in COMPS: return COMPS[op].check(ins, outs, levels)
     sig = dict(load()[op]); sig['seg'] = seg
     ei, eo = bind(sig, ins, outs)
     if ei is None or eo is None: return [('ods', '操作数/结果个数不符')]
-    env = {**ei, **eo}; bad = []
-    for n, c, m in sig['ins'] + sig['outs']:
-        if c in PORT and not all(PORT[c](t) for t in env[n]): bad.append(('ods', f'{n}: 不满足 {c}'))
-    for r in sig['rel']:
-        src = r[-1]
-        if src not in levels: continue
-        if r[0] == 'same':
-            ts = [t for p in r[1] for t in env.get(p, [])]
-            if any(t != ts[0] for t in ts): bad.append((src, f'类型须相同: {r[1]}'))
-        elif r[0] == 'samec':
-            ts = [t for p in r[1] for t in env.get(p, [])]
-            if not all(elt(a) == elt(b) and compat_shape(a, b) and a[0] == b[0] for a, b in itertools.combinations(ts, 2)):
-                bad.append((src, f'元素类型须相同且形状相容: {r[1]}'))
-        elif r[0] == 'elementwise':
-            ok = _elementwise([t for n, *_ in sig['ins'] for t in env[n]], [t for n, *_ in sig['outs'] for t in env[n]])
-            if not ok: bad.append((src, 'Elementwise：非标量操作数/结果须同为一种容器且形状相容'))
-        elif r[0] == 'shape':
-            ts = [t for p in r[1] for t in env.get(p, [])]
-            if not all(compat_shape(a, b) for a, b in itertools.combinations(ts, 2)): bad.append((src, f'形状须相容: {r[1]}'))
-        elif r[0] == 'match':
-            _, a, b, k, _ = r
-            if not env.get(a): continue
-            want = XF[k](env[a][0])
-            if want is None or list(env[b]) != want: bad.append((src, f'{b} 须为 {k}({a})'))
-        elif r[0] == 'pred':
-            if not r[2](*[env[p][0] for p in r[1]]): bad.append((src, f'{r[1]} 不满足 {r[2].__name__}'))
-        elif r[0] == 'predv':
-            args = [env[p] if any(m != 'one' for nn, _, m in sig['ins'] + sig['outs'] if nn == p) else env[p][0] for p in r[1]]
-            if not r[2](*args): bad.append((src, f'{r[1]} 不满足 {r[2].__name__}'))
-    return bad
+    env = {**ei, **eo}
+    return [label(r) for r in items(sig, levels) if not ok(sig, r, env)]
 
 def infer(op, ins, seg=None):
     """由操作数推出结果类型；推不出（结果类型是用户的选择，如 trunci 的目标宽度）⇒ None。"""
