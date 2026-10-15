@@ -27,6 +27,9 @@ def interfaces(op):
     def add(name):
         x = d.get(name)
         if not isinstance(x, dict): out.add(name); return
+        if 'TraitList' in (x.get('!superclasses') or []):        # 第 15 轮：TraitList（如 SingleBlockImplicitTerminator）展开成员
+            for t in x.get('traits') or []: add(O.ref(t))
+            return
         nm = x.get('cppInterfaceName') or x.get('trait') or name
         if nm in out: return
         out.add(nm)
@@ -87,3 +90,28 @@ def ledger():
                 out['使用者'].append(op)
                 if op not in USES: out['使用者未登记义务'].append(op)
     return out
+
+@functools.lru_cache(None)
+def _cls_index():
+    """C++ 类名（去掉方言前缀的 def 名，如 SCF_YieldOp → YieldOp）+ 命名空间 → op 名。"""
+    idx = {}
+    for dia in O.DIALECTS:
+        d = O.records(dia)
+        for op, rec in O.ops(dia).items():
+            cls = rec.split('_', 1)[1] if '_' in rec else rec
+            ns = (d[rec].get('cppNamespace') or '').strip(':').split('::')[-1]
+            idx[(ns, cls)] = op; idx.setdefault(('', cls), op)
+    return idx
+
+def implicit_terminator(op):
+    """SingleBlockImplicitTerminator<X> 的 X 对应的 op 名；没有该 trait ⇒ None；有但解析不出 ⇒ '?'。"""
+    for t in interfaces(op) or ():
+        m = re.match(r'SingleBlockImplicitTerminator<(.+)>::Impl$', t)
+        if m:
+            full = m.group(1).split('::'); cls = full[-1]; ns = full[-2] if len(full) > 1 else ''
+            ix = _cls_index()
+            if not ns:                                  # 未写命名空间 ⇒ 与该 op 同一 C++ 命名空间（shape.reduce 的 YieldOp 是 shape.yield）
+                dia = op.split('.')[0]; d = O.records(dia)
+                ns = (d[O.ops(dia)[op]].get('cppNamespace') or '').strip(':').split('::')[-1]
+            return ix.get((ns, cls)) or '?'
+    return None
