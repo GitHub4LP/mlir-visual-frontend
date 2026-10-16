@@ -9,3 +9,9 @@ curl -fsSL -o nt.whl "https://github.com/makslevental/wheels/releases/download/i
 python3 -m zipfile -e nt.whl . && rm nt.whl
 chmod +x mlir_native_tools-*.data/data/bin/*
 echo "tblgen: $(ls -d $PWD/mlir_native_tools-*.data/data/bin)/llvm-tblgen"
+# 第 19 轮：linalg 命名结构化 op 的 .td 是构建期由 LinalgNamedStructuredOps.yaml 生成的，wheel 不带 ⇒ 取同一提交的 yaml，用同一轮子的 mlir-linalg-ods-yaml-gen 生成。
+LLVM_COMMIT=${LLVM_COMMIT:-9bae84b01718e53495abf50958abc86ea45f16bb}
+G=gen/mlir/Dialect/Linalg/IR; mkdir -p $G
+curl -fsSL -o $G/LinalgNamedStructuredOps.yaml "https://raw.githubusercontent.com/llvm/llvm-project/$LLVM_COMMIT/mlir/include/mlir/Dialect/Linalg/IR/LinalgNamedStructuredOps.yaml"
+mlir_native_tools-*.data/data/bin/mlir-linalg-ods-yaml-gen $G/LinalgNamedStructuredOps.yaml --o-ods-decl=$G/LinalgNamedStructuredOps.yamlgen.td
+echo "yamlgen: $PWD/$G/LinalgNamedStructuredOps.yamlgen.td"

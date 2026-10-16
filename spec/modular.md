@@ -95,3 +95,23 @@
 - auto 10 例不反驳 L28：诊断都是“block with no terminator”，MLIR 把它落在块里最后一个 op（arith.addf、math.exp）上，实际义务属于父 op（linalg 命名 op 的区域，未导入）。归因按诊断位置是近似的。
 
 批判：导入把 725 例中的一部分从“未导入”挪到了 unknown/declared，**真正被符号层自己抓住的只有 183 例**。transform 方言 94/111 是 unknown（端口类型全是方言类型），即导入给了结构与属性信息，但类型义务几乎全部仍在预言机。下一步缩小漏判的杠杆不在“再导入方言”，而在：(a) 方言类型原子（!transform.*、!gpu.*）的登记——它们是类型构造子的 isa，属于类型代数而非方言语义；(b) 区域分支类型（RegionBranchOpInterface，scf.while/tensor.pad/execute_region/named_sequence 共约 140 例）作为一条通用义务导入，而不是逐 op 手写。
+
+## 8. 第 19 轮：类型原子的封闭与开放；构建期生成的 ODS
+
+**(a) 方言类型原子。** 端口约束 `isa<C>($_self)` 分两类，性质不同：
+- C 是具体类型类（TypeDef）：类型类是**封闭**的——一个类型恰属一个 C++ 类。odsjson.typedefs() 从全部已导入方言的 TypeDef 记录取 (命名空间, 类名) → 类型名（`transform.op`），项是 MLIR 打印的 ('opaque', 文本)，按 `!dia.mn` / `!dia.mn<…>` / `!dia<mn…>` 判定，精确。共 49 个 TypeDef。C++ 手写、无 TypeDef 的类型（gpu.async.token、gpu.mma_matrix、gpu 稀疏句柄）在 ODS 里**没有拼写**，留作 unknown。
+- C 是类型接口（TransformHandleTypeInterface、TensorLikeType…）：**开放世界**——实现者可由外部模型在运行时附加（builtin tensor 经扩展实现 bufferization::TensorLikeType；pdl 类型经 transform 扩展实现句柄接口）。ODS 只看得到一部分实现者。
+
+**L43（接口约束开放）**：接口 isa 只能正向接受，不能作为拒绝依据；拒绝权只属于预言机（MLIR 运行时知道全部外部模型）。对前端：接口端口的“可连”候选只能给出已知实现者（补全可靠不完备），“不可连”必须问 MLIR。登记为 unknown（“开放接口 isa”），不是缺陷。
+
+实测：TypeDef 原子使 nvgpu 12、shard 3 个 op 升为 auto，但漏判只减 6（698 → 692）。原因：transform 端口 185 处约束是接口而不是具体类型——上一轮“登记方言类型原子即可缩小漏判”的预期是错的，transform 的 136 例（structured.match）原则上就在符号层之外。
+
+**(b) 构建期生成的 .td。** linalg 命名结构化 op（fill/matmul/generic/transpose…）定义在 LinalgStructuredOps.td，它 include 构建期由 `LinalgNamedStructuredOps.yaml` 经 `mlir-linalg-ods-yaml-gen` 生成的 yamlgen.td。wheel 不带生成物，但工具轮子带同一提交的 `mlir-linalg-ods-yaml-gen`。scripts/fetch_tools.sh 取同一提交（9bae84b0）的 yaml 生成到 tools/gen/，odsjson 把它加进 -I。linalg 由 25 → 99 op（全部 declared：DestinationStyleOpInterface/LinalgOp 接口 verify），结构信息（区域、终结子）进入结构层。
+
+同时修复导入缺陷：attrsig._has_upper 在未知属性原子（linalg::IteratorTypeAttr）上重新抛出，typecheck 异常 ⇒ 8 个合法单元的类型层被跳过（C2 一度 3479）。**异常不是误拒，但它让单元静默失去符号层——须单列计数**（MOD_STATS['类型层异常']，现为 0）。
+
+**(c) 区域分支义务的纠偏。** 上一轮计划把 RegionBranchOpInterface 的类型义务“作为通用义务导入”。查实：`verifyTypesAlongControlFlowEdges` 是通用的，但边关系 `getSuccessorRegions`、`getEntrySuccessorOperands`、`areTypesCompatible` 都是逐 op 的 C++，ODS 不携带。能从 ODS 导入的只有“该 op 有此接口”这一事实；边关系要么手写（违背 review-r7 原则），要么问 MLIR。故不做：scf.while/tensor.pad/execute_region/named_sequence 的义务留在预言机。
+
+验证（MLIR 9bae84b0）：合法模块 2112/3707 单元误拒 0、类型层异常 0；C2 3487 误拒 0（预言机调用 2982）；Y1/Y2、A1 14984 实例、A2 25395 变异误拒 0；O1/O5 一致；odssig 非 declared 分歧 0；Z2 9049 误拒 0、漏判 **120**（原 228）；**M3 19641 误拒 0 漏判 0，不开预言机漏判 580（2.95%，原 698 / 3.55%）**。剩余：declared 314、unknown 250、未知 op 13、未导入 3、auto 0（上轮 auto 10 是父 op 未导入导致的归因错位，导入 linalg 后消失）。
+
+**结论（L44，残差的来源）**：剩余 580 例全部落在三类 ODS 不携带的机制上——C++ verify（declared）、开放接口（L43）、逐 op 的 C++ 关系（区域分支边）。它们唯一忠实的来源是 MLIR 自身。因此以“符号层漏判率”为目标继续推进已到边际：符号层的职责是快路径与引导（补全候选、端口取值域、编辑代价），拒绝的最终权威是隔离单元预言机（L42）。后续轮次转向：L42 增量重验（单元缓存键接 edit.md）、方言资源表、IRDL（用户自定义 op 的载体，前端组合封闭的关键）。

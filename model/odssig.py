@@ -75,7 +75,10 @@ def _tp(dialect, b, S):
     不能因此拒绝；L29 要求的方向）。此前该处直接抛出，导致整个方言导入失败。"""
     try: return O.type_pred(dialect, b, O.ATOM, O.XFORM)
     except O.Unknown as e:
-        S['unknown'].append(f'端口类型原子: {str(e.args[0])[:70]}'); return lambda t: True
+        txt = str(e.args[0])
+        # 第 19 轮：isa<…Interface> 是开放世界——实现者可由外部模型在运行时附加（如 builtin tensor 经扩展实现 bufferization::TensorLikeType），
+        # ODS 里看不到全部实现者 ⇒ 只能正向接受，不能据此拒绝（L43）。
+        S['unknown'].append(('开放接口 isa: ' if 'Interface>' in txt else '端口类型原子: ') + txt[:70]); return lambda t: True
 
 @functools.lru_cache(None)
 def sig(dialect, opname):

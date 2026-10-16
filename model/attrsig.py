@@ -215,9 +215,10 @@ def attr_args(opname):
         elif p is None: ent['pred'] = lambda env: True
         else:
             before = set(ATOMS.upper)
-            try: ent['pred'] = _interp(d, p)
-            except O.Unknown as e: ent['unknown'] = e.args[0]
-            ent['upper'] = ATOMS.upper != before or bool(_has_upper(d, p))
+            try:
+                ent['pred'] = _interp(d, p)
+                ent['upper'] = ATOMS.upper != before or bool(_has_upper(d, p))
+            except O.Unknown as e: ent['unknown'] = e.args[0]; ent['pred'] = None   # 第 19 轮：_has_upper 也会碰到未知原子（linalg::IteratorTypeAttr），曾在 typecheck 里抛出 ⇒ 单元被跳过
         out.append(ent)
     return out
 
