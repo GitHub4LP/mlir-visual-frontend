@@ -216,6 +216,7 @@ def emit_core(blocks, ftype, name='f', symbols=None, mod_attrs=None):
     decls = []
     for r in sorted(refs - {name}):
         d = (symbols or {}).get(r)
+        if d is None and symbols is not None: continue      # 有上下文而最近符号表里没有：整模块里 MLIR 同样找不到 ⇒ 原样保留（第 17 轮）
         if d is None: _why('未解析的符号引用（无模块上下文）'); return None
         dec = _decl(d, r)
         if dec is None: _why(f'{d["op"]} 定义者无法声明'); return None
@@ -249,3 +250,125 @@ def get():
     global ORACLE
     if ORACLE is None: ORACLE = Oracle()
     return ORACLE
+
+# ── 第 17 轮（modular.md §6）：发射单位 = 隔离单元（unit）——函数类符号 op 本身（func.func、transform.named_sequence、gpu.func、llvm.func…），
+#    连同它的祖先链（各祖先只发外壳：属性 + 只含本单元与所需声明的单块区域）与被引用符号的声明。
+#    单元的识别是启发式的（“带区域的符号定义者、且不是符号表、取最外层”）：选错不会误判——体若引用了单元外的值，发射文本解析不了 ⇒ 无结论（不可送达），不是拒绝。
+def _walk(n):
+    yield n
+    for r in n['regions']:
+        for b in r:
+            for m in b['ops']: yield from _walk(m)
+
+def _sym(n):
+    a = (n.get('props') or {}).get('_attrs') or {}
+    v = a.get('sym_name')
+    return v[1:-1] if v and v.startswith('"') else v
+
+def _children(t):
+    out = {}
+    for r in t['regions']:
+        for b in r:
+            for m in b['ops']:
+                nm = _sym(m)
+                if nm: out.setdefault(nm, m)
+    return out
+
+def units(root):
+    """[(祖先链 [root..父], 单元)]。单元 = 带区域、有 sym_name 的非符号表 op（取最外层）。"""
+    import symtab as SY
+    out = []
+    def rec(n, chain):
+        for r in n['regions']:
+            for b in r:
+                for m in b['ops']:
+                    if _sym(m) and m['regions'] and not SY.is_table(m['op']): out.append((chain + [n], m))
+                    elif m['regions']: rec(m, chain + [n])
+    rec(root, [])
+    return out
+
+def _refpaths(v):
+    if v.startswith('"') and v.endswith('"') and _STR.fullmatch(v): return []
+    out = []
+    for m in _REF.finditer(v):
+        path = [m.group(1).strip('"')] + [x.strip('"') for x in re.findall(r'::@("(?:[^"\\]|\\.)*"|[\w$.\-]+)', m.group(2) or '')]
+        out.append(tuple(path))
+    return out
+
+def _decl_full(d):
+    """被引用符号 d 的声明文本：func.func ⇒ 无体私有声明（不带 arg_attrs：外部函数上的方言参数属性另有约束）；
+    其余 ⇒ 原样整段（要求其中不再引用符号、不含 dense_resource）。"""
+    import irimport as I, symtab as SY
+    a = (d.get('props') or {}).get('_attrs') or {}
+    ft = SY.ftype_of(d)
+    if d['op'] == 'func.func' and ft:
+        return f'"func.func"() ({{}}) {{function_type = {ft}, sym_name = "{_sym(d)}", sym_visibility = "private"}} : () -> ()'
+    for m in _walk(d):
+        for k, v in ((m.get('props') or {}).get('_attrs') or {}).items():
+            if 'dense_resource' in v: return None
+            if k != 'sym_name' and _refpaths(v): return None
+    return '\n'.join(I.emit_generic(d))
+
+def _shell(c, inner):
+    """祖先外壳：属性原样，单区域单块，只含 inner。带操作数/结果/多区域的祖先 ⇒ 无法作外壳。"""
+    if c['ins'] or c['outs'] or len(c['regions']) != 1: return None
+    a = (c.get('props') or {}).get('_attrs') or {}
+    return f'"{c["op"]}"() ({{\n^bb0:\n' + '\n'.join(inner) + '\n})' + ((' {' + ', '.join(f'{k} = {v}' for k, v in a.items()) + '}') if a else '') + ' : () -> ()'
+
+UNRESOLVED = []
+def emit_unit(chain, u):
+    """→ (文本, 单元内节点 id 集) 或 None。符号引用按 MLIR 的最近符号表规则在父表里解析；@a::@b 解析为 a 的外壳内的 b 的声明。"""
+    import irimport as I
+    ids, refs = set(), set()
+    for m in _walk(u):
+        ids.add(m['id'])
+        for k, v in ((m.get('props') or {}).get('_attrs') or {}).items():
+            if 'dense_resource' in v: _why('dense_resource（方言资源表未发射）'); return None
+            if k != 'sym_name': refs.update(_refpaths(v))
+    tab = _children(chain[-1]); me = _sym(u)
+    inner_syms = {_sym(m) for m in _walk(u) if m is not u and _sym(m)}
+    decls, nested = {}, {}
+    for p in sorted(refs):
+        d = tab.get(p[0])
+        if d is None and p[0] in inner_syms: continue        # 目标在单元内部（单元本身是符号表，如被当作单元的 gpu.module）：随单元一起发射
+        if d is None:                                      # 在最近符号表里也不存在：整模块里 MLIR 同样找不到它 ⇒ 原样保留，两边判定一致
+            WHY_NONE['（统计）未解析引用原样保留'] = WHY_NONE.get('（统计）未解析引用原样保留', 0) + 1; continue
+        if d is u:
+            if len(p) > 1: _why('引用单元内部符号'); return None
+            continue
+        if len(p) == 1:
+            if p[0] not in decls:
+                t = _decl_full(d)
+                if t is None: _why(f'{d["op"]} 定义者无法声明'); return None
+                decls[p[0]] = t
+        elif len(p) == 2:
+            d2 = _children(d).get(p[1])
+            if d2 is None: _why('未解析的嵌套符号引用'); return None
+            t = _decl_full(d2)
+            if t is None: _why(f'{d2["op"]} 定义者无法声明'); return None
+            nested.setdefault(p[0], (d, {}))[1][p[1]] = t
+        else: _why('三层以上嵌套符号引用'); return None
+    for nm, (d, inner) in nested.items():
+        if nm in decls: _why('同一符号既整段又作外壳'); return None
+        sh = _shell(d, list(inner.values()))
+        if sh is None: _why(f'{d["op"]} 无法作外壳'); return None
+        decls[nm] = sh
+    text = list(decls.values()) + I.emit_generic(u, '', loc=True)
+    for c in reversed(chain):
+        sh = _shell(c, text)
+        if sh is None: _why(f'祖先 {c["op"]} 无法作外壳'); return None
+        text = [sh]
+    return '\n'.join(text), ids
+
+def check_unit(chain, u, unreg=False):
+    """预言机对一个单元的判定 → None（无结论）| [] | [(节点 id, 消息)]。只认落在单元内的诊断；全落在单元外（被引用符号本身不合法）⇒ 无结论。"""
+    e = emit_unit(chain, u)
+    if e is None: return None
+    text, ids = e
+    st, ds = get().verify(text, unreg)
+    if st == 'ok': return []
+    if st == 'parse': _why('发射文本解析不了'); return None
+    if st == 'crash': return [(u['id'], ds[0][1])]
+    mine = [(n, m) for n, m in ds if n in ids]
+    if not mine: _why('诊断全在单元外'); return None
+    return mine
