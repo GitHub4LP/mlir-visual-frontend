@@ -47,3 +47,4 @@ PYTHONPATH=model python3 model/attrsig_test.py 3     # A0 导入账 / A1 真实�
 - 第 15 轮：结构义务审计（spec/obligations.md，model/obligations_test.py）：R1–R8、S1–S5 在真实 IR 上的触发数与逐义务变异差分（8858 例，误拒 0，漏判 249 全部归因于未导入方言或 C++ declared 义务）。
 - 第 16 轮：预言机按模块上下文发射（spec/modular.md，model/modular_test.py）。复盘：C2 此前一直关着预言机、27% 的真实函数体到不了预言机。修后导入节点逐字发射、被引用符号补私有声明；C2 打开预言机误拒 0；M2 19271 例变异对照整模块 verifier 误拒 0，func.func 体内漏判 0（剩余 298 例全在 transform.named_sequence 等非 func 体）。
 - 第 17 轮：发射单位 = 隔离单元（函数类符号 op 本身 + 祖先外壳 + 被引用符号声明，`core.check_module`）。M3 19271 例变异对照整模块 verifier 误拒 0、漏判 0；这是发射忠实与局部性的证据（L42），不是符号层的精度——符号层自身漏判仍 881。
+- 第 18 轮：先归因后导入——导入 affine/gpu/bufferization/linalg/transform/nvgpu/shard 的 ODS；新层在真实 IR 上先误拒（S5 外推 126 例、shard 属性 6 例），全部修正后 M3 19641 误拒 0，符号层自身漏判 4.57% → 3.55%。环境：`scripts/setup_env.sh`。
