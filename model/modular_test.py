@@ -50,6 +50,8 @@ def judge(h, unreg, oracle):
     C.ORACLE_ON = False
     return out
 
+UNIT = True      # 第 17 轮：M3 = 整模块按隔离单元判定（core.check_module）；False 复现第 16 轮的 M2（只发射 func.func 体）
+
 def main(cap=16):
     print('── M1', m1())
     Z.TYPES = True; rnd = random.Random(16); orc = OR.Oracle()
@@ -64,7 +66,7 @@ def main(cap=16):
             try: g = I.import_module(ir.Module.parse(ch, ctx))
             except Exception: continue
             st['模块'] += 1
-            if judge(g, unreg, True): st['底本误拒'] += 1; note('底本误拒', f'{path}#{k}'); continue
+            if (C.check_module(g, unreg) if UNIT else judge(g, unreg, True)): st['底本误拒'] += 1; note('底本误拒', f'{path}#{k}'); continue
             if orc.verify('\n'.join(I.emit_generic(g)), unreg)[0] != 'ok': continue
             for kind, par, h in Z.mutations(g, rnd, cap):
                 s_, ds = orc.verify('\n'.join(I.emit_generic(h)), unreg)
@@ -73,20 +75,22 @@ def main(cap=16):
                     else: st['变异发射伪影（跳过）'] += 1; note('发射伪影 ' + kind, f"{par}: {ds[0][1][:120] if ds else ''}"); continue
                 rej = s_ != 'ok'; st['变异'] += 1
                 q0 = C.TC_STATS['预言机调用']
-                sym = judge(h, unreg, False); full = sym or judge(h, unreg, True)
+                sym = judge(h, unreg, False)
+                full = sym or (C.check_module(h, unreg) if UNIT else judge(h, unreg, True))
                 key = ('拒' if full else '收') + '/' + ('拒' if rej else '收'); byk[(kind, key)] += 1
                 if full and not rej: st['误拒'] += 1; note('误拒 ' + kind, f'{path}#{k} {par}: {full[0]}'[:220])
-                if rej and not full and not in_func(h, par): st['漏判：不在 func.func 体内（体级预言机不覆盖）'] += 1
+                if rej and not full and not UNIT and not in_func(h, par): st['漏判：不在 func.func 体内（体级预言机不覆盖）'] += 1
                 if rej and not full: st['漏判'] += 1; byk[(kind + ' 漏判父 op', par)] += 1; note('漏判 ' + kind, f"{par}: {' | '.join(x for _, x in ds)[:150]}")
                 if rej and full: st['两者都拒'] += 1
                 if not rej and not full: st['两者都收'] += 1
                 if rej and not sym: st['无预言机漏判'] += 1
                 if rej and not sym and full: st['其中体级预言机抓住'] += 1
-    print('── M2 体级预言机 vs 整模块 verifier', dict(st)); print('   预言机（真值）', orc.stats); print('   发射', dict(sorted(OR.WHY_NONE.items(), key=lambda x: -x[1])[:12]))
+    print('── M3 单元级预言机 vs 整模块 verifier' if UNIT else '── M2 体级预言机 vs 整模块 verifier', dict(st)); print('   单元', dict(C.MOD_STATS)); print('   预言机（真值）', orc.stats); print('   发射', dict(sorted(OR.WHY_NONE.items(), key=lambda x: -x[1])[:12]))
     for kk, v in sorted(byk.items(), key=lambda x: (x[0][0], -x[1])):
         if '漏判父' not in kk[0] or v >= 3: print('     ', kk, v)
     for kk, v in ex.items(): print('──', kk); [print('    ', x) for x in v]
     orc.close()
 
 if __name__ == '__main__':
+    if '--m2' in sys.argv: UNIT = False; sys.argv.remove('--m2')
     main(int(sys.argv[1]) if len(sys.argv) > 1 else 16)
