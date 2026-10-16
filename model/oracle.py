@@ -12,7 +12,8 @@ import sys, json, os
 import mlir.ir as ir
 ctx = ir.Context(); ctx.emit_error_diagnostics = True
 for line in sys.stdin:
-    text = json.loads(line)
+    text, unreg = json.loads(line)
+    ctx.allow_unregistered_dialects = unreg
     diags = []
     def h(d):
         diags.append([str(d.location), str(d.message)]); return True
@@ -38,15 +39,17 @@ class Oracle:
     def _start(s):
         s.p = subprocess.Popen([sys.executable, '-c', _WORKER], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                stderr=subprocess.DEVNULL, text=True, bufsize=1)
-    def verify(s, text):
-        k = hashlib.sha1(text.encode()).hexdigest()
+    def verify(s, text, unreg=False):
+        """unreg：允许未注册方言（第 16 轮）。未注册 op 对 MLIR 不透明——它自身的义务不查（上近似、不误拒），其余已注册 op 照查。
+        只在模块上下文本就允许未注册方言时打开（导入语料：源文件带 --allow-unregistered-dialect；前端：用户自定义而未降级的 op）。"""
+        k = hashlib.sha1((('U' if unreg else '') + text).encode()).hexdigest()
         if k in s.cache: s.stats['缓存命中'] += 1; return s.cache[k]
         s.stats['查询'] += 1; t0 = time.perf_counter()
         if s.p is None or s.p.poll() is not None:
             if s.p is not None: s.stats['重启'] += 1
             s._start()
         try:
-            s.p.stdin.write(json.dumps(text) + '\n'); s.p.stdin.flush()
+            s.p.stdin.write(json.dumps([text, unreg]) + '\n'); s.p.stdin.flush()
             line = s.p.stdout.readline()
         except BrokenPipeError: line = ''
         if not line:                                   # 子进程死了：MLIR 断言崩溃
@@ -70,11 +73,26 @@ def _loc(l):
 KDYN = -9223372036854775808          # ShapedType::kDynamic
 def _why(k): WHY_NONE[k] = WHY_NONE.get(k, 0) + 1
 
-def emit_core(blocks, ftype, name='f'):
+_REF = re.compile(r'@("(?:[^"\\]|\\.)*"|[\w$.\-]+)((?:::@(?:"(?:[^"\\]|\\.)*"|[\w$.\-]+))*)')
+_STR = re.compile(r'"(?:[^"\\]|\\.)*"')
+
+def _refs_in(v):
+    """属性文本里的符号引用（去掉字符串字面量里的 @，再找 @name 与 @a::@b）。字符串里的 @ 不算；无法确定的情况由调用者保守处理。"""
+    if v.startswith('"') and v.endswith('"') and _STR.fullmatch(v): return []          # 纯字符串属性
+    return [(m.group(1).strip('"'), bool(m.group(2))) for m in _REF.finditer(v)]
+
+def emit_core(blocks, ftype, name='f', symbols=None, mod_attrs=None):
+    """core 函数体 → MLIR 模块文本（交预言机）。
+    第 16 轮（modular.md）：
+      · 导入节点（props 带 _attrs）逐字发射（属性原样、类型取当前值类型），不再经 ODS 守卫：MLIR 自己认识的方言（linalg、affine…）都可送检；
+      · 模块级符号上下文：体内引用的符号（func.call 的 callee、memref.get_global 的 name、属性里的任何 @ref）从 symbols（名字 → 定义节点）补成私有声明；
+        解析不了的引用 / 嵌套引用 / dense_resource ⇒ 不发射（否则 MLIR 会以缺符号、缺资源误拒——预言机有拒绝权，发射必须忠实）；
+      · 模块属性（gpu.container_module 等）原样带上。"""
     import odssig as G, typesig as TSg, core as C
     try: blocks = C.inline_all(blocks)                     # 透明复合 op 内联；不透明的留下，在 op() 里被拒发
     except Exception as e: _why('内联失败'); return None
     tys, lines, cnt = {}, [], [0]
+    refs = set()
     def val(v): return '%' + re.sub(r'[^\w]', '_', v)
     def bname(b): return '^' + re.sub(r'[^\w]', '_', b)
     def fresh(): cnt[0] += 1; return f'%_o{cnt[0]}'
@@ -116,19 +134,48 @@ def emit_core(blocks, ftype, name='f'):
         props = ['operandSegmentSizes = array<i32: 1, 1, %d, %d, 0>' % (r, len(dyn)), 'static_offsets = array<i64: %s>' % ', '.join([str(KDYN)] * r),
                  'static_sizes = array<i64: %s>' % ', '.join(sizes), 'static_strides = array<i64: %s>' % ', '.join(['1'] * r)]
         return ins, props
-    def region(bs, ind, top):
+    def region(bs, ind, top, verbatim_blocks=False):
         start = len(lines)
         for k, b in enumerate(bs):
             for v, t in b['args']: tys[v] = t; tys[val(v)] = t
-            if k > 0 or (b['args'] and not top):
+            if k > 0 or (b["args"] and not top) or (verbatim_blocks and not top):   # 导入区域：入口块也写块标签（空块 ⇒ 否则区域变成 0 块）
                 lines.append(f'{ind[:-2]}{bname(b["name"])}(' + ', '.join(f'{val(v)}: {t}' for v, t in b['args']) + '):' if b['args']
                              else f'{ind[:-2]}{bname(b["name"])}:')
             for n in b['ops']: op(n, ind)
         body = lines[start:]; del lines[start:]
         return body
+    def verbatim(n, ind):
+        a = n['props']['_attrs']
+        for k, v in a.items():
+            if 'dense_resource' in v: raise LookupError('dense_resource（方言资源表未发射）')
+            for r, nested in _refs_in(v):
+                if nested: raise LookupError('嵌套符号引用')
+                refs.add(r)
+        for x, t in n['outs']: tys[x] = t; tys[val(x)] = t
+        ins = list(n['ins'])
+        if n['succs'] and not n['props'].get('_succ_opaque'): ins += [x for _, sa in n['succs'] for x in sa]
+        for x in ins: tys[val(x)] = tys[x]
+        regs = []
+        for r in n['regions']:
+            body = region(r, ind + '    ', False, verbatim_blocks=True)
+            regs.append('{\n' + '\n'.join(body) + '\n' + ind + '}')
+        sc = ('[' + ', '.join(bname(b) for b, _ in n['succs']) + ']') if n['succs'] else ''
+        res = ', '.join(val(o) for o, _ in n['outs'])
+        lines.append(f'{ind}' + (res + ' = ' if res else '') + f'"{n["op"]}"(' + ', '.join(val(x) for x in ins) + ')' + sc
+                     + ((' (' + ', '.join(regs) + ')') if regs else '')
+                     + ((' {' + ', '.join(f'{k} = {v}' for k, v in a.items()) + '}') if a else '')
+                     + ' : (' + ', '.join(tys[x] for x in ins) + ') -> (' + ', '.join(t for _, t in n['outs']) + f') loc("{n["id"]}")')
     def op(n, ind):
         o = n['op']
-        if o == 'func.call': raise LookupError('func.call 需要模块级符号')
+        if '_attrs' in (n.get('props') or {}): return verbatim(n, ind)
+        if o == 'func.call':
+            c = (n.get('callee') or '').lstrip('@')
+            if not c or '::' in c: raise LookupError('func.call 缺被调符号')
+            refs.add(c)
+            for x, t in n['outs']: tys[x] = t; tys[val(x)] = t
+            ins = [val(v) for v in n['ins']]
+            for v, x in zip(ins, n['ins']): tys[v] = tys[x]
+            return line(ind, n['outs'], o, ins, [f'callee = @{c}'], [], [], n['id'])
         if o not in ('func.return', 'scf.yield') and G.lookup(o) is None: raise LookupError(f'MLIR 不认识 {o}（不透明复合 op 或未导入方言）')
         for x, t in n['outs']: tys[x] = t; tys[val(x)] = t
         if o in ('tensor.extract_slice', 'tensor.insert_slice'):
@@ -164,8 +211,37 @@ def emit_core(blocks, ftype, name='f'):
     for t in set(tys.values()):
         try: TSg.parse(t)
         except (ValueError, AttributeError): _why('core 的抽象类型'); return None
-    head = f'func.func @{name}(' + ', '.join(f'{val(v)}: {t}' for v, t in args) + ') -> ' + ftype.split('->')[1].strip() + ' {'
-    return head + '\n' + '\n'.join(body) + '\n}'
+    head = f'func.func @{_q(name)}(' + ', '.join(f'{val(v)}: {t}' for v, t in args) + ') -> ' + _res(ftype) + ' {'
+    fn = head + '\n' + '\n'.join(body) + '\n}'
+    decls = []
+    for r in sorted(refs - {name}):
+        d = (symbols or {}).get(r)
+        if d is None: _why('未解析的符号引用（无模块上下文）'); return None
+        dec = _decl(d, r)
+        if dec is None: _why(f'{d["op"]} 定义者无法声明'); return None
+        decls.append(dec)
+    if not decls and not mod_attrs: return fn
+    ma = (' attributes {' + ', '.join(f'{k} = {v}' for k, v in mod_attrs.items()) + '}') if mod_attrs else ''
+    return f'module{ma} {{\n' + '\n'.join(decls + [fn]) + '\n}'
+
+def _q(nm): return nm if re.fullmatch(r'[\w$.]+', nm) else '"' + nm + '"'
+
+def _res(ftype):
+    import structure as ST
+    parts = ST._split_top(ftype, '->')
+    return '->'.join(parts[1:]).strip() if len(parts) >= 2 else '()'
+
+def _decl(d, r):
+    """被引用符号的私有声明：函数类 ⇒ 无体的 private func.func；无区域的定义者（memref.global 等）⇒ 原样（去掉初值以外不改）。"""
+    import symtab as SY
+    a = (d.get('props') or {}).get('_attrs') or {}
+    ft = SY.ftype_of(d)
+    if d['op'] == 'func.func' and ft:                     # func.call 的 verifySymbolUses 要求目标是 func.func
+        return f'"func.func"() ({{}}) {{function_type = {ft}, sym_name = "{r}", sym_visibility = "private"}} : () -> ()'
+    if not d['regions'] and a:
+        if any('dense_resource' in v or _refs_in(v) for k, v in a.items() if k != 'sym_name'): return None
+        return f'"{d["op"]}"() {{' + ', '.join(f'{k} = {v}' for k, v in a.items()) + '} : () -> ()'
+    return None
 
 WHY_NONE = {}
 ORACLE = None

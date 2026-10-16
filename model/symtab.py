@@ -115,3 +115,26 @@ def implicit_terminator(op):
                 ns = (d[O.ops(dia)[op]].get('cppNamespace') or '').strip(':').split('::')[-1]
             return ix.get((ns, cls)) or '?'
     return None
+
+def func_scopes(g):
+    """第 16 轮：每个有体的 func.func → (函数节点, 最近符号表的符号 名字→定义者, 最近 builtin.module 的属性)。
+    预言机按此为函数体补模块级符号上下文（oracle.emit_core 的 symbols / mod_attrs）。"""
+    out = []
+    def rec(n, syms, mattrs):
+        if is_table(n['op']):
+            syms = {}
+            for r in n['regions']:
+                for b in r:
+                    for m in b['ops']:
+                        nm = sym_of(m)
+                        if nm is None and ((m.get('props') or {}).get('_attrs') or {}).get('sym_name'):   # 未导入 ODS 的方言（shard.grid…）：
+                            nm = _unq(m['props']['_attrs']['sym_name'])  # 只用于给预言机补声明，不用于结构层的拒绝（真值在 MLIR）
+                        if nm: syms.setdefault(nm, m)
+        if n['op'] == 'builtin.module':
+            mattrs = dict((n.get('props') or {}).get('_attrs') or {}); mattrs.pop('sym_name', None); mattrs.pop('sym_visibility', None)
+        if n['op'] == 'func.func' and n['regions'] and n['regions'][0]: out.append((n, syms, mattrs))
+        for r in n['regions']:
+            for b in r:
+                for m in b['ops']: rec(m, syms, mattrs)
+    rec(g, {}, {})
+    return out

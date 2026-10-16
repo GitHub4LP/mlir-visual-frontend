@@ -13,7 +13,7 @@
 import os, sys, re, glob, collections, multiprocessing as mp
 
 def run_file(path, q):
-    import mlir.ir as ir, irimport as I, structure as ST, core as C
+    import mlir.ir as ir, irimport as I, structure as ST, core as C, symtab as SY, oracle as OR
     C.ORACLE_ON = False
     st = collections.Counter(); ex = collections.defaultdict(list)
     def note(k, v):
@@ -83,6 +83,7 @@ def run_file(path, q):
         try: mod_sd = list(ST.check(g))
         except Exception as e:
             st['C2 结构层异常'] += 1; note('C2 结构层异常', f'{os.path.basename(path)}#{k}: {type(e).__name__} {str(e)[:100]}'); mod_sd = None
+        scope = {id(f): (sy, ma) for f, sy, ma in SY.func_scopes(g)}       # 第 16 轮：预言机按模块上下文发射
         for f in funcs(g):
             st['C2 函数'] += 1
             ftype = f['props']['_attrs'].get('function_type', '() -> ()')
@@ -91,7 +92,11 @@ def run_file(path, q):
             # 第 14 轮：结构层（含符号义务）对整个模块判定一次；此前把单个函数装进新模块，符号上下文丢失、且 S1–S4 在导入节点上从未触发
             sd = [x for x in mod_sd if x[0] in fids(f)] if mod_sd is not None else None
             try:
-                C.TYPE_WARN.clear(); td = C.typecheck(body, ftype)
+                sy, ma = scope.get(id(f), ({}, {}))
+                # 第 16 轮：C2 打开预言机（此前 C2 一直关着它 ⇒ 有拒绝权的预言机层从未在真实 IR 上被检验过不误拒）；C3 仍关着（不让 MLIR 判自己）
+                C.ORACLE_ON = True
+                C.TYPE_WARN.clear(); td = C.typecheck(body, ftype, sy, SY.sym_of(f) or 'f', ma, unreg)
+                C.ORACLE_ON = False
             except Exception as e:
                 st['C2 符号层异常'] += 1; note('C2 符号层异常', f'{os.path.basename(path)}#{k}: {type(e).__name__} {str(e)[:100]}'); td = None
             if sd: st['C2 结构层误拒'] += 1; note('C2 结构层误拒', f'{os.path.basename(path)}#{k}: {sd[0]}'[:200])
@@ -99,6 +104,11 @@ def run_file(path, q):
             if td:
                 st['C2 自动签名误拒'] += 1; note('C2 自动签名误拒', f'{os.path.basename(path)}#{k}: {td[0]}'[:200])
             if sd == [] and td == []: st['C2 两层都接受'] += 1
+    # 第 16 轮：预言机可达性（防空检验：需要预言机的体有多少真的送到了 MLIR）
+    st['C2 预言机调用'] = C.TC_STATS['预言机调用']
+    st['C2 需预言机但不可发射'] = C.TC_STATS['预言机不可用→人工签名'] + C.TC_STATS['预言机不可用→仅符号层']
+    for k, v in OR.WHY_NONE.items(): st['C2 不可发射：' + k[:40]] += v
+    for d in C.TC_STATS.get('发射缺陷', []): st['C2 发射缺陷（MLIR 解析不了发射文本）'] += 1; note('C2 发射缺陷', f'{os.path.basename(path)}: {d}')
     q.put((dict(st), dict(ex)))
 
 def fids(f):

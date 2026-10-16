@@ -45,3 +45,4 @@ PYTHONPATH=model python3 model/attrsig_test.py 3     # A0 导入账 / A1 真实�
 属性值由 MLIR 属性解析器承载，属性参数与约束从 ODS 导入（model/attrsig.py）；core 参数 → MLIR 属性只有一个翻译函数 attrsig.from_core。见 spec/attributes.md。
 
 - 第 15 轮：结构义务审计（spec/obligations.md，model/obligations_test.py）：R1–R8、S1–S5 在真实 IR 上的触发数与逐义务变异差分（8858 例，误拒 0，漏判 249 全部归因于未导入方言或 C++ declared 义务）。
+- 第 16 轮：预言机按模块上下文发射（spec/modular.md，model/modular_test.py）。复盘：C2 此前一直关着预言机、27% 的真实函数体到不了预言机。修后导入节点逐字发射、被引用符号补私有声明；C2 打开预言机误拒 0；M2 19271 例变异对照整模块 verifier 误拒 0，func.func 体内漏判 0（剩余 298 例全在 transform.named_sequence 等非 func 体）。

@@ -16,7 +16,7 @@
 | 7 | IsolatedFromAbove、捕获 | R6、结构摘要 captures | E | ✓ | L3、extract |
 | 8 | Symbol、SymbolTable、可见性、嵌套引用、SymbolUserOpInterface 使用义务 | S1–S4（symtab.py：定义者/表/使用者取自 ODS 接口闭包） | E | ✓ | L4（X6）；第 14 轮修正：此前的 ✓ 只有自测，真实 IR 上从未触发（symbols.md §1）。现 Y1 整模块 2108 误拒 0、Y2 变异 6089/6089（L36a/b）；嵌套引用的接受方向无外部真值 |
 | 9 | Location、诊断回映 | 节点 id → loc | E | ◐ | 规范 §3；没有和 MLIR 诊断联测 |
-| 10 | 未注册 op 与方言 | 结构保守（R2 拒绝）、值层 Unknown | S | ◐ | 策略已定，规范需写明 |
+| 10 | 未注册 op 与方言 | 结构保守（R2 拒绝）、值层 Unknown | S | ◐ | 第 16 轮：预言机在模块允许时以 allow_unregistered 送检（未注册 op 自身义务不查，上近似）；规范见 modular.md §2 |
 
 ## B 类型与属性
 | # | 机制 | 元模型落点 | 强度 | 状态 | 证据或缺口 |
@@ -91,7 +91,8 @@
 ## 小结
 共 52 项：✓ 17，◐ 26，✗ 8，— 1（2026-10-15，第 13 轮属性层之后）。
 - 剩下的 ✗：递归、方言组织（命名空间、版本、IRDL、方言扩展、bytecode）、transform dialect、数据流分析框架、WASM。
-- 当前最大的缺口：(1) 预言机按模块发射（func.call 仍不可发射到预言机；符号义务已在结构层，symbols.md）；(2) core 节点内部改用 ODS 属性名作参数（attributes.md §8）；(3) 方言资源表；(4) trait/interface 作为查询的导入与审计。
+- 第 16 轮（modular.md）：预言机按模块上下文发射——导入节点逐字发射、被引用符号补私有声明、模块属性与未注册方言随上下文；C2 首次打开预言机仍误拒 0（2982 次调用，不可送达 4）；M2 19271 例变异与整模块 verifier 误拒 0，func.func 体内漏判 0。
+- 当前最大的缺口：(1) 非 func.func 函数体（transform.named_sequence 等）的发射单位，以及方言属性 verifier（arg_attrs）；(2) core 节点内部改用 ODS 属性名作参数（attributes.md §8）；(3) 方言资源表；(4) trait/interface 作为查询的导入与审计。
 
 
 ## 第 12 轮
