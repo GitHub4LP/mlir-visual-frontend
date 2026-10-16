@@ -49,3 +49,4 @@ PYTHONPATH=model python3 model/attrsig_test.py 3     # A0 导入账 / A1 真实�
 - 第 17 轮：发射单位 = 隔离单元（函数类符号 op 本身 + 祖先外壳 + 被引用符号声明，`core.check_module`）。M3 19271 例变异对照整模块 verifier 误拒 0、漏判 0；这是发射忠实与局部性的证据（L42），不是符号层的精度——符号层自身漏判仍 881。
 - 第 18 轮：先归因后导入——导入 affine/gpu/bufferization/linalg/transform/nvgpu/shard 的 ODS；新层在真实 IR 上先误拒（S5 外推 126 例、shard 属性 6 例），全部修正后 M3 19641 误拒 0，符号层自身漏判 4.57% → 3.55%。环境：`scripts/setup_env.sh`。
 - 第 19 轮：TypeDef 类型原子（封闭、精确）与接口原子（开放世界，L43 只能正向接受）；用同一提交的 mlir-linalg-ods-yaml-gen 生成 linalg 命名 op 的 .td（linalg 25 → 99 op）；修 attrsig 静默异常。M3 误拒 0 漏判 0，符号层自身漏判 3.55% → 2.95%，Z2 漏判 228 → 120；残差全在 ODS 之外（L44）。
+- 第 20 轮：增量重验 L45——单元判定的缓存键 = 子树 + 外壳 + 被引用声明；失效集在编辑点局部可算。12958 次真实 IR 编辑：失效预测违例 0、增量 ≡ 全量；拆掉符号层后 104/144 次拒绝只有依赖单元能抓住。测试 `model/incr_test.py`。
