@@ -70,6 +70,13 @@ def _iface(d, trait):
             if not r.get('!anonymous') and r.get('trait'): idx[r['trait']] = r
     return idx.get(trait)
 
+def _tp(dialect, b, S):
+    """端口类型谓词。第 18 轮：含未登记原子（方言自有类型，如 !gpu.async.token、!transform.any_op）的约束 ⇒ 记入 unknown，谓词取 ⊤（上近似：
+    不能因此拒绝；L29 要求的方向）。此前该处直接抛出，导致整个方言导入失败。"""
+    try: return O.type_pred(dialect, b, O.ATOM, O.XFORM)
+    except O.Unknown as e:
+        S['unknown'].append(f'端口类型原子: {str(e.args[0])[:70]}'); return lambda t: True
+
 @functools.lru_cache(None)
 def sig(dialect, opname):
     d = O.records(dialect); r = d[O.ops(dialect)[opname]]
@@ -79,13 +86,13 @@ def sig(dialect, opname):
     for c, nm in O.dag_args(r['arguments']):
         c = unwrap(c); sc = d[c]['!superclasses'] if c in d else []
         if 'TypeConstraint' in sc:
-            b, m = _base(d, c); S['ins'].append((nm, O.type_pred(dialect, b, O.ATOM, O.XFORM), m, b))
+            b, m = _base(d, c); S['ins'].append((nm, _tp(dialect, b, S), m, b))
         else:
             req = not (any(k in sc for k in ('OptionalAttr', 'DefaultValuedAttr', 'DefaultValuedOptionalAttr', 'UnitAttr', 'UnitProp'))
                        or c in ('UnitAttr', 'UnitProp') or d.get(c, {}).get('isOptional') == 1)       # UnitAttr 缺省即 false
             S['attrs'].append((nm, c, sc[-1] if sc else '?', req))
     for c, nm in O.dag_args(r['results']):
-        b, m = _base(d, unwrap(c)); S['outs'].append((nm, O.type_pred(dialect, b, O.ATOM, O.XFORM), m, b))
+        b, m = _base(d, unwrap(c)); S['outs'].append((nm, _tp(dialect, b, S), m, b))
     if r['hasVerifier']: S['declared'].append('C++ verify()')
     if r['hasRegionVerifier']: S['declared'].append('C++ verifyRegions()')
     infer_iface = False

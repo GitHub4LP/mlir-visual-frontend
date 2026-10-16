@@ -14,7 +14,7 @@
 """
 import sys, re, glob, collections, random
 import mlir.ir as ir
-import irimport as I, structure as ST, symtab as SY, oracle as OR, core as C, obligations_test as Z
+import irimport as I, structure as ST, symtab as SY, oracle as OR, core as C, obligations_test as Z, odssig as G, odsjson as O
 
 def m1():
     node, blk = ST.node, ST.blk
@@ -33,7 +33,7 @@ def m1():
     out['自递归不需声明'] = OR.get().verify(OR.emit_core(rec, '(i32) -> i32', 'f'))[0] == 'ok'
     return out
 
-SYNTAX = r'(use of undeclared SSA value|definition of SSA value|expected |custom op|redefinition of|undefined symbol alias|use of value .* expects different type)'
+SYNTAX = r"(use of undeclared SSA value|definition of SSA value|expected (?!'[\w.]+' as terminator)|custom op|redefinition of|undefined symbol alias|use of value .* expects different type)"   # 第 18 轮：隐式终结子的解析期校验是真拒绝，不是发射伪影
 
 def in_func(h, par):
     """变异点（父 op 名）是否出现在某个 func.func 体内——体级预言机只发射 func.func 体。"""
@@ -50,6 +50,7 @@ def judge(h, unreg, oracle):
     C.ORACLE_ON = False
     return out
 
+MISS = collections.Counter()
 UNIT = True      # 第 17 轮：M3 = 整模块按隔离单元判定（core.check_module）；False 复现第 16 轮的 M2（只发射 func.func 体）
 
 def main(cap=16):
@@ -85,10 +86,20 @@ def main(cap=16):
                 if not rej and not full: st['两者都收'] += 1
                 if rej and not sym: st['无预言机漏判'] += 1
                 if rej and not sym and full: st['其中体级预言机抓住'] += 1
+                if rej and not sym and full:                 # 第 18 轮：符号层自身漏判按“预言机诊断落在的 op”及其导入账归因
+                    nid = full[0][1][0] if full[0][0] == 'oracle' else None
+                    op = next((m['op'] for m in OR._walk(h) if m['id'] == nid), '?')
+                    lk = G.lookup(op) if op != '?' else None
+                    MISS[(op, lk[0] if lk else ('未导入方言' if op.split('.')[0] not in O.DIALECTS else '未知 op'))] += 1
+                    if lk and lk[0] == 'auto': note('符号层漏判落在 auto op', f"{kind} {par} → {op}: {full[0][1][1][:160]}")
     print('── M3 单元级预言机 vs 整模块 verifier' if UNIT else '── M2 体级预言机 vs 整模块 verifier', dict(st)); print('   单元', dict(C.MOD_STATS)); print('   预言机（真值）', orc.stats); print('   发射', dict(sorted(OR.WHY_NONE.items(), key=lambda x: -x[1])[:12]))
     for kk, v in sorted(byk.items(), key=lambda x: (x[0][0], -x[1])):
         if '漏判父' not in kk[0] or v >= 3: print('     ', kk, v)
     for kk, v in ex.items(): print('──', kk); [print('    ', x) for x in v]
+    print('── 符号层自身漏判归因（op, 导入账）'); [print('     ', kk, v) for kk, v in MISS.most_common(40)]
+    agg = collections.Counter()
+    for (op, c), v in MISS.items(): agg[c] += v
+    print('   按导入账', dict(agg))
     orc.close()
 
 if __name__ == '__main__':

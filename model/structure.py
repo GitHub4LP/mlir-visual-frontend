@@ -186,7 +186,7 @@ def _symbols(root, d):
             for b in r:
                 for n in b['ops']:
                     nm = SY.sym_of(n)
-                    if nm and SY._has(n['op'], 'FunctionOpInterface'):
+                    if nm and SY.decl_is_external(n['op']):
                         CHECKED['S5'] += 1
                         if not (n['regions'] and n['regions'][0]) and SY.vis_of(n) == 'public':
                             d.add(n['id'], 'S5', f"@{nm} 是声明（无函数体），不能是 public")
