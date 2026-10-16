@@ -37,6 +37,16 @@ def interfaces(op):
     for t in d[O.ops(dia)[op]].get('traits', []): add(O.ref(t))
     return frozenset(out)
 
+@functools.lru_cache(None)
+def decl_is_external(op):
+    """SymbolOpInterface::verify 只在 isDeclaration() && isPublic() 时报错；isDeclaration 缺省返回 false。
+    第 18 轮：S5 只对 ODS extraClassDeclaration 里写明 `bool isDeclaration() { return isExternal(); }` 的 op 成立（func.func）；
+    transform.named_sequence、gpu.func 等没有覆写 ⇒ 外部 public 合法（M3 误拒 126 例的来源）。其它覆写形式不解释 ⇒ 不拒。"""
+    dia = op.split('.')[0]
+    if dia not in O.DIALECTS or op not in O.ops(dia): return False
+    x = O.records(dia)[O.ops(dia)[op]].get('extraClassDeclaration') or ''
+    return bool(re.search(r'bool\s+isDeclaration\(\)\s*\{\s*return\s+isExternal\(\);\s*\}', x))
+
 def _has(op, k):
     s = interfaces(op)
     return None if s is None else any(k == x or x.endswith('::' + k) for x in s)
