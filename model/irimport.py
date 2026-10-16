@@ -67,7 +67,7 @@ def import_module(m):
     return import_op(m.operation, st, bnames)
 
 # ── core 图（导入得到的）→ MLIR 通用形式。属性原样回发；值名、块名照用。
-def emit_generic(n, ind=''):
+def emit_generic(n, ind='', loc=False):
     out = []
     a = n['props'].get('_attrs', {})
     ins = list(n['ins']); tys = list(n['props'].get('_types', []))
@@ -81,7 +81,7 @@ def emit_generic(n, ind=''):
         lines = []
         for b in r:
             lines.append(f'{ind}^{b["name"]}(' + ', '.join(f'{v}: {t}' for v, t in b['args']) + '):')
-            for m in b['ops']: lines += emit_generic(m, ind + '  ')
+            for m in b['ops']: lines += emit_generic(m, ind + '  ', loc)
         regs.append('{\n' + '\n'.join(lines) + f'\n{ind}}}')
     groups = []                                           # %x#0, %x#1 → %x:2（MLIR 的多结果组名）
     for v, _ in n['outs']:
@@ -92,7 +92,7 @@ def emit_generic(n, ind=''):
     out.append(ind + (res + ' = ' if res else '') + f'"{n["op"]}"(' + ', '.join(ins) + ')' + succ
                + ((' (' + ', '.join(regs) + ')') if regs else '')
                + ((' {' + ', '.join(f'{k} = {v}' for k, v in a.items()) + '}') if a else '')
-               + ' : (' + ', '.join(tys) + ') -> (' + ', '.join(t for _, t in n['outs']) + ')')
+               + ' : (' + ', '.join(tys) + ') -> (' + ', '.join(t for _, t in n['outs']) + ')' + (f' loc("{n["id"]}")' if loc else ''))
     return out
 
 def split_chunks(text):
