@@ -14,12 +14,13 @@ SITE = os.path.expanduser('~/.local/lib/python3.12/site-packages/mlir/_mlir_libs
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TOOLS = glob.glob(f'{_ROOT}/tools/mlir_native_tools-*.data/data/bin') + glob.glob('/tmp/nt/mlir_native_tools-*.data/data/bin')   # scripts/fetch_tools.sh
 CACHE = '/tmp/odsjson'
+GEN = f'{_ROOT}/tools/gen'      # 构建期生成的 .td（scripts/fetch_tools.sh：linalg 命名 op 的 yamlgen.td）
 DIALECTS = {'arith': 'Arith/IR/ArithOps', 'math': 'Math/IR/MathOps', 'index': 'Index/IR/IndexOps', 'complex': 'Complex/IR/ComplexOps',
             'tensor': 'Tensor/IR/TensorOps', 'memref': 'MemRef/IR/MemRefOps', 'scf': 'SCF/IR/SCFOps', 'func': 'Func/IR/FuncOps',
             'cf': 'ControlFlow/IR/ControlFlowOps', 'vector': 'Vector/IR/VectorOps', 'shape': 'Shape/IR/ShapeOps', 'ub': 'UB/IR/UBOps',
             # 第 18 轮：按“符号层自身漏判”的归因导入（modular.md §7）。一个方言可由多个 .td 组成（transform 的扩展 op 分散在各方言的 TransformOps 里）。
             'affine': 'Affine/IR/AffineOps', 'gpu': 'GPU/IR/GPUOps', 'bufferization': 'Bufferization/IR/BufferizationOps',
-            'linalg': ['Linalg/IR/LinalgOps', 'Linalg/IR/LinalgRelayoutOps'],    # LinalgStructuredOps.td 包含构建期生成的 yamlgen.td，wheel 不带 ⇒ 命名结构化 op（fill/matmul/transpose…）未导入，见 modular.md §7
+            'linalg': ['Linalg/IR/LinalgOps', 'Linalg/IR/LinalgRelayoutOps'] + (['Linalg/IR/LinalgStructuredOps'] if os.path.isdir(f'{_ROOT}/tools/gen') else []),   # 第 19 轮：StructuredOps 含构建期生成的 yamlgen.td（tools/gen）
             'transform': ['Transform/IR/TransformOps', 'Linalg/TransformOps/LinalgTransformOps', 'SCF/TransformOps/SCFTransformOps', 'Func/TransformOps/FuncTransformOps'],
             'nvgpu': 'NVGPU/IR/NVGPUOps', 'shard': 'Shard/IR/ShardOps'}
 
@@ -31,7 +32,7 @@ def records(dialect):
     for td in tds:
         out = f'{CACHE}/{td.replace("/", "_")}.json'
         if not os.path.exists(out):
-            subprocess.run([TOOLS[0] + '/llvm-tblgen', '-dump-json', '-I', SITE, f'{SITE}/mlir/Dialect/{td}.td', '-o', out], check=True)
+            subprocess.run([TOOLS[0] + '/llvm-tblgen', '-dump-json', '-I', SITE] + (['-I', GEN] if os.path.isdir(GEN) else []) + [f'{SITE}/mlir/Dialect/{td}.td', '-o', out], check=True)
         txt = open(out).read()
         if merged is not None: txt = re.sub(r'anonymous_(\d+)', lambda m: f'anonymous_f{len(seen)}_{m.group(1)}', txt)   # 匿名记录编号是每次 tblgen 运行各自的 ⇒ 跨文件会撞名
         seen.append(td); d = json.loads(txt)
@@ -145,6 +146,32 @@ ATOM_RE = [   # (正则, 由匹配组生成谓词)；作用于规范化（去空
      lambda op, n: lambda t: ranked(t) and {'==': len(t[1]) == int(n), '>=': len(t[1]) >= int(n), '>': len(t[1]) > int(n)}[op]),
     (r'\(::llvm::cast<::mlir::MemRefType>\(\$_self\)\.isStrided\(\)\)', lambda: lambda t: True),       # 类型池的 memref 都是恒等布局
 ]
+@functools.lru_cache(None)
+def typedefs():
+    """第 19 轮：(C++ 命名空间, 类名) → 方言类型名（'transform.op'），取自全部已导入方言的 TypeDef 记录。
+    只覆盖 ODS 定义的类型；C++ 手写的类型（gpu.async.token、gpu.mma_matrix…）在 ODS 里没有拼写 ⇒ 留作 unknown。"""
+    out = {}
+    for dia in DIALECTS:
+        R = records(dia)
+        for r in R.values():
+            if isinstance(r, dict) and 'TypeDef' in r.get('!superclasses', []) and r.get('cppClassName') and r.get('typeName') and ref(r.get('dialect')):
+                ns = R[ref(r['dialect'])].get('cppNamespace')
+                if ns: out[(norm(ns).lstrip(':'), r['cppClassName'])] = r['typeName']
+    return out
+
+def _typedef_isa(ns, cls):
+    """isa<::mlir::ns::Cls>：类型类是封闭的（一个类型恰属一个 C++ 类）⇒ 精确。项是 ('opaque', 文本)，文本取自 MLIR 的打印。"""
+    nm = typedefs().get(('mlir::' + ns, cls))
+    if nm is None: return None
+    dia, _, mn = nm.partition('.')
+    def f(t):
+        if t[0] != 'opaque': return False
+        x = t[1].strip()
+        return x == '!' + nm or x.startswith('!' + nm + '<') or x == f'!{dia}<{mn}>' or x.startswith(f'!{dia}<{mn}<')
+    return f
+
+ATOM_RE.append((r'\((?:::)?llvm::isa<::mlir::(\w+)::(\w+)>\(\$_self\)\)', _typedef_isa))
+
 XFORM = {norm('::llvm::cast<::mlir::ShapedType>($_self).getElementType()'): lambda t: t[2] if shaped(t) else None,
          norm('::llvm::cast<::mlir::ComplexType>($_self).getElementType()'): lambda t: t[1] if t[0] == 'complex' else None}
 def _scal(t): return len(t) > 3 and any(dict(t[3][1]).get('scalable', ()))
