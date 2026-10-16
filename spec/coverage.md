@@ -95,6 +95,7 @@
 - 第 17 轮（modular.md §6）：发射单位 = 隔离单元（单元 + 祖先外壳 + 被引用符号声明）；core.check_module；M3 19271 例对照整模块 verifier 误拒 0、漏判 0（不开预言机漏判 881）；L42 单元局部性。
 - 第 18 轮（modular.md §7）：按归因导入 7 个方言（共 19）；修 S5 外推（isDeclaration 从 .td 判定）等 6 处导入缺陷；M3 19641 误拒 0 漏判 0，符号层自身漏判 4.57% → 3.55%。
 - 第 19 轮（modular.md §8）：类型原子封闭/开放之分（L43）；linalg 命名 op 由构建期生成 .td 导入；残差来源定性（L44：C++ verify、开放接口、逐 op 区域分支边，只能由预言机裁决）。
+- 第 20 轮（modular.md §9）：增量重验（L45），edit.md L21 指纹在预言机层的对应。
 - 当前最大的缺口：(0) 方言类型原子与 RegionBranchOpInterface 区域分支类型义务（见 modular.md §7 批判）；(1) 方言属性 verifier 只在预言机里；符号层自身的漏判 881 仍须靠导入（linalg/affine/transform ODS）缩小；(2) core 节点内部改用 ODS 属性名作参数（attributes.md §8）；(3) 方言资源表；(4) trait/interface 作为查询的导入与审计。
 
 

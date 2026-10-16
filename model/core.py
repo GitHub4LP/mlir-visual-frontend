@@ -706,23 +706,29 @@ if __name__ == '__main__':
 import collections as _collections
 MOD_STATS = _collections.Counter()
 
+def check_unit(chain, u, unreg=False, oracle=True):
+    """一个隔离单元的判定：类型层（自动签名、属性层）先判，过了再交预言机。→ [('type'|'oracle', …)]。
+    第 20 轮：从 check_module 拆出，作为增量重验（L45）的单位——它的结果只依赖 emit_unit 的输入。"""
+    import oracle as OR
+    global ORACLE_ON
+    MOD_STATS['单元'] += 1
+    sym = []
+    if u['regions'] and u['regions'][0]:
+        keep, ORACLE_ON = ORACLE_ON, False
+        try: sym = typecheck(u['regions'][0], ((u.get('props') or {}).get('_attrs') or {}).get('function_type'))
+        except Exception: MOD_STATS['类型层异常'] += 1
+        finally: ORACLE_ON = keep
+    if sym: MOD_STATS['类型层拒'] += 1; return [('type', x) for x in sym]
+    if not oracle: return []
+    r = OR.check_unit(chain, u, unreg)
+    if r is None: MOD_STATS['预言机无结论'] += 1; return []
+    MOD_STATS['预言机判定'] += 1
+    if r: MOD_STATS['预言机拒'] += 1
+    return [('oracle', x) for x in r]
+
 def check_module(g, unreg=False, oracle=True):
     import structure as ST, oracle as OR
     out = [('struct',) + tuple(x) for x in ST.check(g)]
     if out: return out
-    global ORACLE_ON
-    for chain, u in OR.units(g):
-        MOD_STATS['单元'] += 1
-        sym = []
-        if u['regions'] and u['regions'][0]:
-            keep, ORACLE_ON = ORACLE_ON, False
-            try: sym = typecheck(u['regions'][0], ((u.get('props') or {}).get('_attrs') or {}).get('function_type'))
-            except Exception: MOD_STATS['类型层异常'] += 1
-            finally: ORACLE_ON = keep
-        if sym: out += [('type', x) for x in sym]; MOD_STATS['类型层拒'] += 1; continue
-        if not oracle: continue
-        r = OR.check_unit(chain, u, unreg)
-        if r is None: MOD_STATS['预言机无结论'] += 1; continue
-        MOD_STATS['预言机判定'] += 1
-        if r: MOD_STATS['预言机拒'] += 1; out += [('oracle', x) for x in r]
+    for chain, u in OR.units(g): out += check_unit(chain, u, unreg, oracle)
     return out
