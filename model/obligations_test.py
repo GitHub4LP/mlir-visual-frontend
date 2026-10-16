@@ -99,8 +99,16 @@ def mutations(g, rnd, cap):
                             if o['ins']: o['ins'][0] = v; return
             return False
         M(f, 'R6 区域内的值越出作用域', n['op'])
+    if TYPES:                                     # 第 16 轮（modular_test）：函数体内 op 的结果类型改变——义务落在各 op 自己的 verifier 上
+        for n, par in walk(g):
+            if par is None or par['op'] == 'builtin.module' or not n['outs']: continue
+            t0 = n['outs'][0][1]; alt = next(t for t in ('i32', 'f32', 'index', 'i1') if t != t0)
+            def f(h, ix, n=n, alt=alt): o = ix[n['id']]['outs']; o[0] = (o[0][0], alt)
+            M(f, 'T1 结果类型改变', n['op'])
     rnd.shuffle(out)
     return out[:cap]
+
+TYPES = False
 
 def full(h):
     """前端的完整无预言机判定：结构 + 符号（整模块）+ 每个函数体的类型层（自动签名、属性层；预言机关闭）。"""
