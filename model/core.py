@@ -459,7 +459,7 @@ TYPE_WARN = []         # 人工签名的提示：未经证实，不作拒绝（�
 ORACLE_ON = True       # 预言机层开关（oracle.py）；关掉后只剩符号层
 TC_STATS = {'节点': 0, '自动签名': 0, '无法绑定': 0, '需预言机的体': 0, '预言机调用': 0, '预言机不可用→人工签名': 0, '预言机不可用→仅符号层': 0,
             '人工签名误拒（预言机接受）': 0, '人工签名误收（预言机拒绝）': 0}
-def typecheck(blocks, ftype=None):
+def typecheck(blocks, ftype=None, symbols=None, name='f', mod_attrs=None, unreg=False):
     """类型层的判定次序（第 10 轮，import.md §6、oracle.md）：
       1 自动签名（odssig.py，tblgen 导入）。它对一切 op 是上近似（L29），对 auto 账目精确（L28）⇒ 它的拒绝是终判，auto op 不再问别人。
       2 体内有 declared/unknown 的 op，或端口组无法绑定 ⇒ 整个体交给预言机（oracle.py，同一提交的 MLIR verifier）。预言机是终判。
@@ -493,10 +493,11 @@ def typecheck(blocks, ftype=None):
                     flat = n['ins'] + [v for _, sa in n.get('succs', []) for v in sa] if not n.get('props', {}).get('_succ_opaque') else n['ins']
                     ins = [TSg.parse(tys[v]) for v in flat]; outs_ = [TSg.parse(t) for _, t in n['outs']]
                 except (KeyError, ValueError, AttributeError):
-                    if lk is not None: need.append(n['id'])
+                    if lk is not None or '_attrs' in (n.get('props') or {}): need.append(n['id'])
                     continue
                 if lk is None:
                     if n['op'] in sigs: hand.extend(hand_check(n, ins, outs_)); need.append(n['id'])
+                    elif '_attrs' in (n.get('props') or {}): need.append(n['id'])     # 第 16 轮：导入的、我们未导入其 ODS 的 op（linalg、affine…）⇒ 预言机
                     continue                                                             # 复合 op：由其 Schema 负责
                 cls, S = lk; TC_STATS['自动签名'] += 1
                 seg = n.get('seg')
@@ -512,10 +513,10 @@ def typecheck(blocks, ftype=None):
     walk(blocks)
     if out or not need: return out
     import oracle as OR
-    text = OR.emit_core(blocks, ftype or _ftype_of(blocks, tys)) if ORACLE_ON else None
+    text = OR.emit_core(blocks, ftype or _ftype_of(blocks, tys), name, symbols, mod_attrs) if ORACLE_ON else None
     if text is not None:
         TC_STATS['需预言机的体'] += 1; TC_STATS['预言机调用'] += 1
-        st, diags = OR.get().verify(text)
+        st, diags = OR.get().verify(text, unreg)
         if st == 'parse': TC_STATS.setdefault('发射缺陷', []).append(diags[0][1][:80]); text = None
         else:
             res = [(nid or need[0], f'oracle/{st}: {m}') for nid, m in diags] if st != 'ok' else []
