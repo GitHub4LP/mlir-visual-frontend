@@ -92,7 +92,8 @@
 共 52 项：✓ 17，◐ 26，✗ 8，— 1（2026-10-15，第 13 轮属性层之后）。
 - 剩下的 ✗：递归、方言组织（命名空间、版本、IRDL、方言扩展、bytecode）、transform dialect、数据流分析框架、WASM。
 - 第 16 轮（modular.md）：预言机按模块上下文发射——导入节点逐字发射、被引用符号补私有声明、模块属性与未注册方言随上下文；C2 首次打开预言机仍误拒 0（2982 次调用，不可送达 4）；M2 19271 例变异与整模块 verifier 误拒 0，func.func 体内漏判 0。
-- 当前最大的缺口：(1) 非 func.func 函数体（transform.named_sequence 等）的发射单位，以及方言属性 verifier（arg_attrs）；(2) core 节点内部改用 ODS 属性名作参数（attributes.md §8）；(3) 方言资源表；(4) trait/interface 作为查询的导入与审计。
+- 第 17 轮（modular.md §6）：发射单位 = 隔离单元（单元 + 祖先外壳 + 被引用符号声明）；core.check_module；M3 19271 例对照整模块 verifier 误拒 0、漏判 0（不开预言机漏判 881）；L42 单元局部性。
+- 当前最大的缺口：(1) 方言属性 verifier 只在预言机里；符号层自身的漏判 881 仍须靠导入（linalg/affine/transform ODS）缩小；(2) core 节点内部改用 ODS 属性名作参数（attributes.md §8）；(3) 方言资源表；(4) trait/interface 作为查询的导入与审计。
 
 
 ## 第 12 轮
