@@ -75,3 +75,23 @@
 **批判**：M3 的“漏判 0”是 MLIR 判 MLIR，度量的是**发射的忠实与局部性**（单元 + 外壳 + 声明 ≡ 整模块），不是我们对义务的理解；我们自己理解的部分仍是“无预言机漏判 881/19271”，其归因见 obligations.md（未导入方言、C++ declared）。局部性的用处在前端：编辑一个单元只需重验该单元（缓存键 = 单元文本 + 声明），其余单元的判定不变——这是 L42 要求的前提。
 
 - **L42（单元局部性）**：在 M3 的分布上，整模块 verifier 的判定 = 结构+符号层整模块判定 ∧ 各单元（单元 + 祖先外壳 + 被引用符号声明）的判定。因此单元外的编辑只经由被引用符号的**声明**（func 的类型、无区域定义者的属性）影响本单元：声明不变 ⇒ 本单元判定不变。
+
+## 7. 第 18 轮：按归因导入方言（odsjson.DIALECTS 12 → 19）
+
+先归因再动手：M3 中“不开预言机的漏判”881 例，按预言机诊断落在的 op 及其导入账分：未导入方言 725、declared 154、unknown 2。据此导入 affine、gpu、bufferization、linalg（LinalgOps + RelayoutOps）、transform（核心 + Linalg/SCF/Func 的 TransformOps）、nvgpu、shard 的 ODS（同一提交的 .td）。
+
+导入暴露的缺陷（**每一项都是 L33 的再现：新获得拒绝权的层先在真实 IR 上误拒**）：
+1. 端口类型含方言自有类型原子（`!gpu.async.token`、`!transform.any_op`…）时 odssig 直接抛出，整个方言导入失败 ⇒ 改为记入 unknown、谓词取 ⊤（上近似，L29 方向）。
+2. 一个方言跨多个 .td：tblgen 的匿名记录编号每次运行各自从头数 ⇒ 合并时撞名，取到别的文件的约束 ⇒ 后续文件的匿名名加前缀。
+3. 属性层 isa 假设方言属性打印成 `#dia<mn …>` 或 `#dia<mn>`；shard 是 `#shard<axisarray[[0]]>` ⇒ 合法模块误拒 6 ⇒ 助记符按最长标识符取。
+4. **S5（声明不可 public）原来对所有 FunctionOpInterface 成立**：MLIR 的 SymbolOpInterface::verify 只在 `isDeclaration() && isPublic()` 时报错，而 isDeclaration 缺省返回 false；只有 ODS extraClassDeclaration 写明 `return isExternal();` 的 op（func.func、shape.func）才有此约束 ⇒ transform.named_sequence 外部 public 合法，M3 误拒 126、Z2 误拒 87 ⇒ S5 改由 `symtab.decl_is_external` 从 .td 判定。这是一条从 func.func 外推出的手写规则——第 12 轮以来的同一类错误。
+5. 属性谓词树里出现非 def 引用的子项 ⇒ attrsig 崩溃 ⇒ 进导入账（pred-ref）。
+6. M3 的发射伪影正则把 `expected 'transform.yield' as terminator`（隐式终结子的解析期校验）当成伪影跳过；它是真拒绝 ⇒ 改正。
+
+结果（MLIR 9bae84b0 语料）：
+- 新方言导入账：affine 14（declared 14）、gpu 66（auto 20 / declared 10 / unknown 36）、bufferization 7、linalg 8、transform 111（auto 15 / declared 2 / unknown 94）、nvgpu 24（unknown 24）、shard 22（auto 12）。linalg 的命名结构化 op（fill、matmul、transpose、generic…）定义在构建期生成的 `LinalgNamedStructuredOps.yamlgen.td`，wheel 不带 ⇒ 仍是“未知 op”。
+- 合法模块：2112 模块 3707 单元误拒 0；C2 3487/误拒 0；Y1 误拒 0、Y2 6040；A1 14905 实例误拒 0、A2 24701 变异误拒 0（ODS 属性层漏判 375，新方言的属性原子未登记）；O1/O5 一致；Z2 9049 变异误拒 0、漏判 228（原 249）。
+- **M3**：19641 变异（变异集随导入的 ODS 变化），误拒 0、漏判 0；**不开预言机的漏判 698（3.55%），原 881（4.57%）**。剩余归因：declared 268、unknown 256、未知 op 161、auto 10、未导入 3。
+- auto 10 例不反驳 L28：诊断都是“block with no terminator”，MLIR 把它落在块里最后一个 op（arith.addf、math.exp）上，实际义务属于父 op（linalg 命名 op 的区域，未导入）。归因按诊断位置是近似的。
+
+批判：导入把 725 例中的一部分从“未导入”挪到了 unknown/declared，**真正被符号层自己抓住的只有 183 例**。transform 方言 94/111 是 unknown（端口类型全是方言类型），即导入给了结构与属性信息，但类型义务几乎全部仍在预言机。下一步缩小漏判的杠杆不在“再导入方言”，而在：(a) 方言类型原子（!transform.*、!gpu.*）的登记——它们是类型构造子的 isa，属于类型代数而非方言语义；(b) 区域分支类型（RegionBranchOpInterface，scf.while/tensor.pad/execute_region/named_sequence 共约 140 例）作为一条通用义务导入，而不是逐 op 手写。
