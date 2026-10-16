@@ -16,14 +16,32 @@ TOOLS = glob.glob(f'{_ROOT}/tools/mlir_native_tools-*.data/data/bin') + glob.glo
 CACHE = '/tmp/odsjson'
 DIALECTS = {'arith': 'Arith/IR/ArithOps', 'math': 'Math/IR/MathOps', 'index': 'Index/IR/IndexOps', 'complex': 'Complex/IR/ComplexOps',
             'tensor': 'Tensor/IR/TensorOps', 'memref': 'MemRef/IR/MemRefOps', 'scf': 'SCF/IR/SCFOps', 'func': 'Func/IR/FuncOps',
-            'cf': 'ControlFlow/IR/ControlFlowOps', 'vector': 'Vector/IR/VectorOps', 'shape': 'Shape/IR/ShapeOps', 'ub': 'UB/IR/UBOps'}
+            'cf': 'ControlFlow/IR/ControlFlowOps', 'vector': 'Vector/IR/VectorOps', 'shape': 'Shape/IR/ShapeOps', 'ub': 'UB/IR/UBOps',
+            # 第 18 轮：按“符号层自身漏判”的归因导入（modular.md §7）。一个方言可由多个 .td 组成（transform 的扩展 op 分散在各方言的 TransformOps 里）。
+            'affine': 'Affine/IR/AffineOps', 'gpu': 'GPU/IR/GPUOps', 'bufferization': 'Bufferization/IR/BufferizationOps',
+            'linalg': ['Linalg/IR/LinalgOps', 'Linalg/IR/LinalgRelayoutOps'],    # LinalgStructuredOps.td 包含构建期生成的 yamlgen.td，wheel 不带 ⇒ 命名结构化 op（fill/matmul/transpose…）未导入，见 modular.md §7
+            'transform': ['Transform/IR/TransformOps', 'Linalg/TransformOps/LinalgTransformOps', 'SCF/TransformOps/SCFTransformOps', 'Func/TransformOps/FuncTransformOps'],
+            'nvgpu': 'NVGPU/IR/NVGPUOps', 'shard': 'Shard/IR/ShardOps'}
 
 @functools.lru_cache(None)
 def records(dialect):
-    os.makedirs(CACHE, exist_ok=True); out = f'{CACHE}/{dialect}.json'
-    if not os.path.exists(out):
-        subprocess.run([TOOLS[0] + '/llvm-tblgen', '-dump-json', '-I', SITE, f'{SITE}/mlir/Dialect/{DIALECTS[dialect]}.td', '-o', out], check=True)
-    return json.load(open(out))
+    os.makedirs(CACHE, exist_ok=True)
+    tds = DIALECTS[dialect]; tds = [tds] if isinstance(tds, str) else tds
+    merged = None; seen = []
+    for td in tds:
+        out = f'{CACHE}/{td.replace("/", "_")}.json'
+        if not os.path.exists(out):
+            subprocess.run([TOOLS[0] + '/llvm-tblgen', '-dump-json', '-I', SITE, f'{SITE}/mlir/Dialect/{td}.td', '-o', out], check=True)
+        txt = open(out).read()
+        if merged is not None: txt = re.sub(r'anonymous_(\d+)', lambda m: f'anonymous_f{len(seen)}_{m.group(1)}', txt)   # 匿名记录编号是每次 tblgen 运行各自的 ⇒ 跨文件会撞名
+        seen.append(td); d = json.loads(txt)
+        if merged is None: merged = d; continue
+        inst = merged['!instanceof']
+        for k, v in d.items():
+            if k == '!instanceof':
+                for c, names in v.items(): inst[c] = sorted(set(inst.get(c, [])) | set(names))
+            elif k not in merged: merged[k] = v
+    return merged
 
 def ref(v): return v['def'] if isinstance(v, dict) and v.get('kind') == 'def' else None
 
