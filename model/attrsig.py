@@ -81,8 +81,10 @@ def _dialect_isa(cpp):
     if nm is not None:
         dia, _, mn = nm.partition('.')
         def f(a):
-            s = str(a)                                # MLIR 有两种打印：#arith.fastmath<…> 与 #index<cmp_predicate …>
-            return s == '#' + nm or s.startswith('#' + nm + '<') or s.startswith(f'#{dia}<{mn} ') or s == f'#{dia}<{mn}>'
+            s = str(a)                                # MLIR 有两种打印：#arith.fastmath<…> 与 #index<cmp_predicate …>、#shard<axisarray[[0]]>
+            if s == '#' + nm or s.startswith('#' + nm + '<'): return True
+            m = re.match(r'#([\w$]+)<([\w$.]+)', s)    # 第 18 轮：助记符是关键字，按“最长标识符”取，不假设其后是空格或 '>'（shard 误拒 6 例）
+            return bool(m) and m.group(1) == dia and m.group(2) == mn
         return f
     se = specialized_enums().get(cpp)
     if se is not None:
@@ -156,6 +158,7 @@ XFORM = {O.norm('::llvm::cast<::mlir::TypeAttr>($_self).getValue()'): _type_of}
 
 def _interp(d, name):
     """odsjson.interp 加上属性数组的 Concat 形状（all_of(ArrayAttr, [&](Attribute attr){ return attr && (…); })）。"""
+    if name is None or name not in d: raise O.Unknown(('pred-ref', name))      # 第 18 轮：新方言里有非 def 引用的谓词子项 ⇒ 进导入账，不崩
     r = d[name]; sc = r['!superclasses']
     if 'Concat' in sc and 'ArrayAttr' in r.get('prefix', ''):
         if O.norm(r['prefix']) != O.norm('::llvm::all_of(::llvm::cast<::mlir::ArrayAttr>($_self), [&](::mlir::Attribute attr) { return attr && ('):
