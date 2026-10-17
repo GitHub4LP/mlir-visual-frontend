@@ -109,8 +109,8 @@ def _acc_of(t, n):
     if z3.is_expr(t): return [], True                              # 符号的 nuw 标志
     return ([] if isinstance(t, Term) and t.kind == 'OverflowFlagsAttr' else ['overflowFlags 须为 #arith.overflow']), True
 def _den_of(t):
-    if isinstance(t, Term): return {'nuw': 'nuw' in t.args[0]}
-    return {'nuw': t}                                              # 符号：z3 Bool
+    if isinstance(t, Term): return {'nuw': 'nuw' in t.args[0], 'nsw': 'nsw' in t.args[0]}   # 第 21 轮：此前丢掉 nsw（语义不可靠）
+    return {'nuw': t}                                              # 符号：z3 Bool（复合 op 参数只开放 nuw）
 OPSIG = {
     'arith.constant': [Param('value', _acc_const, lambda t: {'value': _value_of(t)}, ('value',), required=True)],
     'arith.cmpi': [Param('predicate', _acc_pred, lambda t: {'predicate': _value_of(t)}, ('predicate',), required=True)],

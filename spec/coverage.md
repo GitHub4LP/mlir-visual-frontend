@@ -28,7 +28,7 @@
 | 15 | Properties 与可丢弃 attribute 的区分 | 参数进语义，元数据不进；命名空间分离（L9） | E | ✓ | D2 与 MLIR：不可靠 0 |
 | 16 | AttrConstraint、ConfinedAttr、DefaultValued | 参数值域；复合 op 参数约束推导（L10） | E | ✓ | 第 13 轮：ODS 导入 225 参数（精确 224、上近似 1）；A1 真实 14065 实例误拒 0；A2 变异 18145 例误拒 0、ODS 层漏判仅上近似 9（attributes.md） |
 | 17 | Type/Attr interface（ShapedType 等） | 接口 + 实现表（类型上） | E | ◐ | Monoid 示例；ShapedType 未导入 |
-| 18 | DataLayout | 目标参数（IW） | E | ◐ | core.IW 决定 index 溢出成毒值的界（L17′）；其余布局 ✗ |
+| 18 | DataLayout | 目标参数（IW） | E | ◐ | core.IW 是 index 的回绕位宽（L17″，第 21 轮）；IW ∈ {32,64} 双宽度判定未做；其余布局 ✗ |
 
 ## C 签名
 | # | 机制 | 元模型落点 | 强度 | 状态 | 证据或缺口 |
@@ -40,9 +40,9 @@
 ## D 语义与效应
 | # | 机制 | 元模型落点 | 强度 | 状态 | 证据或缺口 |
 |---|---|---|---|---|---|
-| 22 | UB 与毒值 | 值层（QF_BV） | E | ✓ | T1 精确 900/900；L6 |
-| 23 | Speculatable | caps 派生（含毒值输入） | E | ✓ | X3 |
-| 24 | MemoryEffects | compose_eff | S | ✓ | L7；llvm.ptr 的别名是 S |
+| 22 | UB 与毒值 | 值层（QF_BV） | E | ◐ | 第 21 轮降级：T1 900/900 是自证（C）；外部审计 sem_test 只覆盖 arith 整数子集（V1 JIT、V3 int-range-optimizations 1500/1500），并抓出 nsw 漏建模（旧语义反例 22）；L6 复合摘要仍 C |
+| 23 | Speculatable | caps 派生（含毒值输入） | E | ◐ | 第 21 轮降级：只有 X3 自证（C）；未与 MLIR 的 getSpeculatability 差分 |
+| 24 | MemoryEffects | compose_eff | S | ◐ | 第 21 轮降级：L7 只有自证（C）；llvm.ptr 的别名是 S |
 | 25 | Resource、Target 细分 | effect 三元组 | S | ◐ | 只有 Default |
 | 26 | AutomaticAllocationScope、alloca | 透明模式自动包 alloca_scope | E | ◐ | 只在规范 |
 | 27 | 下标、extent（slice、pad…） | extent 是 index 值（ℤ），静态维是投影（L22） | E | ◐ | shapes.md：9 个 tensor op 并入 core，bufferize 后 JIT 差分 1049/1049；pad、多维 stride、memref 形状未做；Presburger 显示层未接 |
@@ -89,7 +89,8 @@
 | 51 | 增量查询（增量 ≡ 全量） | ◐ | edit.md：Merkle 键 + 指纹早截断（L21），720 次编辑 0 不一致；定义内部不细分 |
 
 ## 小结
-共 52 项：✓ 17，◐ 26，✗ 8，— 1（2026-10-15，第 13 轮属性层之后）。
+共 52 项：✓ 14，◐ 29，✗ 8，— 1（2026-10-17，第 21 轮按证据重评之后）。
+- **第 21 轮评级规则**：✓ 须有 A 或 B 级证据（laws.md）；只有自证（C）的降为 ◐。据此 #22、#23、#24 由 ✓ 降为 ◐。值层的 L17′ 被否定、改为 L17″，nsw 补建模（laws.md §2–3）。
 - 剩下的 ✗：递归、方言组织（命名空间、版本、IRDL、方言扩展、bytecode）、transform dialect、数据流分析框架、WASM。
 - 第 16 轮（modular.md）：预言机按模块上下文发射——导入节点逐字发射、被引用符号补私有声明、模块属性与未注册方言随上下文；C2 首次打开预言机仍误拒 0（2982 次调用，不可送达 4）；M2 19271 例变异与整模块 verifier 误拒 0，func.func 体内漏判 0。
 - 第 17 轮（modular.md §6）：发射单位 = 隔离单元（单元 + 祖先外壳 + 被引用符号声明）；core.check_module；M3 19271 例对照整模块 verifier 误拒 0、漏判 0（不开预言机漏判 881）；L42 单元局部性。

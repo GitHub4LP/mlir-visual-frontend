@@ -3,7 +3,7 @@
   W2 与真实 MLIR 执行的差分：随机程序（i8/i32/i64/index、类型转换、scf.if、静态 scf.for），LLVM JIT 执行 vs 模型求值
   W3 循环摘要（L18）：确定性、嵌套 ≡ 内联、透明模式调用点特化、不透明模式只可靠
   W4 不变式（L19）：归纳检查、收窄 Pre、错误不变式被拒、公理与具体执行一致
-  W5 index 溢出是毒值（L17′）：MLIR 的回绕是精化，addi 可推测
+  W5 index 回绕（L17″，第 21 轮依 LangRef 更正 L17′）：模型值 = MLIR 执行值；nsw/nuw 才产生毒值；L17′ 的反例
 用法：PYTHONPATH=model python3 model/loop_test.py [W2 的程序数]
 """
 import random, sys, ctypes, z3
@@ -187,7 +187,7 @@ def W3():
 
 def W4(rng):
     r = {}
-    # L17′ 之后，c+1 溢出是毒值而不是 UB，所以“c 不是毒值”要靠范围事实维持：lb < 0 时 i − lb 可以超过 2^63
+    # L17″ 下 c+1 回绕；“c = i − lb”要靠范围事实维持：lb < 0 时 i − lb 可以超过 2^63 而回绕
     weak = lambda iv, its, B: z3.And(its[0][0] == iv - B['lb'], z3.Not(its[0][1]), iv >= B['lb'])
     r['c = i − lb（不带范围）：不是归纳的'] = counter('cnt_weak', mode='opaque', inv=weak).loop_diag
     good = lambda iv, its, B: z3.And(its[0][0] == iv - B['lb'], z3.Not(its[0][1]), iv >= B['lb'], B['lb'] >= 0)
@@ -221,21 +221,37 @@ def W4(rng):
     return r
 
 def W5():
-    f = C.derive('ixadd', [('a', IX), ('b', IX)], [('q', IX)], [blk('entry', [C.op2('s', 'arith.addi', 'a', 'b', IX), C.ret('r', 's')], args=[('a', IX), ('b', IX)])])
-    a, b = f.holes[0][0], f.holes[1][0]
-    src = ('module {\nfunc.func @main(%arg0: i64, %arg1: i64, %arg2: i64) -> i64 attributes {llvm.emit_c_interface} {\n'
-           '  %a = arith.index_cast %arg0 : i64 to index\n  %b = arith.index_cast %arg1 : i64 to index\n'
-           '  %s = arith.addi %a, %b : index\n  %r = arith.index_cast %s : index to i64\n  return %r : i64\n}\n}')
-    wrap = jit(src, [[1 << 62, 1 << 62, 0]])[0]
+    """L17″（第 21 轮）：index 运算按 2^IW 回绕（LangRef：结果为数学值 mod 2^n），只有 nsw/nuw 使溢出成为毒值。
+    对照 L17′（第 6–20 轮，溢出 = 毒值）：它能“证明” (x+1) > x，MLIR 执行在 x = 2^63−1 时给出假。"""
+    def ix(nm, ops, ins=(('a', IX), ('b', IX)), out=IX): return C.derive(nm, list(ins), [('q', out)], [blk('entry', ops, args=list(ins))])
+    run = lambda body, xs: jit('module {\nfunc.func @main(%arg0: i64, %arg1: i64, %arg2: i64) -> i64 attributes {llvm.emit_c_interface} {\n'
+                               '  %a = arith.index_cast %arg0 : i64 to index\n  %b = arith.index_cast %arg1 : i64 to index\n' + body + '\n}\n}', [xs])[0]
+    sgn = lambda v: v - (1 << 64) if v >= 1 << 63 else v
+    f = ix('ixadd', [C.op2('s', 'arith.addi', 'a', 'b', IX), C.ret('r', 's')])
+    fs = ix('ixadd_nsw', [C.op2('s', 'arith.addi', 'a', 'b', IX, nsw=True), C.ret('r', 's')])
+    a, b = f.holes[0][0], f.holes[1][0]; nop = z3.And(z3.Not(f.holes[0][1]), z3.Not(f.holes[1][1]))
+    wrap = sgn(run('  %s = arith.addi %a, %b : index\n  %r = arith.index_cast %s : index to i64\n  return %r : i64', [1 << 62, 1 << 62, 0]))
+    g = ix('ixgt', [C.cst('one', 1, IX), C.op2('s', 'arith.addi', 'a', 'one', IX), C.op2('c', 'arith.cmpi', 's', 'a', 'i1', predicate=4), C.ret('r', 'c')],
+           ins=(('a', IX),), out='i1')
+    gt_proved = C.prove(z3.Implies(z3.And(g.ax, z3.Not(g.holes[0][1]), z3.Not(g.outv[0][1])), g.outv[0][0] == 1))
+    gt_mlir = run('  %one = arith.constant 1 : index\n  %s = arith.addi %a, %one : index\n  %c = arith.cmpi sgt, %s, %a : index\n'
+                  '  %r = arith.extui %c : i1 to i64\n  return %r : i64', [(1 << 63) - 1, 0, 0])
     rt = C.derive('rt', [('x', I64)], [('q', I64)], [blk('entry', [node('i', 'arith.index_cast', ins=['x'], outs=[('i', IX)]),
                    node('o', 'arith.index_cast', ins=['i'], outs=[('o', I64)]), C.ret('r', 'o')], args=[('x', I64)])])
-    nop = z3.And(z3.Not(f.holes[0][1]), z3.Not(f.holes[1][1]))
-    return {'UB ≡ ⊥，MayPoison(a + b : index) ⇔ 输入毒值 ∨ 超出 [−2^63, 2^63)':
-                C.prove(z3.Implies(f.ax, z3.Not(f.ubf))) and C.prove(z3.Implies(f.ax, f.outv[0][1] == z3.Or(z3.Not(nop), a + b < C.LO, a + b >= C.HI))),
-            '2^62 + 2^62：前端毒值': C.prove(z3.Implies(z3.And(a == 1 << 62, b == 1 << 62, nop), f.outv[0][1])),
-            'index addi 可推测（与 MLIR 的 Pure 一致）': C.caps(f)['Speculatable'],
-            'MLIR 执行结果（回绕）': wrap - (1 << 64) if wrap >= 1 << 63 else wrap,
-            'i64 → index → i64 往返恒等': C.prove(z3.Implies(z3.Not(rt.holes[0][1]), rt.outv[0][0] == rt.holes[0][0]))}
+    r = {'语义': C.IXOVF,
+         'UB ≡ ⊥，MayPoison(a + b : index) ⇔ 输入毒值': C.prove(z3.Implies(f.ax, z3.Not(f.ubf))) and C.prove(z3.Implies(f.ax, f.outv[0][1] == z3.Not(nop))),
+         'nsw：MayPoison ⇔ 输入毒值 ∨ 超出 [−2^63, 2^63)': C.prove(z3.Implies(fs.ax, fs.outv[0][1] == z3.Or(fs.holes[0][1], fs.holes[1][1],
+                                                     fs.holes[0][0] + fs.holes[1][0] < C.LO, fs.holes[0][0] + fs.holes[1][0] >= C.HI))),
+         '2^62 + 2^62：模型值 = MLIR 执行值': C.prove(z3.Implies(z3.And(f.ax, a == 1 << 62, b == 1 << 62, nop), f.outv[0][0] == wrap)) and wrap == -(1 << 63),
+         'index addi 可推测（与 MLIR 的 Pure 一致）': C.caps(f)['Speculatable'],
+         '(x+1) > x 不可证（MLIR 在 x=2^63−1 执行得假）': (not gt_proved) and gt_mlir == 0,
+         'i64 → index → i64 往返恒等': C.prove(z3.Implies(z3.Not(rt.holes[0][1]), rt.outv[0][0] == rt.holes[0][0]))}
+    old = C.IXOVF; C.IXOVF = 'poison'
+    g2 = ix('ixgt_old', [C.cst('one', 1, IX), C.op2('s', 'arith.addi', 'a', 'one', IX), C.op2('c', 'arith.cmpi', 's', 'a', 'i1', predicate=4), C.ret('r', 'c')],
+            ins=(('a', IX),), out='i1')
+    C.IXOVF = old
+    r['对照 L17′：(x+1) > x 被“证明”（与 MLIR 执行矛盾）'] = C.prove(z3.Implies(z3.And(g2.ax, z3.Not(g2.holes[0][1]), z3.Not(g2.outv[0][1])), g2.outv[0][0] == 1))
+    return r
 
 if __name__ == '__main__':
     n = int(sys.argv[1]) if len(sys.argv) > 1 else 150

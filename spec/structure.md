@@ -47,7 +47,7 @@ Schema v3 只描述端口、类型、语义和效应，没有覆盖 MLIR 的结�
 ## 5 复合 op 的结构摘要（推导，声明只能收窄）
 `derive_struct(体) = ⟨captures, free_syms, needs_ssacfg, multi_block, isolated_ok⟩`
 - 组合律 L3（捕获）：透明内联进 IsolatedFromAbove 的宿主时，captures 必须提升为显式端口；captures 为空 ⇔ 可声明 IsolatedFromAbove（这是推导，不是声明）。
-- 组合律 L4（符号）：透明模式下 free_syms 变成宿主所在符号表的解析义务（S2/S3）；不透明模式（func + call）下，它们是复合定义所在表的义务。两种模式解析到不同的表时，**语义不同**，所以必须判定一致或者拒绝透明模式。这一点与 alloca_scope 的问题（frontend-model.md §5）同构：透明内联都要保持作用域。
+- 组合律 L4（符号）：透明模式下 free_syms 变成宿主所在符号表的解析义务（S2/S3）；不透明模式（func + call）下，它们是复合定义所在表的义务。两种模式解析到不同的表时，**语义不同**，所以必须判定一致或者拒绝透明模式。这一点与 alloca_scope 的问题（derivation-v3.md §5）同构：透明内联都要保持作用域。
 - L5（区域种类）：needs_ssacfg 的复合 op 不能内联进 Graph 区域；它只能以不透明模式出现，或者先结构化（cf → scf）。
 
 ## 6 差分结果
