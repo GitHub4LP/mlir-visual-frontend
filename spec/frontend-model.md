@@ -1,129 +1,84 @@
-# 可视化编程前端模型（主规范，当前核心为 v4）
+# 可视化编程前端模型（主规范，第 21 轮重写）
 
-> 当前版本：Schema v4 = v3 + Struct，统一核心见 spec/core-v4.md，结构层见 spec/structure.md，机制覆盖矩阵见 spec/coverage.md。下文 §5 保留 v3 的推导规则与历次修正；与 core-v4.md 冲突时以后者为准。
+本文件是**当前的规范性模型**：前端实现者只读它，就应当知道每种编辑要问哪一层、谁有权拒绝、代价多大、诊断和补全依据什么。
+- 各条定律的证据等级见 laws.md（A 外部语料 / B MLIR 差分 / C 自证 / D 定义 / ✗ 已否定）。
+- 机制覆盖见 coverage.md。
+- 第 1–4 轮的推导规则原文（L1、L2、Schema v3、管线契约的例子）保留在 derivation-v3.md，作为历史参考。
 
-## 0 定位与判据
-- 前端 IR（VIR）是一门独立的一等语言，不是 MLIR 的外壳。前后端的表示和交互可以不一一对应。
-- “不弱于 MLIR”的定义：(a) MLIR 的每个机制在 VIR 里都有对应；(b) 这些对应在编辑期可判定、可增量计算。
-- “比 MLIR 强”的定义：MLIR 要等构造完才验证的东西，前端在编辑时就能预判和引导。
-- 编译路径：VIR → vis dialect → 标准 dialect → LLVM → native 或 wasm32。另留一条 VIR → WASM 的直出路径，用于预览。
+## 0 定位与三条判据
+- 前端 IR（VIR）是一门独立的语言，经 ⟦·⟧ 降到 MLIR。它要建模的是 MLIR 的**机制**，而不是 MLIR 的外壳。
+- **(1) 覆盖**：MLIR 的每项机制都可以导入或降级，不能缺（coverage.md）。
+- **(2) 组合律可靠**：每条有拒绝权或改写权的定律都要有 A/B 级证据（laws.md）。
+- **(3) 指导性**：见 §4 的动作表。
+- **“不弱于 MLIR”的可检验形式**：
+  - 前端判定合法 ⇒ MLIR verifier 接受（不误拒，并且同样拒绝 MLIR 拒绝的）；
+  - 导入一个 MLIR 程序，语义不变（L17″ 就是因为违反这一条而更正的）；
+  - 前端证明的改写 ⇒ 在 MLIR 语义下也是精化。
+- **“强于 MLIR”**：只允许出现在 MLIR 没有对应物的地方，并且必须标成 D 级：
+  - 编辑期的洞与部分图；
+  - 结果类型相对选择（L26）；
+  - tensor 层无 UB 加降低守卫（L24）；
+  - 增量与补全。
 
-## 1 机制对应
-| 前端 | MLIR 对应机制 | 前端需要强化的地方 |
-|---|---|---|
-| 节点库/包 | Dialect | 版本、迁移、依赖 |
-| 节点 schema | OpDef/ODS | 作为唯一事实源，生成 UI、校验、推断、lowering |
-| 端口 | operand/result | 多重性 1/?/*/分组、默认值、内联常量 |
-| 端口类型 | Type + TypeConstraint | 约束限定在可判定片段，禁止 opaque 谓词 |
-| 参数 | Properties/Attr | 表单 schema、值域 |
-| 能力 | Trait/Interface | 能力代数：蕴含、前提、互斥；支持外部模型 |
-| 容器/子图 | Region、IsolatedFromAbove | 闭包捕获规则可视化 |
-| 命名定义/引用 | Symbol/SymbolTable | 重命名重构、跨图引用 |
-| 执行顺序 | MemoryEffects/Pure | 区分 exec 边和数据边 |
-| 控制 | Branch/RegionBranch | 优先用结构化控制 |
-| 校验 | 分阶段 Verifier | 增量校验、允许带洞的部分图、错误定位到节点/边 |
-| 推断 | InferType、TypesMatchWith | 双向：连线时传播类型，并反向筛选候选节点 |
-| 预览 | fold/canonicalize | 实时显示常量结果 |
-| 重构 | Pass/Pattern/Transform | 每个编辑操作都是带契约的变换，支持 undo |
-| 复用 | func/call/inliner | 复合节点、泛型 |
-| lowering | DialectConversion | 语义保持义务；用 Location 存节点 ID，后端诊断回映到图上 |
+## 1 对象
+- **Op = ⟨Schema, Impl⟩**。Impl 是 Primitive、Graph（复合）、External 三者之一。所有消费者只读 Schema。
+- **Schema** 的字段与来源：
 
-## 2 核心演算（相当于 MLIR 规范化后的超集）
-- 节点 schema：`N : ∀X̄. ports × params × slots → ports where Φ, caps C`
-- Φ 只能用可判定的约束片段：类型族成员、投影相等、函数依赖、Presburger 关系、参数值域。于是“两个端口能不能连”就是约束可满足性问题，用增量合一求解。
-- 两级良构：W_partial 表示允许有洞但没有冲突；W_complete 表示可以编译。MLIR 只有后一级。
-- 每个编辑操作都是变换，都要保持 W_partial。
-- 节点库加载时检查能力代数的闭包。
+| 字段 | 内容 | 原生 op 的来源 | 复合 op 的来源 | 级 |
+|---|---|---|---|---|
+| 结构 | 区域种类/个数、终结子、后继、隔离、符号定义者/表/使用者 | ODS trait/interface 闭包（structure、symtab） | 推导：captures、free_syms、needs_ssacfg（L3–L5） | A（原生）/ B（复合） |
+| 类型签名 | 端口约束 Pred 树、多态签名 | tblgen JSON 自动签名（L28/L29） | 端口表达式上的 Φ（L25–L27） | A / B |
+| 属性 | 参数值域、必需性 | ODS 导入，值是 MLIR Attribute（L34、L35） | 使用点约束的合取（L10） | A / B |
+| declared 义务 | C++ verify、开放接口、区域分支边 | 只有预言机能裁决（L43、L44） | 透明内联后交预言机 | A |
+| 值层 | Sem / UB / Poison（QF_BV，index 回绕） | 人工覆盖层，由 sem_test 审计 | 推导（L6） | B（arith 子集）/ C |
+| 效应 | MemoryEffects 三元组 | ODS | compose_eff（L7） | C |
+| caps | Speculatable、Pure 等 | 由上面各字段派生，不单独声明 | 同左 | C |
 
-## 3 前后端映射义务
-- 语义映射 ⟦·⟧: VIR → MLIR，要求 W_complete(g) ⇒ W(⟦g⟧)。也就是前端判定合法的图，后端一定不报错。这是“不弱于”的可检验形式。
-- **每个 op 有三个谓词，不能混在一起**（v1 原型中发现）：
-  - Wf：后端的静态接受条件，也就是 MLIR verifier 的条件，**包括它的怪癖**。它定义在**静态投影**上：哪些检查会被触发，取决于维度是不是静态。
-  - Def：运行期定义性，即不触发 UB。它定义在 **extent** 上。
-  - Sem：结果关系。
-- 复合 op 推导时三者分别投影（量词规则见 §5 第 3 条）：
-  - Wf 必须在 lowering 之前对静态投影判定为真；
-  - Def 推出来的是边界前提。能静态证明的直接消去，不能的 lowering 为运行期断言，可接 MLIR runtime-verification。
-- 对 MLIR 的偏差统一由 lowering 消解，例如把 size=0 的 slice 规范为 tensor.empty，这样语义层就不用继承后端的怪癖。
-- **⟦·⟧ 必须包含 pass 管线，而不只是 IR 翻译**（v3 用真实 MLIR 验证过，见 model/difftest/）。W_complete(g) ⇒ W(⟦g⟧) 只能保证后端不报错，不能保证语义保持。
-  - 实例：tensor.extract 标为 Pure，于是 LICM 把它提到可能 0 次迭代的循环外面；bufferize 之后变成无条件执行的 memref.load。原程序从不访问内存，变换后的程序可能越界。
-  - 所以前端需要固定两样东西：一份“MLIR 语义剖面”（每个 op 是 UB 还是毒值，由覆盖层规定），以及一份 pass 白名单和顺序约束。例如：bufferize 之前不跑会做推测的 pass，或者对未证明在界内的 extract 先做索引钳制。
-  - 判据升级为：Sem(g) ⊑ Sem(pipeline(⟦g⟧))。
-- 后端诊断通过 Location 回映到节点/边。
-- 数据流图转 SSACFG：按数据依赖加效应做拓扑调度；图中的环必须经过显式的循环或状态容器。
+- **复合 op 与原生 op 同构**：同一种 Schema、同一个 check。声明只能收窄，并且要经过检查（Φ_user ⊨ Φ_comp）。
 
-## 4 迭代
-- R1 端口类型、约束与推断（做深）
-- R2 容器、作用域、效应、控制
-- R3 节点库、能力代数、版本
-- R4 ⟦·⟧ 与 WASM 路径
-- R5 原型：TS 校验器 + MLIR lowering
+## 2 分层与拒绝权
+| 层 | 回答 | 权威 | 代价 | 拒绝权 |
+|---|---|---|---|---|
+| 结构层 R1–R8、S1–S5 | 区域、块、支配、可见性、符号 | ODS 导入的结构 | 局部 O(1)；R5 按区域重建支配树；S2/S4 走反向索引 | 有（L39：Z2 误拒 0） |
+| 自动签名 | 端口类型 | tblgen JSON | Φ 检查约 30 µs | 有（L29，A） |
+| 属性层 | 参数、属性 | ODS + MLIR 属性解析器 | 微秒级 | 有（L34a，A） |
+| 符号层 | 引用解析、使用义务 | ODS 接口 + _attrs | 反向索引 | 有（L36a，A） |
+| 预言机（隔离单元） | 其余全部：C++ verify、开放接口、区域分支边 | MLIR verifier，同一提交 | 原生约 3–15 µs；本原型跨进程约 670 µs，命中缓存约 73 µs | 有，且是最终权威（L42，A） |
+| 人工签名 typesig | 预言机不可用时的退路 | 人工 | — | **无**，只发警告（L33） |
+| 值层 / 效应 / caps | 预览、可推测性、改写证明、补全分类 | 覆盖层与推导 | 查询为毫秒级 | **无**：不拒绝程序，只提供事实与改写许可 |
 
-## 5 复合 op：由实现图推导签名
-**统一抽象**：Op = ⟨Schema, Impl⟩，其中 Schema = ∀X̄. ports × params × slots → ports where Φ, caps C；Impl 是 Primitive(mlir 名)、Graph(G)、External 三者之一。
-所有消费者（编辑器推断、校验、trait 查询、lowering）只读 Schema，不关心 Impl 是哪一种。内置 op 的 Schema 由 ODS 导入后规范化得到；复合 op 的 Schema 从实现图推导。两者是同一种对象。
+- **判定顺序**：结构 → 符号 → 自动签名与属性 → 预言机。前一层的拒绝即为终判；预言机只在符号层管不到的节点上补充拒绝（L30、L31）。
+- **无结论是一等结果**：发射不忠实、不可送达、资源缺失时返回 None 并给警告，不能报成类型错误（L41）。
 
-**推导（主签名）**：
-1. 对图中每个实例 nᵢ，以新鲜变量实例化它的 Schema，得到约束 Φᵢ。
-2. 每条边 p→q 生成约束 type(p)=type(q)；如果允许隐式转换，改为 ⊑。
-3. 量词按变量的种类区分（v2 修正：原先统一用 ∃，对运行期量是**不可靠**的）：
-   - 类型和静态变量（编译器或用户选定）用 ∃：Φ_comp = ∃Y_静态. ∧Φᵢ ∧ ∧边约束。
-   - 运行期内部量（extent、index、条件）求最弱前提：Pre(b) = ¬∃r. Sem(b,r) ∧ ¬Def(b,r)；Post = ∃r. Sem ∧ Def。
-   - 反例：if(数据相关条件) 两支对 n 的要求不同时，∃ 得到的是两支要求的析取，但正确的前提是合取。
-4. Φ_comp 就是使实现体良构的最弱条件：它可靠，也最大。
-**前提**：约束语言必须对 ∧ 和 ∃ 封闭，并且蕴含可判定。可选的组合是：项合一 + Presburger（维度、秩、计数）+ 有限类型族 + 边界上的接口原子。opaque 谓词无法被消去，这时推导结果就退化为“可靠但不是最大”。因此禁止 opaque 是硬性要求。
+## 3 值层的语义（第 21 轮更正后）
+- **iN**：位向量。add/sub/mul 回绕；nsw/nuw 溢出产生毒值；divui/divsi/remsi 除以 0 是 UB；毒值进入除数是 UB。
+- **index**：IW 位补码，结果回绕（L17″）。目标无关的事实要对 IW ∈ {32, 64} 都成立（尚未实现，见 laws.md §4）。
+- **tensor**：⟨extent, 元素, 元素毒值⟩。越界产生毒值而不是 UB（L24，D 级）；降低时对不能证明在界内的节点插守卫。
+- **精化判据**：src 不 UB ⇒ tgt 不 UB；src 非毒值 ⇒ tgt 值相同且非毒值。
+  - 改写、fold、降级都用这同一个判据；
+  - 它的外部校准是 MLIR 自己的变换：canonicalize 和 int-range-optimizations 的结果，在模型下必须是精化（sem_test V2/V3）。
 
-**签名间关系是查询，不是声明**：trait T 对复合 op 成立 ⇔ Φ_comp ⊨ φ_T。例如 SameOperandsAndResultType、AllShapesMatch、TypesMatchWith 都可以这样判定。
-**Schema v3（统一记录，原生 op 与复合 op 同构）**：
-`Schema = ⟨ports, params, slots; Φ_type（∃，合一）; Sem; UB; Poison; Sensitive; Eff; Wf 引理; caps⟩`
-- Sem：运行期量之间的关系（Presburger）。UB：立即 UB 的条件。Poison：每个输出产生毒值的条件。Sensitive：哪些输入遇到毒值即 UB。
-  - 依据：MLIR 自己就区分这两种。arith 的 nuw/nsw 溢出产生毒值，divui 除以 0 是 UB（ArithOps.cpp getDivUISpeculatability）。
-- 复合 op：Pre = ¬∃r. Sem ∧ UB*，其中 UB* 包含“毒值流入敏感输入”；MayPoison_o = ∃r. Sem ∧ Pre ∧ P_o；Eff 按下面的规则组合。
-- **caps 由上述字段派生，不单独声明**：
-  - Speculatable ⇔ Pre ≡ 合法输入域。前端还可以给出“在 Pre 下可推测”这个精确谓词，MLIR 只有一个枚举值。
-  - Pure ⇔ Speculatable ∧ Eff=∅。
-  - nuw 一类的标志 ⇔ 对应的 MayPoison 恰好等于溢出条件。
-- 修正 v2 之前的过强断言：
-  - “体内全部 Pure ⇒ 复合 op Pure”只是充分条件，不是充要条件；
-  - IsolatedFromAbove 只在没有闭包捕获时成立；
-  - Commutative 一般不可判定，只能声明，再用规范化同构去检查（D）。
+## 4 前端动作表（判据 3）
+| 前端动作 | 要问的层 | 需要重算的范围 | 代价（本原型实测） | 诊断依据 | 补全/引导依据 |
+|---|---|---|---|---|---|
+| 放置节点 | 结构 R1/R2，自动签名 | 该节点 | 微秒 | R*、端口约束 | 按端口类型筛选的候选 op（connectable，约 12 µs） |
+| 连数据边 / 填洞 | R5/R6，自动签名，值层 L20 代换 | 该边；所在单元重验 | 代换不需要重推导 | 端口约束不满足；Pre | 候选值按安全 / 有条件 / 必然 UB 排序（edit.md §4） |
+| 改参数/属性 | 属性层，自动签名 | 该节点；所在单元 | 微秒 | ODS 约束 Pred | 值域（枚举、区间） |
+| 连控制边 / 改块 | R3/R4/R5（支配树）、R8 | 整个区域 | 按区域 | R* | 目标块按参数类型筛选 |
+| 改名、改可见性、改函数签名 | S1–S5 | 该表与所有引用者（L45 的 dependent） | 反向索引 | S* | 最近符号表中种类正确的符号（L37） |
+| 编辑隔离单元内部 | 预言机 | dirty ∪ dependent（L45） | 平均重验 40% 的单元 | MLIR 诊断，用 loc 回映到节点 | — |
+| 提取为复合 op | L3 捕获提升、L25 签名推导 | 新定义 + 使用点 | 推导签名约 450 µs | 推导出的 Φ | 推导出的 Φ 就是新节点的签名 |
+| 应用改写 | L13 定义期证明 + L14 前同余 | 改写点 | 定义期一次 | 反例 | 只提供已证明的规则 |
+| 预览常量结果 | L15 fold | 常量子图 | 毫秒 | 毒值显示为 poison | — |
 
-**组合律（core.py 的闭包测试暴露出来的两条）**：
-- L1：Sem 必须是全关系。在 UB 处取任意输出，即 Sem' = Sem ∨ UB。否则 UB 输入找不到对应的输出，会从“bad”集合中漏掉，结果不可靠。
-- L2：复合 op 的 Sem 摘要不能限制到 Pre 上，理由同 L1。
-- 满足这两条之后，“摘要组合 ≡ 全部内联”在 2 层和 3 层嵌套下都由 isl 判定为相等。
-- **修正（v4）**：上面的相等只在边界输入不是毒值时成立。L6：复合 op 的 UB 和输出毒值必须依赖输入的毒值标志，否则复合 op 收到毒值输入时不可靠（core-v4.md §4）。这正是“推导出的实体享有与原生实体同等地位”的可检验形式。
+## 5 降级 ⟦·⟧ 与它的义务
+- ⟦·⟧ 包含 pass 管线，不只是 IR 翻译。判据是 Sem(g) ⊑ Sem(pipeline(⟦g⟧))。
+  - 反例：LICM 提升 tensor.extract，bufferize 之后变成无条件的 load（difftest/）。
+- 复合 op 有三种落地方式：内联（透明，默认）；func + call（不透明）；IRDL op（不透明，并且有 MLIR 身份，见第 22 轮）。
+  - 内联要保持作用域：遇到 alloca 时要包一层 alloca_scope；遇到自由符号时要判定解析是否一致（L4）。
+- 后端诊断通过 Location（节点 id）回映到节点。
 
-**约束语言改为双类（v3.1，取代“值也用 Presburger”的做法）**：
-- 值层用 QF_BV（位向量）。op 是确定性的，Sem 是函数，所以 wp 只需要项代换：Pre = ¬UB(f(x)) 是无量词公式，精确且不需要投影。只有在提问时才求解：是否恒真（可推测）、是否可满足、取一个反例。
-- 下标、extent、循环计数、类型和静态变量用 Presburger（ℤ）。这一层负责 ∃ 消去、循环闭包，以及编辑器里可读的前提显示（例如“需要 0<n≤x”）。
-- 注意：MLIR 的 index 是目标位宽的环绕整数。把它当作 ℤ 处理，只有在不溢出时才精确，所以要附带一条义务：extent 和下标运算不超过 2^(w−1)。
-- 非线性运算（mul、div）在 Presburger 层抽象成过近似，结果仍然可靠（S）；需要精确时交给 QF_BV。
-- 语义覆盖层不必从零手写：xdsl-smt（Fehr 等，PLDI 2025）已经给出 arith、comb、func 等方言的毒值、UB、内存语义，表示方式与本规范同构（值加毒值标志，UB 效应）。上游的 arith-to-smt 不建模毒值，不能直接使用。**修正（v3.2）**：审计后发现 xdsl-smt 有 3 类与规范不符的语义，所以只能借鉴方法，逐 op 导入前必须先过条款测试，见 spec/semantic-overlay.md。覆盖层的原则是：规范与 lowering 不一致时，UB 和毒值都取保守并集（例如 remsi 的 INT_MIN % −1）。
-
-**信任等级与一致性审计**：
-- 每个字段标注来源：ods（导入）、authored（人工语义覆盖层）、derived（推导）。
-- ODS 只提供类型约束和 caps；Sem、UB、Poison 不在 ODS 里，必须由覆盖层提供。这是建设前端的主要成本。
-- 没有覆盖层的 op，其 UB 视为未知：派生的 caps 只能取 ODS 的声明（S），并在 UI 上标出来。
-- 审计规则：ODS 声明了 Pure，覆盖层却写了 UB ⇒ 两者必有一错。tensor.extract 就被这条规则抓了出来；tensor.dim 则相反，语义上恒可推测，ODS 的声明可以加强。
-
-**效应组合（已并入 model/core.py 的 compose_eff）**：
-- 并集，目标重定位到边界端口；
-- 体内新分配的缓冲，在返回之前外部不可能持有它的别名，所以对它的 Read/Write 外部不可见；
-- 局部 alloc…free 抵消，**但只在同一块内**（v4 修正 L7：只在某个分支里释放 ⇒ 其余路径泄漏）；逃逸时 Allocate 重定位到输出端口；未释放又不逃逸的报告为泄漏；
-- 体内有任何未建模效应的 op ⇒ ⊤；
-- 这条“新缓冲无别名”规则依赖逃逸分析：对 builtin memref 成立（memref 不能存放 memref），对 llvm.ptr 需要真正的逃逸分析，只能做到 S；
-- alloca：透明内联会改变语义（栈分配跑到外层作用域，放在循环里会让栈不断增长）。规定：含 alloca 的复合 op 在透明模式下必须包一层 memref.alloca_scope，这样两种模式语义一致；alloca 的结果逃逸则违反 Def（悬垂引用），两种模式下都拒绝。
-
-**边界情形**：
-- slot（高阶 region 参数）的签名，由实现体对它的使用方式推出
-- 可变端口需要实现体中有对该组的 map/fold 结构，对应约束 ∀i<n
-- 递归复合 op：必须显式声明签名，再用实现体去检查（多态递归的推断不可判定）
-- 用户可以收窄签名：要求 Φ_user ⊨ Φ_comp；放宽则禁止
-- 实现体修改导致 Φ_comp 变化时，检查已有使用点是否仍满足，以此做版本兼容
-- 内置 op 带有 C++ verify() 的，需要人工整理成规范化 Schema，否则推出的签名会偏宽
-
-**落到 MLIR**：
-(a) 实例化时内联，单态化 —— 最简单
-(b) 每个单态实例生成一个 func.func，使用处 call
-(c) 把 Φ_comp 导出为 IRDL 动态 dialect 中的 op，从而获得真正的 MLIR op 身份（有 verifier、能参与 pattern），lowering 时再内联。IRDL 表达不了的约束（比如 Presburger 关系）放进动态 verifier 回调。
+## 6 当前已知的不足（按 laws.md 的顺序处理）
+- 组合封闭（L25–L27）只有 B/C 级证据：复合 op 作为 op 的身份从未被 MLIR 检验过。
+- 值层只在 arith 整数子集上做了外部审计。scf、shift、浮点、memref 的语义只有自证。
+- 递归、方言注册与版本、transform 方言、DataFlow、bytecode、WASM：coverage 里是 ✗。
