@@ -96,7 +96,7 @@ def S4():
     old_fuse = rule('ss_old', X, [('q', TD)],
                     [nd('s1', 'tensor.extract_slice', ['x', 'o1', 'n1'], TD), nd('s2', 'tensor.extract_slice', ['s1', 'o2', 'n2'], TD), C.ret('r', 's2')],
                     [C.op2('o', 'arith.addi', 'o1', 'o2', IX), nd('s', 'tensor.extract_slice', ['x', 'o', 'n2'], TD), C.ret('r', 's')])[0]
-    C.IXOVF = 'poison'
+    C.IXOVF = 'wrap'
     r['对照 旧 L17：index addi 可推测'] = old_add
     r['对照 旧 L17：slice∘slice 融合成立'] = old_fuse
     return r
