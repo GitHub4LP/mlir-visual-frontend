@@ -8,7 +8,7 @@
 """
 import re, itertools, functools
 import odsjson as O
-from typesig import shaped, ranked, elt, compat_shape, _elementwise, i1same
+from typesig import shaped, ranked, elt, compat_shape, _elementwise, i1same, encoding
 
 def _base(d, c):
     """Variadic/Optional/VariadicOfVariadic → (基约束记录, 多重性)"""
@@ -193,6 +193,7 @@ def check(S, ins, outs, levels=('ods', 'cpred')):
         if k == 'samec_all':
             al = opd + res
             ok = all(E(a) == E(b) and compat_shape(a, b) and a[0] == b[0] for a, b in itertools.combinations(al, 2))
+            ok = ok and len({encoding(t) for t in al if t[0] == 'tensor'}) <= 1      # 第 22 轮：verifySameOperandsAndResultType 要求编码相同
         elif k == 'same_ops': ok = all(a == opd[0] for a in opd)
         elif k == 'shape_ops': ok = all(compat_shape(a, b) for a, b in itertools.combinations(opd, 2))
         elif k == 'shape_all': ok = all(compat_shape(a, b) for a, b in itertools.combinations(opd + res, 2))

@@ -27,7 +27,7 @@
 | 字段 | 内容 | 原生 op 的来源 | 复合 op 的来源 | 级 |
 |---|---|---|---|---|
 | 结构 | 区域种类/个数、终结子、后继、隔离、符号定义者/表/使用者 | ODS trait/interface 闭包（structure、symtab） | 推导：captures、free_syms、needs_ssacfg（L3–L5） | A（原生）/ B（复合） |
-| 类型签名 | 端口约束 Pred 树、多态签名 | tblgen JSON 自动签名（L28/L29） | 端口表达式上的 Φ（L25–L27） | A / B |
+| 类型签名 | 端口约束 Pred 树、多态签名 | tblgen JSON 自动签名（L28/L29） | 有拒绝权的层逐节点判定，内部类型按 ODS 前推（composite.py，L25/L46/L47）；compsig 的符号 Φ 只用于呈现与端口投影 | A / A |
 | 属性 | 参数值域、必需性 | ODS 导入，值是 MLIR Attribute（L34、L35） | 使用点约束的合取（L10） | A / B |
 | declared 义务 | C++ verify、开放接口、区域分支边 | 只有预言机能裁决（L43、L44） | 透明内联后交预言机 | A |
 | 值层 | Sem / UB / Poison（QF_BV，index 回绕） | 人工覆盖层，由 sem_test 审计 | 推导（L6） | B（arith 子集）/ C |
@@ -74,11 +74,11 @@
 ## 5 降级 ⟦·⟧ 与它的义务
 - ⟦·⟧ 包含 pass 管线，不只是 IR 翻译。判据是 Sem(g) ⊑ Sem(pipeline(⟦g⟧))。
   - 反例：LICM 提升 tensor.extract，bufferize 之后变成无条件的 load（difftest/）。
-- 复合 op 有三种落地方式：内联（透明，默认）；func + call（不透明）；IRDL op（不透明，并且有 MLIR 身份，见第 22 轮）。
+- 复合 op 有三种落地方式：内联（透明，默认）；func + call（不透明）；IRDL op（不透明，有 MLIR 身份）。IRDL 只能表达 any/is/相等，所以不透明模式下使用点仍由前端用 Φ 判定（L48，closure.md）。
   - 内联要保持作用域：遇到 alloca 时要包一层 alloca_scope；遇到自由符号时要判定解析是否一致（L4）。
 - 后端诊断通过 Location（节点 id）回映到节点。
 
 ## 6 当前已知的不足（按 laws.md 的顺序处理）
-- 组合封闭（L25–L27）只有 B/C 级证据：复合 op 作为 op 的身份从未被 MLIR 检验过。
+- 组合封闭：类型层已有 A 级证据（第 22 轮）；端口投影（L27）还建立在 typesig 上；值层的复合摘要（L6）仍是 C 级。
 - 值层只在 arith 整数子集上做了外部审计。scf、shift、浮点、memref 的语义只有自证。
 - 递归、方言注册与版本、transform 方言、DataFlow、bytecode、WASM：coverage 里是 ✗。

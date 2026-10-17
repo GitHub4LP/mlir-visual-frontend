@@ -127,7 +127,11 @@ def compat_shape(a, b):
     """mlir::verifyCompatibleShape：要么都不是 shaped，要么都是；无秩与任何秩相容；秩相等时逐维相容（? 与任何维相容）。"""
     if shaped(a) != shaped(b): return False
     if not shaped(a) or a[1] is None or b[1] is None: return True
+    if a[0] == b[0] == 'vector' and scalable(a) != scalable(b): return False     # 第 22 轮（复合 op 语料检验）：可伸缩维须一致，[4] 与 4 不相容
     return len(a[1]) == len(b[1]) and all(x is None or y is None or x == y for x, y in zip(a[1], b[1]))
+def mods(t): return dict(t[3][1]) if len(t) > 3 else {}
+def scalable(t): return mods(t).get('scalable') or (False,) * len(t[1] or ())
+def encoding(t): return mods(t).get('encoding') if t[0] == 'tensor' else None
 def _elementwise(ins, outs):
     """OpTrait::impl::verifyElementwise：可映射类型 = vector、tensor（含无秩）；有秩与无秩 tensor 是不同的基类型。"""
     mp = lambda t: t[0] in ('tensor', 'vector')

@@ -50,7 +50,7 @@
 | 29 | RegionBranchOpInterface | scf.if 守卫；R8 控制流边类型 | E | ◐ | 第 15 轮更正：R8 只覆盖 func/scf.if/scf.for/scf.execute_region（3949 实例），scf.while、scf.parallel、tensor.pad 等 914 实例的边类型是 C++（declared），交预言机；Z2 漏判 57 全在此（obligations.md） |
 | 30 | Call、Callable | S4；复合 op 调用 = 代换 | E | ◐ | func.call 的值层未建模 |
 | 31 | 递归 | 必须声明签名 | D | ✗ | |
-| 52 | 泛型复合 op（接口约束的多态） | 推导签名：端口表达式上的 Φ（L25–L27） | E | ◐ | compsig.md：Φ≡体≡MLIR 1043/1043，嵌套≡展开 900/900；值层仍单态化；接口约束的多态未做 |
+| 52 | 泛型复合 op（接口约束的多态） | Φ = 有拒绝权的层逐节点判定 + ODS 前推推断（composite.py，L25/L46/L47） | E | ◐ | 第 22 轮：语料抽取的复合 op（19 方言）10703 + 40681 例 Φ_full ≡ MLIR；端口投影（L27）仍在 typesig 上；值层仍单态化；接口约束的多态未做 |
 
 ## E 扩展机制
 | # | 机制 | 元模型落点 | 强度 | 状态 | 证据或缺口 |
@@ -59,7 +59,7 @@
 | 33 | Op/Type/Attr interface、external model、promised interface | 声明与实现表分开；derived/checked/declared；定律为定向精化（L12） | E/D | ◐ | D5；op interface 只有派生的 MemoryEffects、Speculatable |
 | 34 | Native trait | 已知实现的 trait 导入为关系；其余记 unknown | D→E | ◐ | odssig.NATIVE_OK 7 个；SameVariadicResultSize 等未覆盖 |
 | 35 | ODS/TableGen 导入 | tblgen -dump-json（与被测 MLIR 同一提交）→ 自动签名 + 导入账 | E/D | ◐ | import.md：auto 161 / declared 135 / unknown 9；region/后继 op 未差分 |
-| 36 | IRDL、动态方言 | 复合 op 的不透明身份 | — | ✗ | 只在规范（落地方案 c） |
+| 36 | IRDL、动态方言 | 复合 op 的不透明身份 | S | ◐ | 第 22 轮（closure.md）：复合 op 导出为 IRDL op，在语料切片上误拒 0；IRDL 对 builtin 类型只能表达 any/is/相等，只抓住 3.2% 的错误（L48）；用户自定义类型的 IRDL 导入未做 |
 | 37 | 方言扩展、延迟注册 | 节点库组合 | — | ✗ | |
 
 ## F 变换
@@ -89,7 +89,7 @@
 | 51 | 增量查询（增量 ≡ 全量） | ◐ | edit.md：Merkle 键 + 指纹早截断（L21），720 次编辑 0 不一致；定义内部不细分 |
 
 ## 小结
-共 52 项：✓ 14，◐ 29，✗ 8，— 1（2026-10-17，第 21 轮按证据重评之后）。
+共 52 项：✓ 14，◐ 30，✗ 7，— 1（2026-10-17，第 22 轮 IRDL ✗→◐ 之后）。
 - **第 21 轮评级规则**：✓ 须有 A 或 B 级证据（laws.md）；只有自证（C）的降为 ◐。据此 #22、#23、#24 由 ✓ 降为 ◐。值层的 L17′ 被否定、改为 L17″，nsw 补建模（laws.md §2–3）。
 - 剩下的 ✗：递归、方言组织（命名空间、版本、IRDL、方言扩展、bytecode）、transform dialect、数据流分析框架、WASM。
 - 第 16 轮（modular.md）：预言机按模块上下文发射——导入节点逐字发射、被引用符号补私有声明、模块属性与未注册方言随上下文；C2 首次打开预言机仍误拒 0（2982 次调用，不可送达 4）；M2 19271 例变异与整模块 verifier 误拒 0，func.func 体内漏判 0。
