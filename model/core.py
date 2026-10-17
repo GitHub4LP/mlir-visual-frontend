@@ -4,8 +4,8 @@ IR：structure.py 的 module/region/block/node 表示，是唯一的图表示（
 Schema v4 = ⟨签名; 值层（每个输出的值与毒值标志、UB，都是“输入值 × 输入毒值标志”的函数）; Eff; Struct; 信任等级; Impl⟩
 derive(体) 一次遍历同时给出 值层 / 效应层 / 结构层 的事实；结果仍是 Schema，可再作为节点使用。
 值层是多 sort 的：iN 用 z3 位向量（任意位宽；i3 便于穷举预言机，见 core_test.py）；index 用数学整数 ℤ，
-溢出出目标位宽 IW 的有符号范围 ⇒ 结果是毒值（L17′；第 5 轮之前是 UB，那会让 index 上的 addi 不可推测，弱于 MLIR 的 Pure）。
-毒值的值项仍是数学结果，所以 index 的值域公理写成“毒值 ∨ 在范围内”。
+值恒在目标位宽 IW 的有符号范围内：结果按 2^IW 回绕（L17″，第 21 轮依 LangRef 更正；第 6–20 轮的 L17′ 把溢出当毒值，
+比 MLIR 弱，会把导入程序的确定行为改成毒值）；只有 nsw/nuw 标志使溢出成为毒值。
 scf.for：静态小循环精确展开；其余用“按结构命名的未解释函数”做摘要（L18，确定性 ⇒ 嵌套 ≡ 内联仍成立），
 可用声明的不变式收窄，不变式在定义期做归纳检查，通过后作为公理进入摘要（L19）。见 spec/loops.md。
 运行：PYTHONPATH=model python3 model/core.py
@@ -20,7 +20,8 @@ TOP = 'Unknown'                       # 未建模效应
 _n = itertools.count()
 def fv(h): return f'{re.sub(r"[^A-Za-z0-9]", "_", h)}_{next(_n)}'
 IW = 64                               # 目标的 index 位宽（超出 ⇒ 毒值）
-IXOVF = 'poison'                      # index 溢出的语义：'poison'（L17′，默认）| 'ub'（旧 L17，只为对照保留）
+IXOVF = 'wrap'                        # index 溢出的语义：'wrap'（L17″，LangRef：按 2^IW 取模，默认）| 'poison'（L17′，第 6–20 轮）| 'ub'（旧 L17）；后两者只为对照保留
+NSW = True                            # nsw 标志的毒值条件（第 21 轮前漏建模：nsw 被忽略，模型比 MLIR 更“有定义”，不可靠）
 KUNROLL = 64                          # 静态循环精确展开的上限
 def is_int(t): return isinstance(t, str) and re.fullmatch(r'i\d+', t) is not None
 def hi(t): return (1 << W(t)) - 1
@@ -86,17 +87,25 @@ def nat(name, ins, outs, fn, eff=frozenset()):
     return reg(Schema(name, ins, outs, fn, frozenset(eff), trust={'值层/效应': 'authored', '结构': 'ods'}))
 I3 = 'i3'
 def _ixub(r, px, py): return z3.And(z3.Not(px), z3.Not(py), ovf(r)) if IXOVF == 'ub' else F_
-def _ixp(r): return ovf(r) if IXOVF == 'poison' else F_                      # index 溢出 ⇒ 毒值（L17′）
+def _ixp(r): return ovf(r) if IXOVF == 'poison' else F_                      # 对照：index 溢出 ⇒ 毒值（L17′）
+def wrapix(r, mul=False):
+    """L17″：index 结果按 IW 位补码回绕（LangRef：结果为数学值 mod 2^n）。加减的输入在范围内，至多越界一次；乘法用取模。"""
+    if IXOVF != 'wrap': return r
+    if mul: return S(r % (1 << IW))
+    return z3.If(r >= HI, r - (1 << IW), z3.If(r < LO, r + (1 << IW), r))
+def nsw(p): return zb(p.get('nsw', False)) if NSW else F_
 def _add(p, a):
     (x, px), (y, py) = a
     nuw = zb(p.get('nuw', False))
-    if is_ix(x): r = x + y; return [(r, z3.Or(px, py, _ixp(r), z3.And(nuw, U(x) + U(y) >= 1 << IW)))], _ixub(r, px, py)
-    return [(x + y, z3.Or(px, py, z3.And(nuw, z3.Not(z3.BVAddNoOverflow(x, y, False)))))], F_
+    if is_ix(x): r = x + y; return [(wrapix(r), z3.Or(px, py, _ixp(r), z3.And(nsw(p), ovf(r)), z3.And(nuw, U(x) + U(y) >= 1 << IW)))], _ixub(r, px, py)
+    sov = z3.Or(z3.Not(z3.BVAddNoOverflow(x, y, True)), z3.Not(z3.BVAddNoUnderflow(x, y)))
+    return [(x + y, z3.Or(px, py, z3.And(nsw(p), sov), z3.And(nuw, z3.Not(z3.BVAddNoOverflow(x, y, False)))))], F_
 def _sub(p, a):
     (x, px), (y, py) = a
     nuw = zb(p.get('nuw', False))
-    if is_ix(x): r = x - y; return [(r, z3.Or(px, py, _ixp(r), z3.And(nuw, U(x) < U(y))))], _ixub(r, px, py)
-    return [(x - y, z3.Or(px, py, z3.And(nuw, z3.ULT(x, y))))], F_
+    if is_ix(x): r = x - y; return [(wrapix(r), z3.Or(px, py, _ixp(r), z3.And(nsw(p), ovf(r)), z3.And(nuw, U(x) < U(y))))], _ixub(r, px, py)
+    sov = z3.Or(z3.Not(z3.BVSubNoOverflow(x, y)), z3.Not(z3.BVSubNoUnderflow(x, y, True)))
+    return [(x - y, z3.Or(px, py, z3.And(nsw(p), sov), z3.And(nuw, z3.ULT(x, y))))], F_
 def _div(p, a):
     (x, px), (y, py) = a
     if is_ix(x): return [(S(U(x) / U(y)), px)], z3.Or(py, y == 0)
@@ -128,8 +137,10 @@ def _bin(f, ovfc=None):
         if is_ix(x):                                              # index 上的位运算：经 IW 位向量
             if ovfc is None: return [(z3.BV2Int(f(z3.Int2BV(x, IW), z3.Int2BV(y, IW)), True), z3.Or(px, py))], F_
             r = x * y                                             # muli
-            return [(r, z3.Or(px, py, _ixp(r), z3.And(zb(p.get('nuw', False)), U(x) * U(y) >= 1 << IW)))], _ixub(r, px, py)
-        return [(f(x, y), z3.Or(px, py, z3.And(zb(p.get('nuw', False)), ovfc(x, y)) if ovfc else F_))], F_
+            return [(wrapix(r, True), z3.Or(px, py, _ixp(r), z3.And(nsw(p), ovf(r)), z3.And(zb(p.get('nuw', False)), U(x) * U(y) >= 1 << IW)))], _ixub(r, px, py)
+        if ovfc is None: return [(f(x, y), z3.Or(px, py))], F_
+        sov = z3.Or(z3.Not(z3.BVMulNoOverflow(x, y, True)), z3.Not(z3.BVMulNoUnderflow(x, y)))
+        return [(f(x, y), z3.Or(px, py, z3.And(nsw(p), sov), z3.And(zb(p.get('nuw', False)), ovfc(x, y))))], F_
     return g
 nat('arith.muli', [('lhs', I3), ('rhs', I3)], [('r', I3)], _bin(lambda x, y: x * y, lambda x, y: z3.Not(z3.BVMulNoOverflow(x, y, False))))
 nat('arith.andi', [('lhs', I3), ('rhs', I3)], [('r', I3)], _bin(lambda x, y: x & y))
@@ -140,14 +151,17 @@ def _cast(kind):
         (x, px), t = a[0], outty(p)
         if kind == 'trunci': return [(z3.Extract(W(t) - 1, 0, x), px)], F_
         if kind in ('extui', 'extsi'): return [((z3.ZeroExt if kind == 'extui' else z3.SignExt)(W(t) - x.size(), x), px)], F_
-        if t == 'index':                                                              # iN → index：有/无符号扩展
-            r = z3.BV2Int(x, kind == 'index_cast'); ORIG[r.get_id()] = (r, x, kind == 'index_cast'); return [(r, px)], F_
+        if t == 'index':                                                              # iN → index：有/无符号扩展；宽于 IW 时截断
+            if x.size() > IW: x = z3.Extract(IW - 1, 0, x)
+            r = z3.BV2Int(x, kind == 'index_cast')
+            if kind == 'index_castui' and x.size() == IW: r = S(r)                   # 满宽无符号读出须回到 IW 位有符号表示
+            ORIG[r.get_id()] = (r, x, kind == 'index_cast'); return [(r, px)], F_
         o = ORIG.get(x.get_id())                # index → iN 直接作用在 iN → index 上：在位向量里化简（ℤ↔位向量混合是 z3 的弱点）
-        if o is not None and o[0].eq(x):        # 按项本身比较（AST id 会被回收复用；表里留着引用也防止回收）
+        if o is not None and o[0].eq(x) and W(t) <= IW:        # 按项本身比较（AST id 会被回收复用；表里留着引用也防止回收）
             _, y, sg = o; w = W(t)
             r = z3.Extract(w - 1, 0, y) if w <= y.size() else (z3.SignExt if sg else z3.ZeroExt)(w - y.size(), y)
             return [(r, px)], F_
-        return [(z3.Int2BV(x, W(t)), px)], F_                                         # index → iN：截断
+        return [(z3.Int2BV(U(x) if kind == 'index_castui' else x, W(t)), px)], F_    # index → iN：截断；更宽时 index_castui 零扩展、index_cast 符号扩展
     return g
 for k in ('trunci', 'extui', 'extsi', 'index_cast', 'index_castui'):
     nat(f'arith.{k}', [('in', 'T')], [('r', 'T2')], _cast(k))
