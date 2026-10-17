@@ -23,7 +23,7 @@
   - 例：`extract(x, i)` 需要守卫；`extract(splat:8, 5)` 不需要；`slice(x, 0, dim x)` 不需要。
   - tensor.dim 在维下标未知时也可推测，比 MLIR 更强（MLIR 在这种情形下返回 NotSpeculatable）。
 
-## 3 修订：L17 → L17′（index 溢出由 UB 改为毒值）
+## 3 修订：L17 → L17′（index 溢出由 UB 改为毒值）；第 21 轮再更正为 L17″（回绕，laws.md §2），S3 融合、S4 可推测、S6 361/361 在 L17″ 下不变
 - 原 L17 下，index 上的 addi 不可推测，而 MLIR 把 addi 标为 Pure，前端因此弱于 MLIR。
 - 原 L17 下，`slice(slice(x,o1,n1),o2,n2) → slice(x, o1+o2, n2)` 也不成立：内层越界只产生毒值，而 o1+o2 溢出却是 UB。
 - 改为毒值后两者都成立；保留 `core.IXOVF = 'ub'` 只为做对照。
