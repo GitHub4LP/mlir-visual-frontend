@@ -103,6 +103,12 @@ class Verifier:
         except BrokenPipeError: line = ''
         if not line: s.p.wait(); s.stats['崩溃'] += 1; return 'crash', ''
         return tuple(json.loads(line))
+    def close(s):
+        """第 24 轮：显式关闭 verifier 子进程（此前依赖解释器退出回收）。"""
+        if s.p is not None and s.p.poll() is None:
+            try: s.p.stdin.close(); s.p.wait(timeout=5)
+            except Exception: s.p.kill()
+        s.p = None
 _V = []
 def get():
     if not _V: _V.append(Verifier())
