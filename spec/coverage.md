@@ -40,7 +40,7 @@
 ## D 语义与效应
 | # | 机制 | 元模型落点 | 强度 | 状态 | 证据或缺口 |
 |---|---|---|---|---|---|
-| 22 | UB 与毒值 | 值层（QF_BV） | E | ◐ | 第 21 轮降级：T1 900/900 是自证（C）；外部审计 sem_test 只覆盖 arith 整数子集（V1 JIT、V3 int-range-optimizations 1500/1500），并抓出 nsw 漏建模（旧语义反例 22）；L6 复合摘要仍 C |
+| 22 | UB 与毒值 | 值层（QF_BV） | E | ◐ | 第 21 轮降级：T1 900/900 是自证（C）；外部审计 sem_test 只覆盖 arith 整数子集（V1 JIT、V3 int-range-optimizations 1500/1500），并抓出 nsw 漏建模（旧语义反例 22）；L6 复合摘要仍 C；第 23 轮（values.md）：移位/divsi/remsi/remui/exact/trunci 标志补上；属性账 S0 缺口 0；IW∈{32,64} 对照 JIT 反例 0 |
 | 23 | Speculatable | caps 派生（含毒值输入） | E | ◐ | 第 21 轮降级：只有 X3 自证（C）；未与 MLIR 的 getSpeculatability 差分 |
 | 24 | MemoryEffects | compose_eff | S | ◐ | 第 21 轮降级：L7 只有自证（C）；llvm.ptr 的别名是 S |
 | 25 | Resource、Target 细分 | effect 三元组 | S | ◐ | 只有 Default |
@@ -80,7 +80,7 @@
 | 46 | Bytecode、版本、升级 | 节点库版本与迁移 | ✗ | |
 | 47 | 文本格式、OpAsmInterface、自定义汇编 | — | — | 前端有自己的表示，只需要通用形式发射 |
 | 48 | ExecutionEngine、到 LLVM 的降级 | ⟦·⟧ | ◐ | vslice 端到端 |
-| 49 | WASM 目标 | ⟦·⟧ | ✗ | |
+| 49 | WASM 目标 | ⟦·⟧ | ✗ | 第 23 轮先行发现（L50）：MLIR 的 index 折叠在 32 位 index 下误编译 ⇒ 面向 wasm32 须先把 index 降为 i32 |
 
 ## H 编辑期（标准 3，MLIR 没有对应）
 | # | 机制 | 状态 | 证据或缺口 |
