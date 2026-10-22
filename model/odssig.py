@@ -191,8 +191,8 @@ def check(S, ins, outs, levels=('ods', 'cpred')):
                         any(a[0] == 'res' or a[0] == 'name' and a[1] not in [n for n, *_ in S['ins']] for a in x[1])): continue
         groups = [get(a) for a in x[1]]; ts = [t for g in groups for t in g]
         if k == 'samec_all':
-            al = opd + res
-            ok = all(E(a) == E(b) and compat_shape(a, b) and a[0] == b[0] for a, b in itertools.combinations(al, 2))
+            al = opd + res; ref = (res or opd)[:1]                # 第 24 轮：MLIR 的 verifySameOperandsAndResultType 逐个对照 result(0)，不是两两
+            ok = all(E(a) == E(r) and compat_shape(a, r) and a[0] == r[0] for r in ref for a in al)
             ok = ok and len({encoding(t) for t in al if t[0] == 'tensor'}) <= 1      # 第 22 轮：verifySameOperandsAndResultType 要求编码相同
         elif k == 'same_ops': ok = all(a == opd[0] for a in opd)
         elif k == 'shape_ops': ok = all(compat_shape(a, b) for a, b in itertools.combinations(opd, 2))
