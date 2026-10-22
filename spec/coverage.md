@@ -50,7 +50,7 @@
 | 29 | RegionBranchOpInterface | scf.if 守卫；R8 控制流边类型 | E | ◐ | 第 15 轮更正：R8 只覆盖 func/scf.if/scf.for/scf.execute_region（3949 实例），scf.while、scf.parallel、tensor.pad 等 914 实例的边类型是 C++（declared），交预言机；Z2 漏判 57 全在此（obligations.md） |
 | 30 | Call、Callable | S4；复合 op 调用 = 代换 | E | ◐ | func.call 的值层未建模 |
 | 31 | 递归 | 必须声明签名 | D | ✗ | |
-| 52 | 泛型复合 op（接口约束的多态） | Φ = 有拒绝权的层逐节点判定 + ODS 前推推断（composite.py，L25/L46/L47） | E | ◐ | 第 22 轮：语料抽取的复合 op（19 方言）10703 + 40681 例 Φ_full ≡ MLIR；端口投影（L27）仍在 typesig 上；值层仍单态化；接口约束的多态未做 |
+| 52 | 泛型复合 op（接口约束的多态） | Φ = 有拒绝权的层逐节点判定 + ODS 前推推断（composite.py，L25/L46/L47） | E | ◐ | 第 22 轮：语料抽取的复合 op（19 方言）10703 + 40681 例 Φ_full ≡ MLIR；端口投影（L27）第 24 轮改到 Φ_ods（composite.project），真实切片 24070 候选不可靠 0；值层仍单态化；接口约束的多态未做 |
 
 ## E 扩展机制
 | # | 机制 | 元模型落点 | 强度 | 状态 | 证据或缺口 |
