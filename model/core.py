@@ -21,6 +21,13 @@ _n = itertools.count()
 def fv(h): return f'{re.sub(r"[^A-Za-z0-9]", "_", h)}_{next(_n)}'
 IW = 64                               # 目标的 index 位宽（超出 ⇒ 毒值）
 IXOVF = 'wrap'                        # index 溢出的语义：'wrap'（L17″，LangRef：按 2^IW 取模，默认）| 'poison'（L17′，第 6–20 轮）| 'ub'（旧 L17）；后两者只为对照保留
+REMSI_MIN = 'langref'                 # remsi(INT_MIN, -1)：'langref'（LangRef 只规定除 0 为 UB，MLIR 折叠器给 0）| 'ub'（降到 llvm.srem 后为 UB）。
+                                      # MLIR 自身不一致 ⇒ 语义参数，证明须对两种取值都成立（L49，第 23 轮）
+FLAGS_EXT = True                      # 第 23 轮：exact（divui/divsi/shrui/shrsi）与 trunci 的 nsw/nuw；False 只为对照（第 22 轮前的语义）
+def set_iw(w):
+    """index 位宽是目标参数（LangRef：由数据布局决定）。L49：值层事实须对 IW ∈ {32, 64} 都成立；改了 IW 须重新推导摘要。"""
+    global IW, LO, HI
+    IW, LO, HI = w, -(1 << (w - 1)), 1 << (w - 1)
 NSW = True                            # nsw 标志的毒值条件（第 21 轮前漏建模：nsw 被忽略，模型比 MLIR 更“有定义”，不可靠）
 KUNROLL = 64                          # 静态循环精确展开的上限
 def is_int(t): return isinstance(t, str) and re.fullmatch(r'i\d+', t) is not None
@@ -83,8 +90,15 @@ def anyp(a): return z3.Or([p for _, p in a]) if a else F_
 # ───────────────────────── 原生 op（语义为人工覆盖层，结构取自 structure.STRUCT）
 REG = {}
 def reg(s): REG[s.name] = s; return s
-def nat(name, ins, outs, fn, eff=frozenset()):
-    return reg(Schema(name, ins, outs, fn, frozenset(eff), trust={'值层/效应': 'authored', '结构': 'ods'}))
+def nat(name, ins, outs, fn, eff=frozenset(), reads=None):
+    """reads：语义读取的参数名。节点带有不在 reads 里的参数（且非 False）⇒ 值层拒绝给出事实（ValueUnknown），不静默忽略。
+    第 21 轮的 nsw、第 23 轮的 exact / trunci 标志都是“参数存在、语义不读”的不可靠缺陷；sem_test S0 把 reads 与 ODS 属性对账。
+    reads=None：未对账（tensor/memref 覆盖层，参数是 core 自己的记法），S0 单列。"""
+    s = reg(Schema(name, ins, outs, fn, frozenset(eff), trust={'值层/效应': 'authored', '结构': 'ods'}))
+    s.reads = None if reads is None else frozenset(reads)
+    return s
+GENERIC_PROPS = {'__out', 'type', '_types', '_succ_opaque'}
+ATTR_MAP = {'overflowFlags': ('nsw', 'nuw'), 'isExact': ('exact',), 'predicate': ('predicate',), 'value': ('value',)}   # MLIR 属性 → core 参数
 I3 = 'i3'
 def _ixub(r, px, py): return z3.And(z3.Not(px), z3.Not(py), ovf(r)) if IXOVF == 'ub' else F_
 def _ixp(r): return ovf(r) if IXOVF == 'poison' else F_                      # 对照：index 溢出 ⇒ 毒值（L17′）
@@ -108,8 +122,9 @@ def _sub(p, a):
     return [(x - y, z3.Or(px, py, z3.And(nsw(p), sov), z3.And(nuw, z3.ULT(x, y))))], F_
 def _div(p, a):
     (x, px), (y, py) = a
-    if is_ix(x): return [(S(U(x) / U(y)), px)], z3.Or(py, y == 0)
-    return [(z3.UDiv(x, y), px)], z3.Or(py, y == 0)               # 除数为 0 或毒值 ⇒ UB
+    ex = zb(p.get('exact', False)) if FLAGS_EXT else F_
+    if is_ix(x): return [(S(U(x) / U(y)), z3.Or(px, z3.And(ex, U(x) % U(y) != 0)))], z3.Or(py, y == 0)
+    return [(z3.UDiv(x, y), z3.Or(px, z3.And(ex, z3.URem(x, y) != 0)))], z3.Or(py, y == 0)     # 除数为 0 或毒值 ⇒ UB；exact 且不整除 ⇒ 毒值（第 23 轮）
 PRED = ['eq', 'ne', 'slt', 'sle', 'sgt', 'sge', 'ult', 'ule', 'ugt', 'uge']   # arith::CmpIPredicate 的编号
 def _cmp(p, a):
     (x, px), (y, py) = a
@@ -124,13 +139,13 @@ def _sel(p, a):
 _pz = itertools.count()
 def _poison(p, a):
     return [(z3.FreshConst(zsort(outty(p)), 'poison'), T_)], F_
-nat('arith.constant', [], [('r', I3)], lambda p, a: ([(zbv(p['value'], p.get('type') or outty(p)), F_)], F_))
-nat('arith.addi', [('lhs', I3), ('rhs', I3)], [('r', I3)], _add)
-nat('arith.subi', [('lhs', I3), ('rhs', I3)], [('r', I3)], _sub)
-nat('arith.divui', [('lhs', I3), ('rhs', I3)], [('r', I3)], _div)
-nat('arith.cmpi', [('lhs', I3), ('rhs', I3)], [('r', 'i1')], _cmp)
-nat('arith.select', [('c', 'i1'), ('a', I3), ('b', I3)], [('r', I3)], _sel)
-nat('ub.poison', [], [('r', I3)], _poison)
+nat('arith.constant', [], [('r', I3)], lambda p, a: ([(zbv(p['value'], p.get('type') or outty(p)), F_)], F_), reads=('value',))
+nat('arith.addi', [('lhs', I3), ('rhs', I3)], [('r', I3)], _add, reads=('nsw', 'nuw'))
+nat('arith.subi', [('lhs', I3), ('rhs', I3)], [('r', I3)], _sub, reads=('nsw', 'nuw'))
+nat('arith.divui', [('lhs', I3), ('rhs', I3)], [('r', I3)], _div, reads=('exact',))
+nat('arith.cmpi', [('lhs', I3), ('rhs', I3)], [('r', 'i1')], _cmp, reads=('predicate',))
+nat('arith.select', [('c', 'i1'), ('a', I3), ('b', I3)], [('r', I3)], _sel, reads=())
+nat('ub.poison', [], [('r', I3)], _poison, reads=())
 def _bin(f, ovfc=None):
     def g(p, a):
         (x, px), (y, py) = a
@@ -142,14 +157,52 @@ def _bin(f, ovfc=None):
         sov = z3.Or(z3.Not(z3.BVMulNoOverflow(x, y, True)), z3.Not(z3.BVMulNoUnderflow(x, y)))
         return [(f(x, y), z3.Or(px, py, z3.And(nsw(p), sov), z3.And(zb(p.get('nuw', False)), ovfc(x, y))))], F_
     return g
-nat('arith.muli', [('lhs', I3), ('rhs', I3)], [('r', I3)], _bin(lambda x, y: x * y, lambda x, y: z3.Not(z3.BVMulNoOverflow(x, y, False))))
-nat('arith.andi', [('lhs', I3), ('rhs', I3)], [('r', I3)], _bin(lambda x, y: x & y))
-nat('arith.ori', [('lhs', I3), ('rhs', I3)], [('r', I3)], _bin(lambda x, y: x | y))
-nat('arith.xori', [('lhs', I3), ('rhs', I3)], [('r', I3)], _bin(lambda x, y: x ^ y))
+nat('arith.muli', [('lhs', I3), ('rhs', I3)], [('r', I3)], _bin(lambda x, y: x * y, lambda x, y: z3.Not(z3.BVMulNoOverflow(x, y, False))), reads=('nsw', 'nuw'))
+nat('arith.andi', [('lhs', I3), ('rhs', I3)], [('r', I3)], _bin(lambda x, y: x & y), reads=())
+nat('arith.ori', [('lhs', I3), ('rhs', I3)], [('r', I3)], _bin(lambda x, y: x | y), reads=())
+nat('arith.xori', [('lhs', I3), ('rhs', I3)], [('r', I3)], _bin(lambda x, y: x ^ y), reads=())
+
+# ── 第 23 轮：移位、有符号除法、取余（LangRef 原文见 spec/values.md）。index 经 IW 位向量计算
+def _bvop(f):
+    """f(p, x, y, w) -> (值, 额外毒值, UB(py))，x/y 为 w 位位向量。index 操作数转 IW 位向量，结果有符号读回。"""
+    def g(p, a):
+        (x, px), (y, py) = a
+        if is_ix(x):
+            r, pz, ub = f(p, z3.Int2BV(x, IW), z3.Int2BV(y, IW), IW)
+            return [(z3.BV2Int(r, True), z3.Or(px, py, pz))], ub(py)
+        r, pz, ub = f(p, x, y, x.size())
+        return [(r, z3.Or(px, py, pz))], ub(py)
+    return g
+def _ex(p): return zb(p.get('exact', False)) if FLAGS_EXT else F_
+def _shl(p, x, y, w):
+    r = x << y; big = z3.UGE(y, w)
+    nsw_, nuw_ = (nsw(p), zb(p.get('nuw', False))) if FLAGS_EXT else (F_, F_)
+    return r, z3.Or(big, z3.And(nsw_, (r >> y) != x), z3.And(nuw_, z3.LShR(r, y) != x)), lambda py: F_
+def _shr(arith):
+    def f(p, x, y, w):
+        r = (x >> y) if arith else z3.LShR(x, y); big = z3.UGE(y, w)
+        return r, z3.Or(big, z3.And(_ex(p), (r << y) != x)), lambda py: F_
+    return f
+def _divsi(p, x, y, w):
+    mn = z3.BitVecVal(1 << (w - 1), w); m1 = z3.BitVecVal(-1, w)
+    return x / y, z3.And(_ex(p), z3.SRem(x, y) != 0), lambda py: z3.Or(py, y == 0, z3.And(x == mn, y == m1))
+def _remui(p, x, y, w): return z3.URem(x, y), F_, lambda py: z3.Or(py, y == 0)
+def _remsi(p, x, y, w):
+    mn = z3.BitVecVal(1 << (w - 1), w); m1 = z3.BitVecVal(-1, w)
+    return z3.SRem(x, y), F_, lambda py: z3.Or(py, y == 0, z3.And(x == mn, y == m1) if REMSI_MIN == 'ub' else F_)
+nat('arith.shli', [('lhs', I3), ('rhs', I3)], [('r', I3)], _bvop(_shl), reads=('nsw', 'nuw'))
+nat('arith.shrui', [('lhs', I3), ('rhs', I3)], [('r', I3)], _bvop(_shr(False)), reads=('exact',))
+nat('arith.shrsi', [('lhs', I3), ('rhs', I3)], [('r', I3)], _bvop(_shr(True)), reads=('exact',))
+nat('arith.divsi', [('lhs', I3), ('rhs', I3)], [('r', I3)], _bvop(_divsi), reads=('exact',))
+nat('arith.remui', [('lhs', I3), ('rhs', I3)], [('r', I3)], _bvop(_remui), reads=())
+nat('arith.remsi', [('lhs', I3), ('rhs', I3)], [('r', I3)], _bvop(_remsi), reads=())
 def _cast(kind):
     def g(p, a):
         (x, px), t = a[0], outty(p)
-        if kind == 'trunci': return [(z3.Extract(W(t) - 1, 0, x), px)], F_
+        if kind == 'trunci':
+            r = z3.Extract(W(t) - 1, 0, x); w = x.size() - W(t)
+            if not FLAGS_EXT: return [(r, px)], F_
+            return [(r, z3.Or(px, z3.And(nsw(p), z3.SignExt(w, r) != x), z3.And(zb(p.get('nuw', False)), z3.ZeroExt(w, r) != x)))], F_   # 第 23 轮
         if kind in ('extui', 'extsi'): return [((z3.ZeroExt if kind == 'extui' else z3.SignExt)(W(t) - x.size(), x), px)], F_
         if t == 'index':                                                              # iN → index：有/无符号扩展；宽于 IW 时截断
             if x.size() > IW: x = z3.Extract(IW - 1, 0, x)
@@ -164,7 +217,7 @@ def _cast(kind):
         return [(z3.Int2BV(U(x) if kind == 'index_castui' else x, W(t)), px)], F_    # index → iN：截断；更宽时 index_castui 零扩展、index_cast 符号扩展
     return g
 for k in ('trunci', 'extui', 'extsi', 'index_cast', 'index_castui'):
-    nat(f'arith.{k}', [('in', 'T')], [('r', 'T2')], _cast(k))
+    nat(f'arith.{k}', [('in', 'T')], [('r', 'T2')], _cast(k), reads=('nsw', 'nuw') if k == 'trunci' else ())
 ORIG = {}
 
 # ───────────────────────── 形状层（第 6 轮）
@@ -332,6 +385,9 @@ class Ctx:
                 outs, ub = instantiate(sch, pr, args); s.ax.append(inst_ax(sch, pr, args))
                 for k, ((_, pty), (av, ap)) in enumerate(zip(sch.ins, args)): s.static_check(f"{n['id']}#{k}", av, ap, pty, g)   # 调用点义务
             else:
+                if getattr(sch, 'reads', None) is not None:
+                    unread = {k for k, v in pr.items() if k not in GENERIC_PROPS and v is not False and k not in sch.reads}
+                    if unread: raise ValueUnknown(f'{op}：参数 {sorted(unread)} 值层未建模（不静默忽略，第 23 轮）')
                 outs, ub = sch.fn(pr, args)
                 md = _mlir_def(op, args, pr['__out']) if op.startswith('tensor.') else None
                 if md is not None: s.guards.append((n['id'], z3.Implies(z3.And(g, z3.Not(_anyp(args))), md)))
