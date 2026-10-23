@@ -97,3 +97,14 @@ PYTHONPATH=model python3 model/irdl_boundary_test.py
 ```
 PYTHONPATH=model python3 model/valimport_test.py 300    # 需 corpus/，约 10 分钟
 ```
+
+## 第 26 轮：L18 循环摘要的名字漏了参数（spec/loops.md §7）
+- 循环体里的复合 op 参数 `$k` 既不进名字，也不进实参，于是 `addk<1>(n) ≡ addk<2>(n)` 被“证明”（JIT 反驳）。语义开关（IW 等）也不进名字。
+- 修正为 L18′：参数改为实参，语义开关进名字。
+- 结果：
+  - 回归：修后不再误证；
+  - MLIR 文本证伪审计：有效变异 458 个，误证 0；
+  - 相同结构可证率：342/342。
+```
+PYTHONPATH=model python3 model/loopsum_test.py 800    # 约 5 分钟
+```
