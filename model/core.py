@@ -355,6 +355,7 @@ def is_comp(sch): return sch.body is not None
 class Ctx:
     def __init__(s, params=None):
         s.env, s.ub, s.eff, s.exact, s.params, s.ax, s.diag = {}, F_, [], True, params or {}, [], []
+        s.owner, s.hole_sum = '', set()   # 第 27 轮：洞的项按（所属定义, hid）命名；被循环摘要吞掉的洞（L20 代换对它无效）
         s.wf, s.guards = [], []       # L22 静态维的证明义务、L24 降低到 MLIR 的守卫义务：[(节点, 公式)]
     def static_check(s, nid, v, pv, ty, g):
         """L22：边上的静态维不符 ⇒ 毒值；同时立义务“非毒值时成立”。返回新的毒值标志。"""
@@ -381,6 +382,7 @@ class Ctx:
                     s.env[o] = (z3.If(c == 1, tv, ev), z3.Or(pc, z3.If(c == 1, tp, ep)))
                 continue
             if op == 'scf.for': s.loop(n, g, path); continue
+            if op == 'edit.hole': s.hole(n); continue
             sch = REG.get(op)
             if sch is None or not sch.value_known: raise ValueUnknown(op)
             args = [s.env.get(v, (None, F_)) for v in n['ins']]
@@ -410,11 +412,23 @@ class Ctx:
         """在调用点按实参重新推导体（独立的 Ctx：体内命名不会与宿主冲突）。UB 只在本路径上算数，由调用方以 g 守卫。"""
         sub = Ctx({nm: (z3.IntVal(pr[nm]) if isinstance(pr.get(nm), int) and not isinstance(pr.get(nm), bool) else zb(pr[nm])) if nm in pr else sch.pconsts[nm]
                    for nm, _ in sch.params})
+        sub.owner = sch.name
         for (v, _), a in zip(sch.body[0]['args'], args): sub.env[v] = a
         ys = sub.walk(sch.body, T_, path)
-        s.ax += sub.ax; s.diag += sub.diag; s.exact &= sub.exact
+        s.ax += sub.ax; s.diag += sub.diag; s.exact &= sub.exact; s.hole_sum |= {(o, h) for o, h in sub.hole_sum}
         return ys, sub.ub
 
+    def hole(s, n):
+        """第 27 轮（L20′）：洞的最终内容是它所在环境的函数（Hazel 的闭包语义），不是与环境无关的自由常量。
+        旧实现用常量 hole.{hid}：同一定义被调用两次时两处洞值相同 ⇒ f(a) ≡ f(b) 被“证明”；两个定义里同 hid 的洞被当成同一个。
+        现在：值/毒值 = 以（定义名, hid）命名的未解释函数，作用于此处已定义的全部值（超集，只会更保守）。"""
+        hid = n['props']['hid']; t = n['outs'][0][1]
+        ctx = [x for v in s.env.values() for x in v if x is not None]
+        nm = hole_name(s.owner, hid)
+        so = zsort(t)
+        val = z3.Function(nm, *[x.sort() for x in ctx], so)(*ctx) if ctx else z3.Const(nm, so)
+        poi = z3.Function(nm + '.Z', *[x.sort() for x in ctx], z3.BoolSort())(*ctx) if ctx else z3.Bool(nm + '.Z')
+        s.env[n['outs'][0][0]] = (val, poi)
     def loop(s, n, g, path):
         """scf.for。步长 ≤ 0 或边界是毒值 ⇒ UB。静态且趟数 ≤ KUNROLL ⇒ 精确展开；否则摘要（L18、L19）。"""
         (lb, plb), (ub, pub), (st, pst) = [s.env[v] for v in n['ins'][:3]]
@@ -448,6 +462,9 @@ class Ctx:
         pn = param_refs(body)
         args += [s.params[q] if q in s.params else z3.Int(f'?unbound.${q}') for q in pn]
         key = 'loop_' + canon(n) + '_' + sem_tag()
+        hs = hole_refs(body)
+        if hs:                                   # 第 27 轮：体内有洞 ⇒ 摘要名带所属定义（否则两个定义的同形洞循环被当成同一函数）；L20 代换看不进摘要
+            key += '_' + re.sub(r'[^A-Za-z0-9_]', '_', s.owner); s.hole_sum |= {(s.owner, h) for h in hs}
         nonempty = lb < ub
         def F(nm, rng):
             if pure:
@@ -488,6 +505,18 @@ def free_vals(blocks, bound):
                 for r in n['regions']: sc(r)
                 defd.update(o for o, _ in n['outs'])
     sc(blocks); return out
+def port_name(name, i, p, tag=''):
+    """端口占位项的名字：长度前缀 + 位置，保证单射（旧的 f'{name}.{p}' 下，定义 'a.b' 的端口 c 与定义 'a' 的端口 b.c 同名）。"""
+    return f'{len(name)}:{name}.{tag}{i}.{p}'
+def hole_name(owner, hid): return f'hole.{len(owner)}:{owner}.{hid}'
+def hole_refs(blocks):
+    out = set()
+    def sc(bs):
+        for b in bs:
+            for x in b['ops']:
+                if x['op'] == 'edit.hole': out.add(x['props']['hid'])
+                for r in x['regions']: sc(r)
+    sc(blocks); return sorted(out)
 def param_refs(blocks):
     """区域里（含嵌套）props 引用的复合 op 参数名（'$k'），按名字排序。"""
     out = set()
@@ -628,6 +657,15 @@ def derive(name, ins, outs, blocks, mode='transparent', params=()):
     """ins/outs: [(端口, 类型)]；blocks: 实现体（入口块参数 = 输入端口）。返回 Schema 并登记。"""
     sch = Schema(name, ins, outs, trust={'*': 'derived'}, body=blocks, mode=mode, params=list(params))
     sch.pconsts = {nm: (z3.Int if k == 'int' else z3.Bool)(f'{name}.${nm}') for nm, k in params}
+    # 第 27 轮：名字是语义身份。重复的端口/参数名会让两个端口共用一个占位项（旧实现“证明”了 x == y）；
+    # 与原生 op 同名的复合 op 会静默覆盖原生语义。两者都拒绝（值层未知 + 诊断），不登记。
+    dup = [x for xs in ([p for p, _ in ins], [p for p, _ in outs], [nm for nm, _ in params]) for x in set(xs) if xs.count(x) > 1]
+    old = REG.get(name)
+    if dup or (old is not None and not is_comp(old)):
+        sch.struct_diag, sch.summary, sch.type_diag = [], None, []
+        sch.name_diag = [f'端口/参数重名 {sorted(set(dup))}'] if dup else [f'复合 op 名 {name} 与原生 op 冲突']
+        sch.value_known, sch.exact = False, False
+        return sch
     # 结构层：把体包成 func 检查 R1–R8，并求结构摘要
     ft = '(' + ', '.join(t for _, t in ins) + ') -> (' + ', '.join(t for _, t in outs) + ')'
     sch.struct_diag = list(ST.check(ST.M(ST.F(name, blocks, ftype=ft))))
@@ -636,11 +674,11 @@ def derive(name, ins, outs, blocks, mode='transparent', params=()):
     if sch.type_diag:
         sch.value_known, sch.exact = False, False
         reg(sch); return sch
-    c = Ctx(sch.pconsts)
+    c = Ctx(sch.pconsts); c.owner = name
     holes = []
-    for (p, ty), (v, _) in zip(ins, blocks[0]['args']):
+    for i, ((p, ty), (v, _)) in enumerate(zip(ins, blocks[0]['args'])):
         so = zsort(ty)
-        h = (z3.Const(f'{name}.{p}', so) if so is not None else None, z3.Bool(f'{name}.Z.{p}'))
+        h = (z3.Const(port_name(name, i, p), so) if so is not None else None, z3.Bool(port_name(name, i, p, 'Z')))
         c.env[v] = h; holes.append(h)
         c.ax.append(wf(h, ty))
         if h[0] is not None: c.env[v] = (h[0], c.static_check(f'入口.{p}', h[0], h[1], ty, T_))
@@ -651,7 +689,7 @@ def derive(name, ins, outs, blocks, mode='transparent', params=()):
         sch.value_known, sch.exact = False, False
         reg(sch); return sch
     sch.holes, sch.outv, sch.ubf = holes, [(z3.simplify(v) if v is not None else None, z3.simplify(p)) for v, p in ys], z3.simplify(c.ub)
-    sch.wf, sch.guards = c.wf, c.guards
+    sch.wf, sch.guards = c.wf, c.guards; sch.hole_sum = set(c.hole_sum)
     sch.exact = c.exact; sch.ax = z3.simplify(z3.And(c.ax)) if c.ax else T_; sch.loop_diag = c.diag
     sch.env = {v: c.env[v] for v in _toplevel_vals(blocks) if v in c.env}     # 顶层值的项：补全查询用
     boundary = {v: p for (p, _), (v, _) in zip(ins, blocks[0]['args'])} | {v: p for (p, _), v in zip(outs, _term(blocks))}
