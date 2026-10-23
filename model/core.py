@@ -442,7 +442,12 @@ class Ctx:
         bub, s.ub = s.ub, ub0
         pure = len(s.eff) == ne
         args = [lb, ub, st] + [x for v, p in inits for x in (v, p)] + [x for c in caps for x in s.env.get(c, (None, F_)) if x is not None]
-        key = 'loop_' + canon(n)
+        # 第 26 轮（L18′）：摘要函数的名字只编码结构，所以结构之外影响语义的东西必须是实参或进名字——
+        #   复合 op 参数（体内 props 的 '$k'）：此前不在实参里 ⇒ addk<1>(n) ≡ addk<2>(n) 被“证明”（不可靠）；改为实参。
+        #   语义开关（IW、IXOVF、REMSI_MIN、FLAGS_EXT、NSW）：进名字，不同设定的摘要不会被当成同一个函数。
+        pn = param_refs(body)
+        args += [s.params[q] if q in s.params else z3.Int(f'?unbound.${q}') for q in pn]
+        key = 'loop_' + canon(n) + '_' + sem_tag()
         nonempty = lb < ub
         def F(nm, rng):
             if pure:
@@ -483,6 +488,17 @@ def free_vals(blocks, bound):
                 for r in n['regions']: sc(r)
                 defd.update(o for o, _ in n['outs'])
     sc(blocks); return out
+def param_refs(blocks):
+    """区域里（含嵌套）props 引用的复合 op 参数名（'$k'），按名字排序。"""
+    out = set()
+    def sc(bs):
+        for b in bs:
+            for x in b['ops']:
+                for k, v in (x.get('props') or {}).items():
+                    if isinstance(v, str) and v.startswith('$'): out.add(v[1:])
+                for r in x['regions']: sc(r)
+    sc(blocks); return sorted(out)
+def sem_tag(): return f'w{IW}{IXOVF[0]}{REMSI_MIN[0]}{int(FLAGS_EXT)}{int(NSW)}'
 def canon(n):
     """与命名无关的结构键：输入按位置、捕获按首次出现、内部定义按出现顺序编号；不变式不参与（不改变语义）。"""
     import hashlib
