@@ -83,3 +83,17 @@ PYTHONPATH=model python3 model/values_test.py 150 300 120    # 约 15 分钟
 PYTHONPATH=model python3 model/projcorpus_test.py 6 3 6
 PYTHONPATH=model python3 model/irdl_boundary_test.py
 ```
+
+## 第 25 轮：值层吃导入的 MLIR（spec/values.md §8）
+- 此前值层只吃 core 自己的记法，导入的真实 IR 从未进入值层：
+  - arith 一律未知；
+  - tensor 切片的静态偏移被无视，导致崩溃；
+  - 0 维 from_elements、逐元素 cast、i0 也会崩溃。
+- `model/valimport.py`：每个 MLIR 属性只有三种处理——翻译（带条件）、登记为无关、或判为未知（L53）。
+- 对照 JIT 的结果：
+  - 语料函数 1036/1036；
+  - static/动态混合切片 1322/1322；
+  - 变异对照能被抓出。
+```
+PYTHONPATH=model python3 model/valimport_test.py 300    # 需 corpus/，约 10 分钟
+```

@@ -93,7 +93,7 @@ def reg(s): REG[s.name] = s; return s
 def nat(name, ins, outs, fn, eff=frozenset(), reads=None):
     """reads：语义读取的参数名。节点带有不在 reads 里的参数（且非 False）⇒ 值层拒绝给出事实（ValueUnknown），不静默忽略。
     第 21 轮的 nsw、第 23 轮的 exact / trunci 标志都是“参数存在、语义不读”的不可靠缺陷；sem_test S0 把 reads 与 ODS 属性对账。
-    reads=None：未对账（tensor/memref 覆盖层，参数是 core 自己的记法），S0 单列。"""
+    第 25 轮起全部 nat 都已对账（tensor/memref 的 reads=()：MLIR 属性由 valimport 翻译成操作数或判未知）。"""
     s = reg(Schema(name, ins, outs, fn, frozenset(eff), trust={'值层/效应': 'authored', '结构': 'ods'}))
     s.reads = None if reads is None else frozenset(reads)
     return s
@@ -278,7 +278,11 @@ def _fill(p, a, empty):
     es, (dims, e) = _dyn_ext(ty, dyn); iv = _ivars(len(dims))
     return [(mkt(tsort(len(dims), e), es, z3.Lambda(iv, v), z3.Lambda(iv, pv)), z3.Or(_anyp(dyn), *[x < 0 for x, _ in dyn]))], F_
 def _from_elements(p, a):
-    dims, e = tparse(outty(p)); d, pz = z3.K(z3.IntSort(), _zero(e)), z3.K(z3.IntSort(), F_)
+    tp = tparse(outty(p))
+    if tp is None or len(tp[0]) != 1: raise ValueUnknown('tensor.from_elements：结果非 1 维')
+    dims, e = tp
+    if len(dims) != 1: raise ValueUnknown(f'tensor.from_elements：结果秩 {len(dims)} ≠ 1 未建模（第 25 轮：此前按 1 维建模，0 维/多维会错位）')
+    d, pz = z3.K(z3.IntSort(), _zero(e)), z3.K(z3.IntSort(), F_)
     for k, (v, pv) in enumerate(a): d, pz = z3.Store(d, k, v), z3.Store(pz, k, pv)
     return [(mkt(tsort(1, e), [z3.IntVal(len(a))], d, pz), F_)], F_
 def _dim(p, a):
@@ -306,15 +310,15 @@ def _insert_slice(p, a):
 def _tcast(p, a):
     (t, pt), ty = a[0], outty(p)
     return [(mkt(zsort(ty), ext(t), dat(t), tpz(t)), z3.Or(pt, z3.Not(static_ok(t, ty))))], F_
-nat('tensor.splat', [('v', 'E'), ('dyn', 'index*')], [('r', 'tensor')], lambda p, a: _fill(p, a, False))
-nat('tensor.empty', [('dyn', 'index*')], [('r', 'tensor')], lambda p, a: _fill(p, a, True))
-nat('tensor.from_elements', [('vs', 'E*')], [('r', 'tensor')], _from_elements)
-nat('tensor.dim', [('t', 'tensor'), ('i', 'index')], [('r', 'index')], _dim)
-nat('tensor.extract', [('t', 'tensor'), ('idx', 'index*')], [('r', 'E')], _extract)
-nat('tensor.insert', [('v', 'E'), ('t', 'tensor'), ('idx', 'index*')], [('r', 'tensor')], _insert)
-nat('tensor.extract_slice', [('t', 'tensor'), ('offs', 'index*'), ('sizes', 'index*')], [('r', 'tensor')], _extract_slice)
-nat('tensor.insert_slice', [('s', 'tensor'), ('t', 'tensor'), ('offs', 'index*')], [('r', 'tensor')], _insert_slice)
-nat('tensor.cast', [('t', 'tensor')], [('r', 'tensor')], _tcast)
+nat('tensor.splat', [('v', 'E'), ('dyn', 'index*')], [('r', 'tensor')], lambda p, a: _fill(p, a, False), reads=())
+nat('tensor.empty', [('dyn', 'index*')], [('r', 'tensor')], lambda p, a: _fill(p, a, True), reads=())
+nat('tensor.from_elements', [('vs', 'E*')], [('r', 'tensor')], _from_elements, reads=())
+nat('tensor.dim', [('t', 'tensor'), ('i', 'index')], [('r', 'index')], _dim, reads=())
+nat('tensor.extract', [('t', 'tensor'), ('idx', 'index*')], [('r', 'E')], _extract, reads=())
+nat('tensor.insert', [('v', 'E'), ('t', 'tensor'), ('idx', 'index*')], [('r', 'tensor')], _insert, reads=())
+nat('tensor.extract_slice', [('t', 'tensor'), ('offs', 'index*'), ('sizes', 'index*')], [('r', 'tensor')], _extract_slice, reads=())
+nat('tensor.insert_slice', [('s', 'tensor'), ('t', 'tensor'), ('offs', 'index*')], [('r', 'tensor')], _insert_slice, reads=())
+nat('tensor.cast', [('t', 'tensor')], [('r', 'tensor')], _tcast, reads=())
 # MLIR 中这些 op 的良定义条件（不满足即 UB）。降低到 MLIR 时，不能证明它成立的地方要插守卫（L24）。
 def _mlir_def(op, a, outs_ty):
     if op == 'tensor.dim': return z3.And(a[1][0] >= 0, a[1][0] < rank(a[0][0]))
@@ -328,10 +332,10 @@ def _mlir_def(op, a, outs_ty):
     return None
 _ch = itertools.count()
 def _load(p, a): return [(z3.FreshConst(zsort(outty(p)), f'load{next(_ch)}'), F_)], F_   # 读到的内容：非确定（自由变量）
-nat('memref.alloc', [], [('m', 'memref')], lambda p, a: ([(None, F_)], F_), eff={('Allocate', 'Default', 'm')})
-nat('memref.dealloc', [('m', 'memref')], [], lambda p, a: ([], F_), eff={('Free', 'Default', 'm')})
-nat('memref.load', [('m', 'memref')], [('r', I3)], _load, eff={('Read', 'Default', 'm')})
-nat('memref.store', [('v', I3), ('m', 'memref')], [], lambda p, a: ([], F_), eff={('Write', 'Default', 'm')})
+nat('memref.alloc', [], [('m', 'memref')], lambda p, a: ([(None, F_)], F_), eff={('Allocate', 'Default', 'm')}, reads=())
+nat('memref.dealloc', [('m', 'memref')], [], lambda p, a: ([], F_), eff={('Free', 'Default', 'm')}, reads=())
+nat('memref.load', [('m', 'memref')], [('r', I3)], _load, eff={('Read', 'Default', 'm')}, reads=())
+nat('memref.store', [('v', I3), ('m', 'memref')], [], lambda p, a: ([], F_), eff={('Write', 'Default', 'm')}, reads=())
 
 def instantiate(sch, props, args):
     """复合 op 的摘要实例化 = 项代换（嵌套 ≡ 内联的根据）。"""
@@ -365,6 +369,8 @@ class Ctx:
         if len(blocks) != 1: raise ValueUnknown('多块 CFG 的值层尚未建模')
         for n in blocks[0]['ops']:
             op = n['op']
+            if '_attrs' in (n.get('props') or {}):              # 第 25 轮：导入的节点须先经 valimport 翻译；原样属性 ⇒ 无事实（此前 tensor 切片在此崩溃）
+                raise ValueUnknown(f'{op}：导入节点未经 valimport 翻译')
             if op in ('scf.yield', 'func.return'): return [s.env[v] for v in n['ins']]
             if op == 'scf.if':
                 c, pc = s.env[n['ins'][0]]

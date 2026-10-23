@@ -81,5 +81,5 @@
 
 ## 6 当前已知的不足（按 laws.md 的顺序处理）
 - 组合封闭：类型层已有 A 级证据（第 22 轮）；端口投影（L27）第 24 轮改建在 Φ_ods 上，可靠且相对 Φ_ods 完备（A 级）；值层的复合摘要（L6）仍是 C 级。
-- 值层只在 arith 整数子集上做了外部审计。scf、shift、浮点、memref 的语义只有自证。
+- 值层的外部审计覆盖 arith 整数子集、scf.for/if（V7）、tensor 切片（A3）。导入的真实 IR 经 valimport 进入值层（L53，第 25 轮），未翻译的属性 ⇒ 未知。浮点、memref 内容、cf 多块、func.call 仍无值层。
 - 递归、方言注册与版本、transform 方言、DataFlow、bytecode、WASM：coverage 里是 ✗。
