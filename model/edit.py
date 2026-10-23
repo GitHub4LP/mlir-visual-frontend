@@ -121,8 +121,15 @@ def delete(ws, name, nid):
         for m in ops: _replace(m, o, hid)
     return hs
 def fill(ws, name, hid, v):
-    ops = _ops(ws, name); ops.pop(_idx(ops, hid))
-    for m in ops: _replace(m, hid, v)
+    """填洞：删去洞节点（可在嵌套区域里，第 27 轮），所有使用改连到 v。"""
+    def rm(bs):
+        for b in bs:
+            for i, m in enumerate(b['ops']):
+                if m['id'] == hid and m['op'] == 'edit.hole': b['ops'].pop(i); return True
+                if any(rm(r) for r in m['regions']): return True
+        return False
+    rm(ws.defs[name]['blocks'])
+    for m in _ops(ws, name): _replace(m, hid, v)
 def _replace(n, a, b):
     n['ins'] = [b if x == a else x for x in n['ins']]
     for r in n['regions']:
@@ -134,10 +141,20 @@ _u = [0]
 def _uid(): _u[0] += 1; return _u[0]
 
 # ───────────────────────── L20：连接洞 = 项代换；补全
-def subst_fill(sch, hid, v_term, p_term):
-    """不重推导：把摘要里的洞代换为候选值的项（候选的项取自 sch.env）。"""
-    h, hz = z3.Const(f'hole.{hid}', v_term.sort()), z3.Bool(f'hole.Z.{hid}')
-    sub = lambda t: z3.substitute(t, [(h, v_term), (hz, p_term)])
+def _apps(t, names, acc):
+    if z3.is_app(t):
+        if t.decl().name() in names and t.decl().kind() == z3.Z3_OP_UNINTERPRETED: acc.add(t)
+        for c in t.children(): _apps(c, names, acc)
+    return acc
+def subst_fill(sch, hid, v_term, p_term, _unsafe=False):
+    """不重推导：把摘要里洞的每一处出现（第 27 轮起是以（定义, hid）命名的函数应用）代换为候选值的项。
+    前提：洞不在循环摘要的体内（sch.hole_sum）；否则代换看不进摘要，调用方须重推导。"""
+    if (sch.name, hid) in getattr(sch, 'hole_sum', ()) and not _unsafe:
+        raise C.ValueUnknown(f'洞 {hid} 在循环摘要体内：L20 代换无效，须重推导')
+    nm = C.hole_name(sch.name, hid)
+    def sub(t):
+        ap = _apps(t, {nm, nm + '.Z'}, set())
+        return z3.substitute(t, [(a, v_term if a.decl().name() == nm else p_term) for a in ap]) if ap else t
     s2 = copy.copy(sch)
     s2.outv = [(sub(v) if v is not None else None, sub(p)) for v, p in sch.outv]
     s2.ubf, s2.ax = sub(sch.ubf), sub(sch.ax)
@@ -160,6 +177,9 @@ def complete(ws, name, hid):
     for v in in_scope(ws, name, first, ty):
         if v == hid or v not in sch.env: continue
         vt, pt = sch.env[v]
-        if f'hole.{hid}' in vt.sexpr() or f'hole.Z.{hid}' in pt.sexpr(): continue        # 依赖洞本身 ⇒ 连上会成环
+        nm = C.hole_name(name, hid)
+        if _apps(vt, {nm, nm + '.Z'}, set()) or _apps(pt, {nm, nm + '.Z'}, set()): continue        # 依赖洞本身 ⇒ 连上会成环
+        if (name, hid) in getattr(sch, 'hole_sum', ()):       # 第 27 轮：洞在循环摘要体内 ⇒ L20 代换无效，按定义重推导
+            w2 = Workspace(ws.defs); fill(w2, name, hid, v); out.append((v, classify(w2.schema(name)))); C.REG[name] = sch; continue
         out.append((v, classify(subst_fill(sch, hid, vt, pt))))
     return out

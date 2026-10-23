@@ -108,3 +108,13 @@ PYTHONPATH=model python3 model/valimport_test.py 300    # 需 corpus/，约 10 �
 ```
 PYTHONPATH=model python3 model/loopsum_test.py 800    # 约 5 分钟
 ```
+
+## 第 27 轮：名字即语义身份（spec/names.md，L54）
+逐项清点所有按名字共享的项，修复 4 个不可靠缺陷：
+- 编辑洞原来是与环境无关的常量 ⇒ f(a) ≡ f(b) 被“证明”；跨定义同 hid 混同。改为环境的未解释函数（L20′）。
+- 洞在循环摘要体内时 L20 代换无效 ⇒ 拒绝代换，改为重推导。
+- 端口重名 ⇒ 两个端口共用一项（x == y 被“证明”）；占位项名不单射。改为拒绝重名，名字用长度前缀 + 位置。
+- 复合 op 与原生 op 同名时会静默覆盖原生语义。改为拒绝。
+```
+PYTHONPATH=model python3 model/names_test.py
+```
