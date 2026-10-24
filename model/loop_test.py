@@ -3,6 +3,8 @@
   W2 与真实 MLIR 执行的差分：随机程序（i8/i32/i64/index、类型转换、scf.if、静态 scf.for），LLVM JIT 执行 vs 模型求值
   W3 循环摘要（L18）：确定性、嵌套 ≡ 内联、透明模式调用点特化、不透明模式只可靠
   W4 不变式（L19）：归纳检查、收窄 Pre、错误不变式被拒、公理与具体执行一致
+  W6 L19 外部化（第 29 轮）：随机循环 × 随机候选不变式；被接受（归纳）的不变式，其出口公理 inv(final, 输出)
+     在同一提交 MLIR JIT 的实际输出上逐输入求值，须全部成立。另含归纳变量越界探针（降级不终止 ⇒ 模型须判 UB）。
   W5 index 回绕（L17″，第 21 轮依 LangRef 更正 L17′）：模型值 = MLIR 执行值；nsw/nuw 才产生毒值；L17′ 的反例
 用法：PYTHONPATH=model python3 model/loop_test.py [W2 的程序数]
 """
@@ -253,6 +255,84 @@ def W5():
     r['对照 L17′：(x+1) > x 被“证明”（与 MLIR 执行矛盾）'] = C.prove(z3.Implies(z3.And(g2.ax, z3.Not(g2.holes[0][1]), z3.Not(g2.outv[0][1])), g2.outv[0][0] == 1))
     return r
 
+W6SRC = """func.func @main(%a: i64, %b: i64) -> i64 attributes {{llvm.emit_c_interface}} {{
+  %lb = arith.index_cast %a : i64 to index
+  %n = arith.index_cast %b : i64 to index
+  %s = arith.constant {s} : index
+  %z = arith.constant {z} : index
+  %k = arith.constant {k} : index
+  %r = scf.for %i = %lb to %n step %s iter_args(%c = %z) -> (index) {{
+    %c2 = arith.addi %c, %k : index
+    scf.yield %c2 : index
+  }}
+  %o = arith.index_cast %r : index to i64
+  return %o : i64
+}}"""
+def W6(rng, n=60):
+    st = dict(配置=0, 接受=0, 入口诊断=0, 拒绝=0, 检查输入=0, 公理在JIT输出上成立=0, 公理不成立=0, 模型UB跳过=0, 拒绝且JIT见证为假=0)
+    HIv = C.HI
+    atoms = {
+        'exact': lambda k, z, s: lambda iv, its, B: its[0][0] == z + k * ((iv - B['lb']) / s),
+        'cong': lambda k, z, s: lambda iv, its, B: (iv - B['lb']) % s == 0,
+        'ge_lb': lambda k, z, s: lambda iv, its, B: iv >= B['lb'],
+        'lb_nn': lambda k, z, s: lambda iv, its, B: B['lb'] >= 0,
+        'c_ge_z': lambda k, z, s: lambda iv, its, B: its[0][0] >= z,
+        'c_iv': lambda k, z, s: lambda iv, its, B: its[0][0] == iv - B['lb'],
+        'small': lambda k, z, s: lambda iv, its, B: z3.And(B['lb'] >= -1000, B['ub'] <= 1000),
+    }
+    for t in range(n):
+        k, z, s = rng.choice([1, 2, 3, -1]), rng.choice([0, 5]), rng.choice([1, 2, 3])
+        names = rng.sample(sorted(atoms), rng.randint(1, 4))
+        fs = [atoms[a](k, z, s) for a in names]
+        inv = lambda iv, its, B, fs=fs: z3.And(z3.Not(its[0][1]), *[f(iv, its, B) for f in fs])
+        ops = [C.cst('kk', k, IX), C.op2('c2', 'arith.addi', 'c', 'kk', IX)]
+        lp = node('L', 'scf.for', ins=['lb', 'n', 's', 'z'], outs=[('r', IX)], props={'inv': inv},
+                  regions=[[blk('b', ops + [node('y', 'scf.yield', ins=['c2'])], args=[('i', IX), ('c', IX)])]])
+        args = [('lb', IX), ('n', IX)]
+        S = C.derive(f'w6_{t}', args, [('q', IX)], [blk('entry', [C.cst('s', s, IX), C.cst('z', z, IX), lp, C.ret('rt', 'r')], args=args)], mode='opaque')
+        st['配置'] += 1
+        acc = not any('不是归纳' in d for d in S.loop_diag); st['接受' if acc else '拒绝'] += 1
+        st['入口诊断'] += any('入口' in d for d in S.loop_diag)
+        ins = [(rng.randrange(-20, 30), rng.randrange(-20, 40)) for _ in range(6)] + \
+              [(HIv - rng.randrange(2, 12), HIv - 1), (rng.randrange(0, 5), rng.randrange(900, 1200))]
+        run = []
+        for a, b in ins:
+            if a < b and a + (-(-(b - a) // s)) * s >= HIv:           # 归纳变量越界：模型判 UB、降级不终止 ⇒ 不执行
+                pairs = [(S.holes[0][0], z3.IntVal(a)), (S.holes[1][0], z3.IntVal(b)), (S.holes[0][1], z3.BoolVal(False)), (S.holes[1][1], z3.BoolVal(False))]
+                st['模型UB跳过'] += 1; st['越界但模型未判UB'] = st.get('越界但模型未判UB', 0) + (not z3.is_true(z3.simplify(z3.substitute(S.ubf, pairs)))); continue
+            run.append((a, b))
+        if not run: continue
+        outs = jit(W6SRC.format(s=s, z=z, k=k), run)
+        for (a, b), o in zip(run, outs):
+            o = o - (1 << 64) if o >= 1 << 63 else o
+            B = {'lb': z3.IntVal(a), 'ub': z3.IntVal(b), 'st': z3.IntVal(s)}
+            if a >= b: continue                                  # 空循环：公理不适用
+            init = z3.is_true(z3.simplify(inv(z3.IntVal(a), [(z3.IntVal(z), z3.BoolVal(False))], B)))
+            if not init: continue
+            final = a + (-(-(b - a) // s)) * s
+            holds = z3.is_true(z3.simplify(inv(z3.IntVal(final), [(z3.IntVal(o), z3.BoolVal(False))], B)))
+            if acc:                                              # 外部真值检验的是模型的公理本身：公理 ∧ 输入 ∧ 输出 = JIT 值 须可满足
+                sv = z3.Solver(); sv.set(timeout=10000)
+                sv.add(S.ax, S.holes[0][0] == a, S.holes[1][0] == b, z3.Not(S.holes[0][1]), z3.Not(S.holes[1][1]), z3.Not(S.ubf), S.outv[0][0] == o)
+                holds = holds and sv.check() == z3.sat
+                st['检查输入'] += 1; st['公理在JIT输出上成立' if holds else '公理不成立'] += 1
+                if not holds: print('  ✗ L19 公理被 JIT 反驳:', names, dict(k=k, z=z, s=s, lb=a, n=b, out=o))
+            else: st['拒绝且JIT见证为假'] += not holds
+    return st
+
+def W6_overflow():
+    """归纳变量越界：lb = 2^63−2, ub = 2^63−1, step = 4。LangRef 文字与 canonicalize ⇒ 1 趟；cf 降级 + JIT ⇒ 不终止（20 s 超时）。"""
+    import subprocess, sys as _s
+    a, b = C.HI - 2, C.HI - 1
+    S = C.derive('w6o', [], [('q', IX)], [blk('entry', [C.cst('lb', a, IX), C.cst('n', b, IX), C.cst('s', 4, IX), C.cst('z', 0, IX),
+                 node('L', 'scf.for', ins=['lb', 'n', 's', 'z'], outs=[('r', IX)],
+                      regions=[[blk('b', [C.cst('kk', 1, IX), C.op2('c2', 'arith.addi', 'c', 'kk', IX), node('y', 'scf.yield', ins=['c2'])], args=[('i', IX), ('c', IX)])]]),
+                 C.ret('rt', 'r')])])
+    code = f'import loop_test as L; print(L.jit(L.W6SRC.format(s=4, z=0, k=1), [({a}, {b})]))'
+    try: r = subprocess.run([_s.executable, '-c', code], capture_output=True, text=True, timeout=20); j = r.stdout.strip() or r.stderr[-80:]
+    except subprocess.TimeoutExpired: j = '超时（不终止）'
+    return {'模型判 UB': z3.is_true(z3.simplify(S.ubf)), 'JIT': j}
+
 if __name__ == '__main__':
     n = int(sys.argv[1]) if len(sys.argv) > 1 else 150
     rng = random.Random(1)
@@ -260,5 +340,6 @@ if __name__ == '__main__':
     print('── W2 与 MLIR 执行的差分:', W2(n, rng))
     print('── W3 循环摘要:'); [print('     ', k, v) for k, v in W3().items()]
     print('── W4 不变式:'); [print('     ', k, v) for k, v in W4(rng).items()]
+    print('── W6 L19 JIT 外部化:', W6(random.Random(29), 120)); print('── W6 归纳变量越界探针:', W6_overflow())
     print('── W5 index 溢出:'); [print('     ', k, v) for k, v in W5().items()]
     print('── 求解器 unknown/超时次数（按“未证明”处理）:', C.STATS['unknown'])

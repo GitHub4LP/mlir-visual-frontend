@@ -436,6 +436,10 @@ class Ctx:
         (lb, plb), (ub, pub), (st, pst) = [s.env[v] for v in n['ins'][:3]]
         inits = [s.env[v] for v in n['ins'][3:]]
         s.ub = z3.Or(s.ub, z3.And(g, z3.Or(plb, pub, pst, st <= 0)))
+        # 第 29 轮：归纳变量越界（最后一趟的 iv + st ≥ 2^(IW−1)）。LangRef 的文字（“iv ∈ [lb, ub) 才执行”）与 canonicalize 给出趟数
+        #   ⌈(ub−lb)/st⌉，但 convert-scf-to-cf 降级只比较 iv < ub，回绕后不终止（同一提交 JIT 实测）。MLIR 自身不一致 ⇒ 按 UB（两种行为都是它的精化）。
+        if z3.is_int(lb):
+            s.ub = z3.Or(s.ub, z3.And(g, z3.Not(z3.Or(plb, pub, pst)), st > 0, lb < ub, lb + ((ub - lb + st - 1) / st) * st >= HI))
         body = n['regions'][0]; iv, *its = [a for a, _ in body[0]['args']]
         L, Ub, St = (z3.simplify(x) for x in (lb, ub, st))
         if all(z3.is_int_value(x) for x in (L, Ub, St)) and St.as_long() > 0:

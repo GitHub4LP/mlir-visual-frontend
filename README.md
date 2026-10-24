@@ -124,3 +124,8 @@ PYTHONPATH=model python3 model/names_test.py
 - 复合 op 的 Schema 在 IW=64 下推导、被 IW=32 的宿主实例化时，会“证明” f(0) >s 0；JIT@32 实际给 −2³¹。现在 Schema 记录 sem，开关不同 ⇒ 未知。
 - edit.Workspace 的缓存键漏了语义开关。
 - z3 按名字合并同名 Datatype，重定义 ADT 会悄悄改写旧 sort。现在同名不同构造一律拒绝。
+
+## 第 29 轮：L13/L14/L19 外部化（transform R5、loops W6）
+- 模型证明的规则在宿主中应用后，与 JIT 穷举对照：21971 个有定义输入，0 不符。L13、L14 由 C 升为 B（值层）。
+- 不变式的出口公理与 JIT 实际输出联立：160/160 可满足；变异可以抓出。L19 由 C 升为 B。
+- 发现 MLIR 自身不一致：scf.for 的归纳变量越界时，canonicalize 给出 1 趟，降级后的程序却不终止。模型改为判 UB。
