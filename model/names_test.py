@@ -12,6 +12,13 @@
   N5 循环摘要名（第 26 轮 L18′）回归：体内有洞时名字带所属定义。
 清点为“不构成问题”的（理由见 spec/names.md）：Ctx.env 按 SSA 名（每次推导独立）、fv() 全局计数、FreshConst、
   edit.Workspace 的 Merkle 键（含定义名与被调指纹）、fingerprint 的 H{i}/P.{nm}（只作字符串）。
+第 28 轮补清点（缓存与跨开关复用）：
+  N5 Schema 跨语义开关复用：IW=64 下推导的复合 op 摘要被 IW=32 的宿主实例化 ⇒ “证明” f(0) >s 0（JIT@32 给负数）。
+     修：Schema 记 sem；实例化时开关不同 ⇒ 未知；equivalent/refines 两侧开关不同 ⇒ None。
+  N6 edit.Workspace 的 Merkle 键漏语义开关：改 IW 后命中旧 Schema。修：sem_tag 进键。
+  N7 z3 按名字合并同名 Datatype：重定义 ADT 会改写旧 sort 的构造子定义域。修：同名不同构造 ⇒ 拒绝；与内建类型同名 ⇒ 拒绝。
+  预言机缓存键 = 文本 + unreg（verifier 只依赖文本，MLIR 提交固定）；odsjson/odssig/attrsig/symtab/typesig 的 lru_cache
+     只依赖 TableGen/字符串，与语义开关无关——清点为无问题。
 保留风险：复合 op 参数常量 f'{name}.${nm}' 与 defs.derive_params 共享命名（契约），未做单射化；参数未在调用点给出时才会悬空。
 """
 import copy, z3
@@ -92,6 +99,52 @@ def N4():
     V = C.derive('a', [('b.c', I), ('d', I)], [('r', I)], [blk('entry', [C.ret('r', 'x')], args=[('x', I), ('y', I)])])
     return {'占位项同名': U.holes[0][0].eq(V.holes[0][0])}
 
+def N5():
+    C.ORACLE_ON = False; X = 'index'
+    kc = lambda i, v: node(i, 'arith.constant', outs=[(i, X)], props={'value': v, 'type': X})
+    fb = [blk('entry', [kc('k', 1 << 31), node('s', 'arith.addi', ins=['x', 'k'], outs=[('s', X)]), C.ret('r', 's')], args=[('x', X)])]
+    hb = [blk('entry', [kc('z', 0), node('u', 'f5', ins=['z'], outs=[('u', X)]),
+                        node('e', 'arith.cmpi', ins=['u', 'z'], outs=[('e', 'i1')], props={'predicate': 4}), C.ret('r', 'e')], args=[('a', X)])]
+    out = {}
+    try:
+        C.set_iw(64); F = C.derive('f5', [('x', X)], [('y', X)], fb, mode='opaque')
+        C.set_iw(32); H = C.derive('h5', [('a', X)], [('e', 'i1')], hb)
+        out['IW=32 复用 IW=64 摘要：值层'] = H.value_known
+        if H.value_known:
+            v, p = H.outv[0]; out['f(0) >s 0 被证明'] = C.prove(z3.Implies(H.ax, z3.Or(p, H.ubf, v == 1)))
+        C.derive('f5', [('x', X)], [('y', X)], fb, mode='opaque'); H = C.derive('h5', [('a', X)], [('e', 'i1')], hb)
+        v, p = H.outv[0]; out['重推导后 f(0) <s 0 可证'] = C.prove(z3.Implies(H.ax, z3.Or(p, H.ubf, v == 0)))
+        out['equivalent(跨开关)'] = C.equivalent(F, C.REG['f5'])
+    finally: C.set_iw(64)
+    import values_test as VT
+    src = 'func.func @main(%a: i64) -> i64 attributes {llvm.emit_c_interface} {\n  %z = arith.constant 0 : index\n  %k = arith.constant 2147483648 : index\n  %s = arith.addi %z, %k : index\n  %r = arith.index_cast %s : index to i64\n  return %r : i64\n}'
+    j = VT.jit(src, [[0]], 32, 0)[0]; out['JIT@32 f(0)'] = j - (1 << 64) if j >= 1 << 63 else j
+    return out
+
+def N6():
+    C.ORACLE_ON = False; X = 'index'
+    d = D([('x', X)], [('e', 'i1')], [node('k', 'arith.constant', outs=[('k', X)], props={'value': 1 << 31, 'type': X}),
+                                       node('z', 'arith.constant', outs=[('z', X)], props={'value': 0, 'type': X}),
+                                       node('e', 'arith.cmpi', ins=['k', 'z'], outs=[('e', 'i1')], props={'predicate': 4}), C.ret('r', 'e')], [('x', X)])
+    ws = E.Workspace({'g6': d})
+    try:
+        C.set_iw(64); a = ws.schema('g6'); C.set_iw(32); b = ws.schema('g6')
+        v, p = b.outv[0]; r = {'改 IW 后命中旧 Schema': a is b, 'IW=32 下 2^31 >s 0 被证明': C.prove(z3.Implies(b.ax, z3.Or(p, b.ubf, v == 1)))}
+    finally: C.set_iw(64)
+    return r
+
+def N7():
+    import defs as DF
+    r = {}
+    DF.define_adt('opt7', [('none', []), ('some', [('v', 'i8')])])
+    try: DF.define_adt('opt7', [('none', []), ('some', [('v', 'i16')])]); r['重定义被拒'] = False
+    except ValueError: r['重定义被拒'] = True
+    r['旧 sort 字段仍为 8 位'] = DF.ADTS['opt7'].sort.constructor(1).domain(0) == z3.BitVecSort(8)
+    r['同构造幂等'] = DF.define_adt('opt7', [('none', []), ('some', [('v', 'i8')])]) is DF.ADTS['opt7']
+    try: DF.define_adt('i32', [('a', [])]); r['内建名被拒'] = False
+    except ValueError: r['内建名被拒'] = True
+    return r
+
 if __name__ == '__main__':
     r1 = N1(); print('── N1 编辑洞:', r1)
     r1c = N1c(); print('── N1c 洞在循环摘要内:', r1c)
@@ -100,4 +153,8 @@ if __name__ == '__main__':
     ok = (not any(v for k, v in r1.items() if '被证明' in k) and all(v for k, v in r1.items() if '可证' in k)
           and r1['JIT（填 h:=x 后）main(1,2)'] == [0, 1] and r1c['洞被循环摘要吞掉'] and not r1c['真填：fill(1) ≡ fill(0) 被证明'] and r1c['subst_fill 默认拒绝'] and not r2['值层'] and not r2['已登记']
           and r3['原生保持'] and not r4['占位项同名'])
+    r5, r6, r7 = N5(), N6(), N7()
+    print('── N5 跨语义开关复用:', r5); print('── N6 Workspace 键含开关:', r6); print('── N7 ADT 重定义:', r7)
+    ok = ok and not r5['IW=32 复用 IW=64 摘要：值层'] and r5['重推导后 f(0) <s 0 可证'] and r5['equivalent(跨开关)'] is None \
+        and r5['JIT@32 f(0)'] < 0 and not r6['改 IW 后命中旧 Schema'] and not r6['IW=32 下 2^31 >s 0 被证明'] and all(r7.values())
     print('── 结论:', '全部符合' if ok else '有不符')
