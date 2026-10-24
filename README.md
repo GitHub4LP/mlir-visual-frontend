@@ -118,3 +118,9 @@ PYTHONPATH=model python3 model/loopsum_test.py 800    # 约 5 分钟
 ```
 PYTHONPATH=model python3 model/names_test.py
 ```
+
+## 第 28 轮：缓存与跨语义开关复用（names.md §3，L54）
+补完清点（缓存键、全局开关），又修复 3 个不可靠缺陷：
+- 复合 op 的 Schema 在 IW=64 下推导、被 IW=32 的宿主实例化时，会“证明” f(0) >s 0；JIT@32 实际给 −2³¹。现在 Schema 记录 sem，开关不同 ⇒ 未知。
+- edit.Workspace 的缓存键漏了语义开关。
+- z3 按名字合并同名 Datatype，重定义 ADT 会悄悄改写旧 sort。现在同名不同构造一律拒绝。

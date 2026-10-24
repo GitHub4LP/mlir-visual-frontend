@@ -191,6 +191,12 @@ class ADT:
 def define_adt(name, variants):
     """登记 z3 sort，生成 op（构造、判别、投影），生成降级（类型转换 + 每个 op 的降级实现）。"""
     assert len(variants) <= 2
+    # 第 28 轮（L54）：z3 按名字合并同名 Datatype——重定义会改写旧 sort 的构造子定义域，旧项随之失效。同名同构造幂等，否则拒绝。
+    if name in ADTS:
+        if ADTS[name].variants == variants: return ADTS[name]
+        raise ValueError(f'类型 {name} 已定义为 {ADTS[name].variants}，不能重定义')
+    if C.is_int(name) or name == 'index' or C.tparse(name) is not None or name in C.SORTS:
+        raise ValueError(f'类型名 {name} 与内建/已登记类型冲突')
     dt = z3.Datatype(name)
     for cn, fs in variants: dt.declare(cn, *[(f'{name}_{cn}_{f}', C.zsort(t)) for f, t in fs])
     a = ADT(name, variants, dt.create()); ADTS[name] = a; C.SORTS[name] = a.sort

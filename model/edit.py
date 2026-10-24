@@ -65,7 +65,7 @@ class Workspace:
     def schema(s, name):
         d = s.defs[name]
         fps = [(c, s.efp(s.schema(c))) for c in sorted(calls(d['blocks'], s.defs))]   # 先保证被调者在 REG 里是当前版本
-        key = hashlib.sha1((name + ser_def(d) + repr(fps)).encode()).hexdigest()   # 名字进键：Schema 的端口变量带定义名
+        key = hashlib.sha1((name + C.sem_tag() + ser_def(d) + repr(fps)).encode()).hexdigest()   # 名字进键：Schema 的端口变量带定义名；第 28 轮：语义开关进键
         if key in s.memo: sch = s.memo[key]; s.stats['命中'] += 1
         else:
             sch = C.derive(name, d['ins'], d['outs'], d['blocks'], d['mode']); s.stats['推导'] += 1

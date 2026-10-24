@@ -390,6 +390,8 @@ class Ctx:
             if is_comp(sch) and not sch.exact and sch.mode == 'transparent' and sch.body is not None:
                 outs, ub = s.specialize(sch, pr, args, g, path + ((n['id'], 'call'),))   # 透明模式：摘要不精确时在调用点特化（L18）
             elif is_comp(sch):
+                if getattr(sch, 'sem', sem_tag()) != sem_tag():
+                    raise ValueUnknown(f'{op}：摘要在语义开关 {sch.sem} 下推导，当前为 {sem_tag()}；须重推导（第 28 轮）')
                 outs, ub = instantiate(sch, pr, args); s.ax.append(inst_ax(sch, pr, args))
                 for k, ((_, pty), (av, ap)) in enumerate(zip(sch.ins, args)): s.static_check(f"{n['id']}#{k}", av, ap, pty, g)   # 调用点义务
             else:
@@ -657,6 +659,7 @@ def derive(name, ins, outs, blocks, mode='transparent', params=()):
     """ins/outs: [(端口, 类型)]；blocks: 实现体（入口块参数 = 输入端口）。返回 Schema 并登记。"""
     sch = Schema(name, ins, outs, trust={'*': 'derived'}, body=blocks, mode=mode, params=list(params))
     sch.pconsts = {nm: (z3.Int if k == 'int' else z3.Bool)(f'{name}.${nm}') for nm, k in params}
+    sch.sem = sem_tag()                   # 第 28 轮：摘要的项依赖全局语义开关（IW 等）；跨开关复用 ⇒ 未知（L54）
     # 第 27 轮：名字是语义身份。重复的端口/参数名会让两个端口共用一个占位项（旧实现“证明”了 x == y）；
     # 与原生 op 同名的复合 op 会静默覆盖原生语义。两者都拒绝（值层未知 + 诊断），不登记。
     dup = [x for xs in ([p for p, _ in ins], [p for p, _ in outs], [nm for nm, _ in params]) for x in set(xs) if xs.count(x) > 1]
@@ -734,10 +737,14 @@ def caps(s):
     return {'Speculatable': spec, 'Speculatable|非毒值输入': prove(z3.Implies(z3.And(s.ax, no_poison(s)), z3.Not(s.ubf))),
             'Pure': spec and s.eff != TOP and not s.eff}
 
+def same_sem(*ss):
+    """第 28 轮：比较的两侧须在同一组语义开关下推导（原生 Schema 无 sem，按当前开关即时求值）。"""
+    return len({getattr(x, 'sem', None) for x in ss} - {None}) <= 1
 def refines(src, tgt, assume=True):
     """tgt 精化 src（把 src 改写成 tgt 有效）：src 不 UB ⇒ tgt 不 UB；src 输出不是毒值 ⇒ tgt 输出相同且不是毒值。
     只覆盖值层：任一方有效应时返回 None（值层精化不足以说明删改效应是否合法，须声明）。assume：参数的前提。"""
     if src.eff or tgt.eff: return None
+    if not same_sem(src, tgt): return None
     pairs = [(ht, hs) for xs, xt in zip(src.holes, tgt.holes) for hs, ht in zip(xs, xt) if hs is not None]
     sb = lambda t: z3.substitute(t, pairs) if pairs else t
     conds = [z3.Not(sb(tgt.ubf))]
@@ -747,6 +754,7 @@ def refines(src, tgt, assume=True):
 
 def equivalent(a, b):
     """两个 Schema 的值层是否相同（按端口位置对齐）：UB 相同；不 UB 时毒值相同；不是毒值时值相同。"""
+    if not same_sem(a, b): return None
     pairs = [(hb, ha) for xa, xb in zip(a.holes, b.holes) for ha, hb in zip(xa, xb) if ha is not None]
     sb = lambda t: z3.substitute(t, pairs)
     conds = [a.ubf == sb(b.ubf)]
