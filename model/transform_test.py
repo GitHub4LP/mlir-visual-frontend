@@ -3,6 +3,10 @@
   R2 局部 → 整体：随机宿主程序上，在随机匹配点应用 pattern，整个程序被精化；贪心到不动点时度量逐步下降
   R3 fold 由 Sem 派生（含复合 op）
   R4 翻译确认：随机函数交给真实 MLIR 的 canonicalize，读回结果，用本模型判定 refines(原程序, 结果)
+  R5 L13/L14 外部化（第 29 轮）：模型证明的规则在随机宿主中应用（单点、贪心到不动点），原程序与改写后程序
+     都交给同一提交 MLIR 降级 + JIT，穷举 128 个输入。凡是模型判定原程序有定义（无 UB、非毒值）的输入，
+     要求 JIT(原) = 模型值（翻译健全）且 JIT(改写) = JIT(原)（整体精化）。错误规则作灵敏度对照：
+     值层可观测的错误（✗sel_true、✗mul_div）必须被 JIT 抓到差异；只差在毒值上的错误（nuw）JIT 不可观测，单列。
 用法：PYTHONPATH=model python3 model/transform_test.py [随机用例数]
 """
 import random, sys, z3
@@ -193,6 +197,64 @@ def R4(n, rng):
         st['变小'] += T.measure(h) < T.measure(g)
     return st
 
+JPIPE = 'builtin.module(convert-scf-to-cf,convert-arith-to-llvm,convert-func-to-llvm,convert-cf-to-llvm,reconcile-unrealized-casts)'
+ALL_IN = [(a, b, c) for a in range(8) for b in range(8) for c in range(2)]
+def jit_all(blocks):
+    """f(i3,i3,i1)->i3 外包 main(i64,i64,i64)->i64，穷举 128 个输入。"""
+    import ctypes
+    from mlir.execution_engine import ExecutionEngine
+    wrap = ('func.func @main(%x: i64, %y: i64, %z: i64) -> i64 attributes {llvm.emit_c_interface} {\n'
+            '  %a = arith.trunci %x : i64 to i3\n  %b = arith.trunci %y : i64 to i3\n  %c = arith.trunci %z : i64 to i1\n'
+            '  %r = func.call @f(%a, %b, %c) : (i3, i3, i1) -> i3\n  %e = arith.extui %r : i3 to i64\n  return %e : i64\n}')
+    with ir.Context():
+        m = ir.Module.parse(emit(blocks) + '\n' + wrap); assert m.operation.verify()
+        PassManager.parse(JPIPE).run(m.operation)
+        ee = ExecutionEngine(m, opt_level=0); out = []
+        for xs in ALL_IN:
+            a = [(ctypes.c_int64 * 1)(x) for x in xs]; r = (ctypes.c_int64 * 1)(0)
+            ee.invoke('main', *a, r); out.append(r[0] & 7)
+        return out
+
+def model_vals(S):
+    from valimport_test import model_eval
+    return [model_eval(S, [I3, I3, 'i1'], xs) for xs in ALL_IN]
+
+def R5(n, rng):
+    st = dict(宿主=0, 定义输入=0, 翻译不符=0, 单点改写=0, 单点模型精化=0, 单点JIT不符=0, 不动点=0, 不动点模型精化=0, 不动点JIT不符=0,
+              值错规则应用=0, 值错模型拒=0, 值错JIT抓到=0, 毒值错规则应用=0, 毒值错模型拒=0, 毒值错JIT可见=0)
+    VAL_WRONG = {'✗sel_true', '✗mul_div'}
+    for t in range(n):
+        g = T.dce(gen(rng, 20000 + t)); G = drv(f'J{t}', g); mv = model_vals(G); jg = jit_all(g)
+        dfd = [i for i, r in enumerate(mv) if r[0] == 'val']; st['宿主'] += 1; st['定义输入'] += len(dfd)
+        st['翻译不符'] += sum(mv[i][1] != jg[i] for i in dfd)
+        def diff(h): jh = jit_all(h); return sum(jh[i] != jg[i] for i in dfd)
+        cand = [(pt, s) for pt in T.PATTERNS for s in T.sites(pt, g)]
+        if cand:
+            pt, s = rng.choice(cand); h = T.rewrite(g, pt, s, f'jw{t}'); st['单点改写'] += 1
+            st['单点模型精化'] += C.refines(G, drv(f'JH{t}', h)) is True
+            d = diff(h); st['单点JIT不符'] += d
+            if d: print('  ✗ 模型证明的规则在宿主中被 JIT 反驳:', pt.name, '\n', emit(g), '\n →\n', emit(h))
+        cur = g
+        for step in range(200):
+            cand = [(pt, s) for pt in T.PATTERNS for s in T.sites(pt, cur)]
+            if not cand: break
+            pt, s = rng.choice(cand); cur = T.dce(T.rewrite(cur, pt, s, f'jg{t}_{step}'))
+        if cur is not g:
+            st['不动点'] += 1; st['不动点模型精化'] += C.refines(G, drv(f'JF{t}', cur)) is True
+            d = diff(cur); st['不动点JIT不符'] += d
+            if d: print('  ✗ 不动点被 JIT 反驳\n', emit(g), '\n →\n', emit(cur))
+        for pt in T.WRONG:
+            ss = T.sites(pt, g)
+            if not ss or pt.name == '✗sub_self_dup': continue
+            h = T.rewrite(g, pt, rng.choice(ss), f'jx{t}'); r = C.refines(G, drv(f'JX{t}', h)); d = diff(h)
+            k = '值错' if pt.name in VAL_WRONG else '毒值错'
+            st[k + '规则应用'] += 1; st[k + '模型拒'] += r is False
+            if r is False: st[k + ('JIT抓到' if k == '值错' else 'JIT可见')] += d > 0
+            else:                                   # 模型接受（宿主上下文里恰好成立）：JIT 不得有差异，否则不可靠
+                st[k + '模型接受'] = st.get(k + '模型接受', 0) + 1; st['接受但JIT不符'] = st.get('接受但JIT不符', 0) + (d > 0)
+                if d: print('  ✗ 模型接受的错误规则被 JIT 反驳:', pt.name, r, '\n', emit(g), '\n →\n', emit(h))
+    return st
+
 if __name__ == '__main__':
     n = int(sys.argv[1]) if len(sys.argv) > 1 else 200
     rng = random.Random(0)
@@ -201,3 +263,4 @@ if __name__ == '__main__':
     print('── R2 局部 → 整体:', R2(n, rng))
     print('── R3 派生的 fold:', R3())
     print('── R4 MLIR canonicalize 的翻译确认:', R4(n, rng))
+    print('── R5 L13/L14 JIT 外部化:', R5(n, random.Random(29)))
