@@ -134,3 +134,4 @@ PYTHONPATH=model python3 model/names_test.py
 - 效应组合对照 MLIR canonicalize，穷举 48 例：模型判纯的全部被 MLIR 删除，不可靠 0；保守 12 例，全是参数上的只读。L7 由 C 升为 B。
 - scf.for 越界判 UB，与上游 PR #203713（2026-06 合并的文档修订）一致，不再需要提 issue。
 - done.md 增加 G2.2 剩余 C 级的分类表。
+- L11 外部化（adtjit_test）：用户 ADT 程序降级后由 JIT 执行，与抽象层的求值对照，89766 个有定义的输入不符 0，变异可抓。L11 由 C 升为 B。
