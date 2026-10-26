@@ -89,4 +89,9 @@
   - `convert-scf-to-cf` 降级只比较 iv < ub。iv 回绕成负数后循环继续，JIT 在 O0 和 O2 下都不终止（20 s 超时）。
 - 模型的处理：此前按 1 趟展开，比降级后的程序“更有定义”。现在“最后一趟的 iv + st ≥ 2^(IW−1)”判为 UB，两种行为都是它的精化。
 - W6 越界探针回归：越界输入中模型未判 UB 的为 0。
-- upstream issue 只起草、不提交（须用户同意）。要点：scf.for 的文档与 canonicalize 的趟数语义，和 SCFToControlFlow 的降级在 iv 溢出时不一致；应在文档中明确溢出是 UB，或在降级中加溢出检查。
+- 上游已处理（第 30 轮核对）：llvm/llvm-project PR #203713「[mlir][scf] Tighten description of scf.for」于 2026-06-22 合并（079683b7），只改文档。新文字是：趟数 n = max(0, ⌈(UB−LB)/Step⌉)，按任意精度计算；**LB + n·Step 必须能在 iv 的类型中表示，否则 UB**。起因是 Discourse 讨论 #91048，那里明确说这正是 canonicalize 与降级在终止性上的分歧。
+- 本模型的真值提交 9bae84b0 早于此 PR（wheel 里的 SCFOps.td 还是旧文字）。第 29 轮的规则 `lb + ⌈(ub−lb)/st⌉·st ≥ 2^(IW−1) ⇒ UB` 与新文字对 index（有符号）逐字一致，所以不需要再提 issue，草稿作废。
+- 新文字还覆盖了两种情况，这里都不在值层建模：
+  - `unsignedCmp`：valimport 登记为未知；
+  - iN 类型的 iv：core 的循环只接受 index，其余为未知。
+  以后若支持其中之一，越界条件要按该类型的位宽和有无符号来写。

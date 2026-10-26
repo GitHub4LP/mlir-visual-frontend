@@ -129,3 +129,8 @@ PYTHONPATH=model python3 model/names_test.py
 - 模型证明的规则在宿主中应用后，与 JIT 穷举对照：21971 个有定义输入，0 不符。L13、L14 由 C 升为 B（值层）。
 - 不变式的出口公理与 JIT 实际输出联立：160/160 可满足；变异可以抓出。L19 由 C 升为 B。
 - 发现 MLIR 自身不一致：scf.for 的归纳变量越界时，canonicalize 给出 1 趟，降级后的程序却不终止。模型改为判 UB。
+
+## 第 30 轮：L7 外部化，scf.for 越界与上游对齐
+- 效应组合对照 MLIR canonicalize，穷举 48 例：模型判纯的全部被 MLIR 删除，不可靠 0；保守 12 例，全是参数上的只读。L7 由 C 升为 B。
+- scf.for 越界判 UB，与上游 PR #203713（2026-06 合并的文档修订）一致，不再需要提 issue。
+- done.md 增加 G2.2 剩余 C 级的分类表。
