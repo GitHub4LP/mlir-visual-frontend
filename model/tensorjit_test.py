@@ -30,6 +30,11 @@ def mk_inputs(rng, ins):
         else:
             dims, e = tparse(t); ex = [d if d is not None else rng.randrange(0, 4) for d in dims]
             xs.append((ex, rng.randrange(-8, 9), [rng.randrange(-3, 4) for _ in dims]))
+    first = {}                                        # 同类型 tensor 参数多数共用 extent（否则动态维多半不一致 ⇒ UB 跳过）
+    for k, t in enumerate(ins):
+        if t in ELEM: continue
+        if t in first and rng.random() < 0.8: xs[k] = (list(xs[first[t]][0]),) + xs[k][1:]
+        first.setdefault(t, k)
     return xs
 
 def ztensor(t, x):
@@ -49,8 +54,19 @@ def model_run(S, ins, outs, xs, rng):
         else: z = ztensor(t, x)
         pairs += [(h, z), (hp, z3.BoolVal(False))]
     sub = lambda f: z3.simplify(z3.substitute(f, pairs)) if pairs else z3.simplify(f)
-    if not all(z3.is_true(sub(f)) for _, f in S.guards): return 'skip', '守卫'
-    if not z3.is_false(sub(S.ubf)): return 'skip', 'UB'
+    def decide(f):                                   # 第 33 轮：逐元素 UB 含 ∃i，化简不一定消去 ⇒ 交给求解器（具体输入下可判定；unknown ⇒ 跳过）
+        f = sub(f)
+        if z3.is_true(f) or z3.is_false(f): return z3.is_true(f)
+        so = z3.Solver(); so.set('timeout', 5000); so.add(f); r = so.check()
+        if r == z3.unknown: return None
+        so2 = z3.Solver(); so2.set('timeout', 5000); so2.add(z3.Not(f)); r2 = so2.check()
+        return None if r2 == z3.unknown or (r == z3.sat and r2 == z3.sat) else r == z3.sat
+    gs = [decide(f) for _, f in S.guards]
+    if None in gs: return 'skip', '未定'
+    if not all(gs): return 'skip', '守卫'
+    u = decide(S.ubf)
+    if u is None: return 'skip', '未定'
+    if u: return 'skip', 'UB'
     res = []
     for (v, p), t in zip(S.outv, outs):
         if not z3.is_false(sub(p)): return 'skip', '毒值'
@@ -141,7 +157,7 @@ def jit_eval(src, fns_and_args):
     from mlir.passmanager import PassManager
     from mlir.execution_engine import ExecutionEngine
     from valimport_test import PIPE as P0
-    PIPE = P0.replace('bufferize-function-boundaries', 'bufferize-function-boundaries function-boundary-type-conversion=identity-layout-map').replace('convert-bufferization-to-memref,', 'convert-bufferization-to-memref,func.func(convert-linalg-to-loops),')   # tensor.generate 缓冲化为 linalg.map； 函数边界用恒等布局：否则参数的 strided 布局 cast 降不到 LLVM
+    PIPE = P0.replace('builtin.module(', 'builtin.module(func.func(convert-elementwise-to-linalg),').replace('bufferize-function-boundaries', 'bufferize-function-boundaries function-boundary-type-conversion=identity-layout-map').replace('convert-bufferization-to-memref,', 'convert-bufferization-to-memref,func.func(convert-linalg-to-loops),')   # tensor.generate 缓冲化为 linalg.map； 函数边界用恒等布局：否则参数的 strided 布局 cast 降不到 LLVM
     with ir.Context():
         m = ir.Module.parse(src); assert m.operation.verify()
         PassManager.parse(PIPE).run(m.operation)
@@ -151,6 +167,25 @@ def jit_eval(src, fns_and_args):
             ps = [ctypes.pointer(ctypes.c_int64(v)) for v in a]; r = ctypes.c_int64(0)
             ee.invoke(fn, *ps, ctypes.pointer(r)); out.append(r.value)
         return out
+
+def ctx1():
+    import mlir.ir as ir
+    c = ir.Context(); c.enable_multithreading(False); return c      # 父进程里的 MLIR 线程池会让之后 fork 的子进程死锁
+def _jit_child(src, calls, q):
+    try: q.put(jit_eval(src, calls))
+    except Exception as e: q.put('异常 ' + str(e)[:200])
+def jit_forked(src, calls):
+    ctx = mp.get_context('fork'); q = ctx.Queue(); pr = ctx.Process(target=_jit_child, args=(src, calls, q)); pr.start()
+    import queue, time
+    r, t0 = None, time.time()
+    while r is None:
+        try: r = q.get(timeout=1)
+        except queue.Empty:
+            if not pr.is_alive() and q.empty(): r = f'崩溃（退出码 {pr.exitcode}）'
+            elif time.time() - t0 > 300: r = '崩溃（超时）'
+    pr.join(5)
+    if pr.is_alive(): pr.kill()
+    return r
 
 def check_fn(S, ftxt, fname, ins, outs, rng, st, note, tag, extra=()):
     """对一个函数做 4 组输入；返回 [(输入, 模型结果)] 供变异复用。"""
@@ -174,8 +209,8 @@ def check_fn(S, ftxt, fname, ins, outs, rng, st, note, tag, extra=()):
             elif kind == 'dim': calls.append((nm, flat(ins, xs, [], nq))); keys.append((ri, j, 'dim', d, m[1][d]))
             else:
                 for ix, v in m[2].items(): calls.append((nm, flat(ins, xs, ix, nq))); keys.append((ri, j, 'el', ix, v))
-    try: got = jit_eval(src, calls)
-    except Exception as e: st['JIT 不可用'] += 1; note('JIT 不可用', f'{tag} {str(e)[:120]}'); return []
+    got = jit_forked(src, calls)                      # MLIR 断言会杀进程 ⇒ 在 fork 子进程里跑
+    if isinstance(got, str): st['JIT 不可用' + ('（MLIR 进程崩溃）' if got.startswith('崩溃') else '')] += 1; note('JIT 不可用', f'{tag} {got[:120]}'); return []
     st['函数（已执行）'] += 1; st['输入组'] += len(runs)
     for (ri, j, kind, ix, mv), jv in zip(keys, got):
         t = outs[j]; w = W(t if kind == 's' else ('index' if kind == 'dim' else tparse(t)[1]))
@@ -196,7 +231,7 @@ def run_file(path, q, seed):
     covered = set(C.REG) | {'scf.for', 'scf.if', 'scf.yield'}
     for ci, ch in enumerate(I.split_chunks(src)):
         if not ch.strip() or I.expected(ch): continue
-        try: m = ir.Module.parse(ch, ir.Context()); root = I.import_module(m)
+        try: m = ir.Module.parse(ch, ctx1()); root = I.import_module(m)
         except Exception: continue
         for fi, fn in enumerate(_funcs(root)):
             blocks = fn['regions'][0]; ft = fn['props']['_attrs'].get('function_type')
@@ -239,7 +274,66 @@ def run_file(path, q, seed):
                     st[f'变异 {flip} 比较'] += 1; st[f'变异 {flip} 发现'] += v2 % (1 << w) != jv % (1 << w)
     q.put((st, dict(ex)))
 
+# ───────────────────────── T2 定向：arith 逐元素作用于 tensor（第 33 轮；生成器只作补充，判定仍是 JIT）
+BIN = ['addi', 'subi', 'muli', 'andi', 'ori', 'xori', 'divui', 'divsi', 'remui', 'remsi', 'shli', 'shrui', 'shrsi']
+def gen_ew(rng):
+    static = rng.random() < 0.5; ty = 'tensor<2x3xi8>' if static else 'tensor<?x3xi8>'
+    L = []; vs = ['%a', '%b']; k = [0]
+    def nv():
+        k[0] += 1; return f'%v{k[0]}'
+    for _ in range(rng.randrange(2, 6)):
+        r = rng.random(); x, y = rng.choice(vs), rng.choice(vs); o = nv()
+        if r < 0.55:
+            op = rng.choice(BIN); fl = ''
+            if op in ('addi', 'subi', 'muli', 'shli') and rng.random() < 0.3: fl = ' overflow<' + rng.choice(['nsw', 'nuw', 'nsw, nuw']) + '>'
+            if op in ('divui', 'divsi', 'shrui', 'shrsi') and rng.random() < 0.2: fl = ' exact'
+            L.append(f'{o} = arith.{op} {x}, {y}{fl} : {ty}')
+        elif r < 0.7:
+            c = nv(); L.append(f'{c} = arith.cmpi {rng.choice(["eq","ne","slt","sle","sgt","sge","ult","ule","ugt","uge"])}, {x}, {y} : {ty}')
+            L.append(f'{o} = arith.select {c}, {x}, {y} : {ty.replace("i8", "i1")}, {ty}')
+        elif r < 0.8: L.append(f'{o} = arith.select %s, {x}, {y} : {ty}')
+        elif r < 0.9:
+            w = nv(); ext = rng.choice(['extsi', 'extui'])
+            L.append(f'{w} = arith.{ext} {x} : {ty} to {ty.replace("i8", "i16")}'); L.append(f'{o} = arith.trunci {w} : {ty.replace("i8", "i16")} to {ty}')
+        elif static:
+            c = nv(); val = rng.choice(['dense<' + str(rng.randrange(-4, 5)) + '>',
+                                        'dense<' + str([[rng.randrange(-4, 5) for _ in range(3)] for _ in range(2)]) + '>'])
+            L.append(f'{c} = arith.constant {val} : {ty}'); L.append(f'{o} = arith.addi {x}, {c} : {ty}')
+        else: L.append(f'{o} = arith.xori {x}, {y} : {ty}')
+        vs.append(o)
+    body = '\n  '.join(L)
+    return f'func.func @main(%a: {ty}, %b: {ty}, %s: i1) -> {ty} {{\n  {body}\n  return {vs[-1]} : {ty}\n}}', [ty, ty, 'i1'], [ty]
+
+def T2(n, seed=11):
+    import mlir.ir as ir, irimport as I
+    from valimport_test import derive_imported
+    rng = random.Random(seed); st = collections.Counter(); ex = collections.defaultdict(list)
+    def note(k, v):
+        if len(ex[k]) < 3: ex[k].append(v)
+    for t in range(n):
+        txt, ins, outs = gen_ew(rng)
+        try: m = ir.Module.parse(txt, ctx1()); assert m.operation.verify()
+        except Exception: st['不合法（跳过）'] += 1; continue
+        fn = I.import_module(m)['regions'][0][0]['ops'][0]
+        S, why = derive_imported(f't2_{t}', fn)
+        if S is None: st['未知/' + why[:40]] += 1; note('未知', why); continue
+        st['程序'] += 1
+        res = check_fn(S, txt, 'main', ins, outs, rng, st, lambda k, v: note(k, v + '\n' + txt), f't2_{t}')
+        if res:                                                         # 变异：把所有 arith.cmpi 的谓词换掉（valimport pred）
+            S2, _ = derive_imported(f't2_{t}_p', fn, 'pred')
+            runs, keys, got = res[0]
+            for (ri, j, kind, ix, mv), jv in zip(keys, got):
+                if kind != 'el' or S2 is None or 'cmpi' not in txt: continue
+                r2 = model_run(S2, ins, outs, runs[ri][0], random.Random(0))
+                if r2[0] == 'val' and ix in r2[1][j][2]: st['变异 pred 比较'] += 1; st['变异 pred 发现'] += (r2[1][j][2][ix] - jv) % 256 != 0
+    return st, ex
+
 if __name__ == '__main__':
+    if len(sys.argv) > 2 and sys.argv[2] != '0':
+        st, ex = T2(int(sys.argv[2]))
+        print('── T2 逐元素定向:'); [print(f'   {k}: {v}') for k, v in sorted(st.items())]
+        for k, v in ex.items(): print('──', k); [print('    ', x) for x in v]
+        if len(sys.argv) > 3: sys.exit()
     lim = int(sys.argv[1]) if len(sys.argv) > 1 else 10 ** 9
     tot = collections.Counter(); exs = collections.defaultdict(list); ctxm = mp.get_context('fork')
     for i, path in enumerate(sorted(glob.glob('corpus/*/*.mlir'))[:lim]):
