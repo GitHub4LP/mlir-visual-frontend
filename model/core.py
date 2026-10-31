@@ -227,16 +227,17 @@ ORIG = {}
 # L24 tensor 层是值语义，没有 UB：越界、负尺寸、形状操作数为毒值 ⇒ 结果为毒值。因此所有 tensor op 都可推测（不弱于 MLIR 的 Pure）；
 #     MLIR 中这些情形是 UB，所以降低时要在不能证明在界内的地方插入守卫（guards 查询）。
 def tparse(t):
-    m = re.fullmatch(r'tensor<((?:(?:\d+|\?)x)+)(\w+)>', t) if isinstance(t, str) else None
+    m = re.fullmatch(r'tensor<((?:(?:\d+|\?)x)*)(\w+)>', t) if isinstance(t, str) else None
     if not m: return None
-    return [None if d == '?' else int(d) for d in m.group(1).rstrip('x').split('x')], m.group(2)
+    return ([None if d == '?' else int(d) for d in m.group(1).rstrip('x').split('x')] if m.group(1) else []), m.group(2)   # 第 34 轮：0 维
 _TS, _TM = {}, {}
 def tsort(r, e):
     if zsort(e) is None: return None          # 第 32 轮：元素类型值层未建模（f32 等）⇒ 整个 tensor 类型未建模（此前 ArraySort(None) 崩溃）
     if (r, e) not in _TS:
         D = z3.Datatype(f'tensor{r}_{e}')
+        ra = max(r, 1)                        # 第 34 轮：0 维 tensor 的数组用一个哑下标（恒为 0）；z3 数组至少要一个下标
         D.declare('mk', *[(f'd{i}', z3.IntSort()) for i in range(r)],
-                  ('data', z3.ArraySort(*([z3.IntSort()] * r), zsort(e))), ('pz', z3.ArraySort(*([z3.IntSort()] * r), z3.BoolSort())))
+                  ('data', z3.ArraySort(*([z3.IntSort()] * ra), zsort(e))), ('pz', z3.ArraySort(*([z3.IntSort()] * ra), z3.BoolSort())))
         S_ = D.create(); _TS[(r, e)] = S_; _TM[S_.name()] = (r, e, S_)
     return _TS[(r, e)]
 def is_t(v): return v is not None and v.sort().name() in _TM
@@ -253,6 +254,11 @@ def wf(h, ty):
 def static_ok(v, ty):
     tp = tparse(ty)
     return z3.And([e == k for e, k in zip(ext(v), tp[0]) if k is not None]) if tp and is_t(v) else T_
+def sel(a, I): return a[tuple(I)] if len(I) else a[z3.IntVal(0)]          # 第 34 轮：统一的取元素/建数组/量化，0 维走哑下标
+def lam(iv, body): return z3.Lambda(list(iv), body) if len(iv) else z3.K(z3.IntSort(), body)
+def store(a, I, v): return z3.Store(a, *I, v) if len(I) else z3.Store(a, z3.IntVal(0), v)
+def forall(iv, body): return z3.ForAll(list(iv), body) if len(iv) else body
+def exists(iv, body): return z3.Exists(list(iv), body) if len(iv) else body
 def inb(idx, es): return z3.And([z3.And(i >= 0, i < e) for i, e in zip(idx, es)])
 def _ivars(r): return [z3.Int(f'_i{k}') for k in range(r)]
 def veq_obs(a, b):
@@ -260,14 +266,14 @@ def veq_obs(a, b):
     if not is_t(a): return a == b
     iv = _ivars(rank(a)); I = tuple(iv)
     return z3.And(*[x == y for x, y in zip(ext(a), ext(b))],
-                  z3.ForAll(iv, z3.Implies(inb(iv, ext(a)), z3.And(tpz(a)[I] == tpz(b)[I], z3.Or(tpz(a)[I], dat(a)[I] == dat(b)[I])))))
+                  forall(iv, z3.Implies(inb(iv, ext(a)), z3.And(sel(tpz(a), I) == sel(tpz(b), I), z3.Or(sel(tpz(a), I), sel(dat(a), I) == sel(dat(b), I))))))
 def vref(vs, ps, vt, pt):
     """tgt 的值精化 src 的值：src 不是毒值 ⇒ tgt 不是毒值且相同；tensor 逐元素（src 元素非毒 ⇒ tgt 元素非毒且相同）。"""
     if vs is None: return z3.Implies(z3.Not(ps), z3.Not(pt))
     if not is_t(vs): return z3.Implies(z3.Not(ps), z3.And(z3.Not(pt), vt == vs))
     iv = _ivars(rank(vs)); I = tuple(iv)
     return z3.Implies(z3.Not(ps), z3.And(z3.Not(pt), *[x == y for x, y in zip(ext(vs), ext(vt))],
-        z3.ForAll(iv, z3.Implies(z3.And(inb(iv, ext(vs)), z3.Not(tpz(vs)[I])), z3.And(z3.Not(tpz(vt)[I]), dat(vt)[I] == dat(vs)[I])))))
+        forall(iv, z3.Implies(z3.And(inb(iv, ext(vs)), z3.Not(sel(tpz(vs), I))), z3.And(z3.Not(sel(tpz(vt), I)), sel(dat(vt), I) == sel(dat(vs), I))))))
 def _anyp(xs): return z3.Or([p for _, p in xs]) if xs else F_
 def _zero(e): return z3.BitVecVal(0, W(e)) if is_int(e) else z3.IntVal(0)
 def _dyn_ext(ty, dyn):
@@ -277,9 +283,11 @@ def _fill(p, a, empty):
     """splat：所有元素 = v；empty：元素全是毒值（MLIR 说内容未指定，毒值是最强的未指定）。"""
     ty = outty(p); (v, pv), dyn = ((_zero(tparse(ty)[1]), T_), a) if empty else (a[0], a[1:])
     es, (dims, e) = _dyn_ext(ty, dyn); iv = _ivars(len(dims))
-    return [(mkt(tsort(len(dims), e), es, z3.Lambda(iv, v), z3.Lambda(iv, pv)), z3.Or(_anyp(dyn), *[x < 0 for x, _ in dyn]))], F_
+    return [(mkt(tsort(len(dims), e), es, lam(iv, v), lam(iv, pv)), z3.Or(_anyp(dyn), *[x < 0 for x, _ in dyn]))], F_
 def _from_elements(p, a):
     tp = tparse(outty(p))
+    if tp is not None and tp[0] == [] and len(a) == 1:                 # 第 34 轮：0 维
+        return [(mkt(tsort(0, tp[1]), [], lam([], a[0][0]), lam([], a[0][1])), F_)], F_
     if tp is None or len(tp[0]) != 1: raise ValueUnknown('tensor.from_elements：结果非 1 维')
     dims, e = tp
     if len(dims) != 1: raise ValueUnknown(f'tensor.from_elements：结果秩 {len(dims)} ≠ 1 未建模（第 25 轮：此前按 1 维建模，0 维/多维会错位）')
@@ -287,26 +295,28 @@ def _from_elements(p, a):
     for k, (v, pv) in enumerate(a): d, pz = z3.Store(d, k, v), z3.Store(pz, k, pv)
     return [(mkt(tsort(1, e), [z3.IntVal(len(a))], d, pz), F_)], F_
 def _dim(p, a):
-    (t, pt), (i, pi) = a; es = ext(t); val = es[-1]
+    (t, pt), (i, pi) = a; es = ext(t)
+    if not es: return [(z3.IntVal(0), T_)], F_                        # 第 34 轮：0 维 tensor 的 dim 下标必越界 ⇒ 毒值（MLIR：UB，降低时守卫）
+    val = es[-1]
     for k in range(len(es) - 2, -1, -1): val = z3.If(i == k, es[k], val)
     return [(val, z3.Or(pt, pi, i < 0, i >= len(es)))], F_
 def _extract(p, a):
     (t, pt), idx = a[0], a[1:]; I = tuple(x for x, _ in idx)
-    return [(dat(t)[I], z3.Or(pt, _anyp(idx), z3.Not(inb(I, ext(t))), tpz(t)[I]))], F_
+    return [(sel(dat(t), I), z3.Or(pt, _anyp(idx), z3.Not(inb(I, ext(t))), sel(tpz(t), I)))], F_
 def _insert(p, a):
     (v, pv), (t, pt), idx = a[0], a[1], a[2:]; I = tuple(x for x, _ in idx)
-    return [(mkt(t.sort(), ext(t), z3.Store(dat(t), *I, v), z3.Store(tpz(t), *I, pv)), z3.Or(pt, _anyp(idx), z3.Not(inb(I, ext(t)))))], F_
+    return [(mkt(t.sort(), ext(t), store(dat(t), I, v), store(tpz(t), I, pv)), z3.Or(pt, _anyp(idx), z3.Not(inb(I, ext(t)))))], F_
 def _slice_oob(offs, szs, es): return z3.Or([z3.Or(o < 0, n < 0, o + n > e) for o, n, e in zip(offs, szs, es)])
 def _extract_slice(p, a):
     (t, pt), r = a[0], rank(a[0][0]); offs, szs = a[1:1 + r], a[1 + r:1 + 2 * r]
     iv = _ivars(r); src = tuple(i + o for i, (o, _) in zip(iv, offs))
-    res = mkt(t.sort(), [n for n, _ in szs], z3.Lambda(iv, dat(t)[src]), z3.Lambda(iv, tpz(t)[src]))
+    res = mkt(t.sort(), [n for n, _ in szs], lam(iv, sel(dat(t), src)), lam(iv, sel(tpz(t), src)))
     return [(res, z3.Or(pt, _anyp(offs + szs), _slice_oob([o for o, _ in offs], [n for n, _ in szs], ext(t))))], F_
 def _insert_slice(p, a):
     (s_, ps), (t, pt), offs = a[0], a[1], a[2:]; r = rank(t)
     iv = _ivars(r); I = tuple(iv); J = tuple(i - o for i, (o, _) in zip(iv, offs))
     win = z3.And([z3.And(i >= o, i < o + n) for i, (o, _), n in zip(iv, offs, ext(s_))])
-    res = mkt(t.sort(), ext(t), z3.Lambda(iv, z3.If(win, dat(s_)[J], dat(t)[I])), z3.Lambda(iv, z3.If(win, tpz(s_)[J], tpz(t)[I])))
+    res = mkt(t.sort(), ext(t), lam(iv, z3.If(win, sel(dat(s_), J), sel(dat(t), I))), lam(iv, z3.If(win, sel(tpz(s_), J), sel(tpz(t), I))))
     return [(res, z3.Or(ps, pt, _anyp(offs), _slice_oob([o for o, _ in offs], ext(s_), ext(t))))], F_
 def _tcast(p, a):
     (t, pt), ty = a[0], outty(p)
@@ -359,15 +369,18 @@ def elementwise(sch, pr, args, n):
             for k, d in enumerate(dims): lin = lin * d + iv[k]
             val = zbv(vals[-1], e)
             for k in range(len(vals) - 2, -1, -1): val = z3.If(lin == k, zbv(vals[k], e), val)
-        return [(mkt(tsort(r, e), [z3.IntVal(d) for d in dims], z3.Lambda(iv, val), z3.Lambda(iv, F_)), F_)], F_
-    if not args or not all(is_t(v) and rank(v) == r for v, _ in args): raise ValueUnknown(f'{op}：逐元素操作数不全是同秩 tensor')
-    es0 = ext(args[0][0]); whole = _anyp(args)
-    mism = z3.Or([x != y for v, _ in args[1:] for x, y in zip(ext(v), es0)]) if len(args) > 1 else F_
-    eargs = [(dat(v)[I], z3.Or(p_, tpz(v)[I])) for v, p_ in args]
+        return [(mkt(tsort(r, e), [z3.IntVal(d) for d in dims], lam(iv, val), lam(iv, F_)), F_)], F_
+    ts = [(v, p_) for v, p_ in args if is_t(v)]
+    scal_ok = op == 'arith.select' and not is_t(args[0][0]) and len(ts) == 2       # Elementwise 唯一允许的标量操作数：select 的 i1 条件（广播）
+    if not ts or not all(rank(v) == r for v, _ in ts) or (len(ts) != len(args) and not scal_ok):
+        raise ValueUnknown(f'{op}：逐元素操作数不全是同秩 tensor')
+    es0 = ext(ts[0][0]); whole = _anyp(ts)
+    mism = z3.Or([x != y for v, _ in ts[1:] for x, y in zip(ext(v), es0)]) if len(ts) > 1 else F_   # OpDefinition.h Elementwise 性质 3：动态形状不一致 ⇒ UB
+    eargs = [(sel(dat(v), I), z3.Or(p_, sel(tpz(v), I))) if is_t(v) else (v, p_) for v, p_ in args]
     pr2 = dict(pr); pr2['__out'] = [tp[1] for tp in tps]
     eouts, eub = sch.fn(pr2, eargs)
-    res = [(mkt(tsort(r, tp[1]), es0, z3.Lambda(iv, ve), z3.Lambda(iv, pe)), whole) for (ve, pe), tp in zip(eouts, tps)]
-    ub = z3.Or(z3.And(z3.Not(whole), mism), z3.Exists(iv, z3.And(inb(iv, es0), eub)) if not z3.is_false(z3.simplify(eub)) else F_)
+    res = [(mkt(tsort(r, tp[1]), es0, lam(iv, ve), lam(iv, pe)), whole) for (ve, pe), tp in zip(eouts, tps)]
+    ub = z3.Or(z3.And(z3.Not(whole), mism), exists(iv, z3.And(inb(iv, es0), eub)) if not z3.is_false(z3.simplify(eub)) else F_)
     return res, ub
 
 def instantiate(sch, props, args):
@@ -432,7 +445,7 @@ class Ctx:
                 if getattr(sch, 'reads', None) is not None:
                     unread = {k for k, v in pr.items() if k not in GENERIC_PROPS and v is not False and k not in sch.reads}
                     if unread: raise ValueUnknown(f'{op}：参数 {sorted(unread)} 值层未建模（不静默忽略，第 23 轮）')
-                if op.startswith('arith.') and any(tparse(t) for _, t in n['outs']) and not (op == 'arith.select' and not is_t(args[0][0])):
+                if op.startswith('arith.') and any(tparse(t) for _, t in n['outs']) :                     # 标量条件的 select 也是 Elementwise（第 34 轮 JIT 反例：形状不一致 ⇒ UB，不是“选整个”）
                     outs, ub = elementwise(sch, pr, args, n)       # 第 33 轮：arith 逐元素作用于 tensor
                     s.ub = z3.Or(s.ub, z3.And(g, ub))
                     for (o, ty), r in zip(n['outs'], outs): s.env[o] = (r[0], s.static_check(n['id'], r[0], r[1], ty, g))
