@@ -232,6 +232,7 @@ def tparse(t):
     return [None if d == '?' else int(d) for d in m.group(1).rstrip('x').split('x')], m.group(2)
 _TS, _TM = {}, {}
 def tsort(r, e):
+    if zsort(e) is None: return None          # 第 32 轮：元素类型值层未建模（f32 等）⇒ 整个 tensor 类型未建模（此前 ArraySort(None) 崩溃）
     if (r, e) not in _TS:
         D = z3.Datatype(f'tensor{r}_{e}')
         D.declare('mk', *[(f'd{i}', z3.IntSort()) for i in range(r)],
@@ -379,6 +380,7 @@ class Ctx:
                 t = s.walk(n['regions'][0], z3.And(g, c == 1), path + ((n['id'], 1),))
                 e = s.walk(n['regions'][1], z3.And(g, c == 0), path + ((n['id'], 0),))
                 for (o, _), (tv, tp), (ev, ep) in zip(n['outs'], t, e):
+                    if tv is None or ev is None: raise ValueUnknown(f'scf.if：结果 {o} 的类型值层未建模')   # 第 32 轮
                     s.env[o] = (z3.If(c == 1, tv, ev), z3.Or(pc, z3.If(c == 1, tp, ep)))
                 continue
             if op == 'scf.for': s.loop(n, g, path); continue
@@ -398,6 +400,10 @@ class Ctx:
                 if getattr(sch, 'reads', None) is not None:
                     unread = {k for k, v in pr.items() if k not in GENERIC_PROPS and v is not False and k not in sch.reads}
                     if unread: raise ValueUnknown(f'{op}：参数 {sorted(unread)} 值层未建模（不静默忽略，第 23 轮）')
+                if not op.startswith('memref.'):     # 第 32 轮：操作数/结果类型值层未建模（无秩 tensor、浮点元素、带 encoding）⇒ 显式未知，不靠下游异常
+                    if any(v is None for v, _ in args): raise ValueUnknown(f'{op}：操作数类型值层未建模')
+                    if any(isinstance(t, str) and t.startswith('tensor<') and zsort(t) is None for _, t in n['outs']):
+                        raise ValueUnknown(f'{op}：结果类型值层未建模')
                 outs, ub = sch.fn(pr, args)
                 md = _mlir_def(op, args, pr['__out']) if op.startswith('tensor.') else None
                 if md is not None: s.guards.append((n['id'], z3.Implies(z3.And(g, z3.Not(_anyp(args))), md)))
@@ -435,6 +441,7 @@ class Ctx:
         """scf.for。步长 ≤ 0 或边界是毒值 ⇒ UB。静态且趟数 ≤ KUNROLL ⇒ 精确展开；否则摘要（L18、L19）。"""
         (lb, plb), (ub, pub), (st, pst) = [s.env[v] for v in n['ins'][:3]]
         inits = [s.env[v] for v in n['ins'][3:]]
+        if any(v is None for v, _ in inits): raise ValueUnknown('scf.for：迭代值的类型值层未建模')   # 第 32 轮
         s.ub = z3.Or(s.ub, z3.And(g, z3.Or(plb, pub, pst, st <= 0)))
         # 第 29 轮：归纳变量越界（最后一趟的 iv + st ≥ 2^(IW−1)）。LangRef 的文字（“iv ∈ [lb, ub) 才执行”）与 canonicalize 给出趟数
         #   ⌈(ub−lb)/st⌉，但 convert-scf-to-cf 降级只比较 iv < ub，回绕后不终止（同一提交 JIT 实测）。MLIR 自身不一致 ⇒ 按 UB（两种行为都是它的精化）。
