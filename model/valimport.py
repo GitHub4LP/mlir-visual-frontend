@@ -40,6 +40,25 @@ def _int_lit(s):
     m = re.fullmatch(r'(-?\d+|true|false)\s*(?::\s*(\S+))?', s.strip())
     if not m: raise Unknown(f'非整数字面量 {s}')
     v = m.group(1); return (1 if v == 'true' else 0 if v == 'false' else int(v)), m.group(2) or 'i1'
+def _dense(s, ty):
+    """dense<…> : tensor<…> 的整数字面量（splat 或嵌套列表）→ 行优先展平表；十六进制/资源/浮点/复数 ⇒ Unknown。嵌套结构须与形状一致。"""
+    m = re.fullmatch(r'dense<(.*)>\s*:\s*(\S+)', s.strip(), re.S)
+    if not m or m.group(2) != ty: raise Unknown(f'tensor 常量 {s[:40]}')
+    body = m.group(1).strip()
+    if not re.fullmatch(r'[\[\]\s,\-\d]+|true|false', body): raise Unknown(f'tensor 常量非整数字面量 {body[:30]}')
+    if body in ('true', 'false'): return [1 if body == 'true' else 0]
+    import json
+    try: v = json.loads(body)
+    except Exception: raise Unknown(f'tensor 常量无法解析 {body[:30]}')
+    if isinstance(v, int): return [v]
+    dims = _rank(ty)
+    def flat(x, k):
+        if k == len(dims):
+            if not isinstance(x, int): raise Unknown('tensor 常量嵌套与形状不符')
+            return [x]
+        if not isinstance(x, list) or (dims[k] is not None and len(x) != dims[k]): raise Unknown('tensor 常量嵌套与形状不符')
+        return [y for e in x for y in flat(e, k + 1)]
+    return flat(v, 0)
 def _rank(ty):
     m = re.fullmatch(r'tensor<((?:[0-9?]+x)*)\w+>', ty)
     if not m: raise Unknown(f'非有秩 tensor {ty}')
@@ -66,13 +85,18 @@ def to_core(blocks, flip=None):
         if any(re.fullmatch(r'tensor<[a-z]\w*>', t) for t in [t for _, t in n['outs']] + list((n.get('props') or {}).get('_types') or [])):
             raise Unknown(f'{op}：0 维 tensor 值层未建模（core 的 tensor 排序要求秩 ≥ 1）')                  # 第 25 轮：此前 z3 以 “bit-vector size must be > 0” 崩溃
         pre = []
-        if op.startswith(('arith.', 'ub.')) and any(re.match(r'(tensor|vector|memref)<', t) for t in [t for _, t in n['outs']] + list((n.get('props') or {}).get('_types') or [])):
-            raise Unknown(f'{op}：逐元素作用于 tensor/vector 未建模（core 的 arith 只有标量语义）')
+        tys = [t for _, t in n['outs']] + list((n.get('props') or {}).get('_types') or [])
+        if op.startswith(('arith.', 'ub.')) and any(re.match(r'(vector|memref)<', t) for t in tys):
+            raise Unknown(f'{op}：逐元素作用于 vector/memref 未建模（core 的 arith 只有标量与 ranked tensor 语义）')
+        if op.startswith(('arith.', 'ub.')) and any(t.startswith('tensor<') and not re.fullmatch(r'tensor<(?:(?:\d+|\?)x)+(?:i\d+|index)>', t) for t in tys):
+            raise Unknown(f'{op}：逐元素作用于非整数元素/无秩/带 encoding 的 tensor 未建模')     # 第 33 轮：ranked 整数 tensor 交给 core.elementwise
         for a in list(at):
             if a in STRUCTURAL or (op, a) in IRRELEVANT: continue
             if (op, a) not in TRANSLATED: raise Unknown(f'{op}.{a}：属性未登记（不静默忽略）')
         p = m['props']
-        if op == 'arith.constant':
+        if op == 'arith.constant' and n['outs'][0][1].startswith('tensor<'):
+            p.update(value=0, dense=_dense(at['value'], n['outs'][0][1]))     # 第 33 轮
+        elif op == 'arith.constant':
             v, ty = _int_lit(at['value'])
             if ty != n['outs'][0][1] and not (ty == 'i1' and n['outs'][0][1] == 'i1'): raise Unknown(f'常量类型 {ty}')
             p.update(value=v, type=ty)

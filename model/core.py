@@ -139,7 +139,7 @@ def _sel(p, a):
 _pz = itertools.count()
 def _poison(p, a):
     return [(z3.FreshConst(zsort(outty(p)), 'poison'), T_)], F_
-nat('arith.constant', [], [('r', I3)], lambda p, a: ([(zbv(p['value'], p.get('type') or outty(p)), F_)], F_), reads=('value',))
+nat('arith.constant', [], [('r', I3)], lambda p, a: ([(zbv(p['value'], p.get('type') or outty(p)), F_)], F_), reads=('value', 'dense'))
 nat('arith.addi', [('lhs', I3), ('rhs', I3)], [('r', I3)], _add, reads=('nsw', 'nuw'))
 nat('arith.subi', [('lhs', I3), ('rhs', I3)], [('r', I3)], _sub, reads=('nsw', 'nuw'))
 nat('arith.divui', [('lhs', I3), ('rhs', I3)], [('r', I3)], _div, reads=('exact',))
@@ -338,6 +338,38 @@ nat('memref.dealloc', [('m', 'memref')], [], lambda p, a: ([], F_), eff={('Free'
 nat('memref.load', [('m', 'memref')], [('r', I3)], _load, eff={('Read', 'Default', 'm')}, reads=())
 nat('memref.store', [('v', I3), ('m', 'memref')], [], lambda p, a: ([], F_), eff={('Write', 'Default', 'm')}, reads=())
 
+def elementwise(sch, pr, args, n):
+    """第 33 轮：arith op 逐元素作用于 ranked tensor（MLIR 的 Elementwise/ElementwiseMappable）。
+    结果 extent = 操作数 extent；元素 i = 标量语义作用于各操作数的元素 i（整体毒值并入元素毒值）；
+    运行时 extent 不一致（只可能出现在动态维）⇒ UB（ElementwiseMappable 要求同形）；任一域内元素的标量 UB ⇒ 整体 UB（∃i）。
+    arith.constant 的 dense 值：逐下标给出常量（p['dense'] = 行优先展平的整数表）。"""
+    op = n['op']; outs_ty = [t for _, t in n['outs']]
+    tps = [tparse(t) for t in outs_ty]
+    if any(tp is None for tp in tps): raise ValueUnknown(f'{op}：结果类型值层未建模')
+    r = len(tps[0][0]); iv = [z3.Int(f'_ew{next(_ch)}_{k}') for k in range(r)]; I = tuple(iv)
+    if op == 'arith.constant':
+        dims, e = tps[0]; vals = pr.get('dense')
+        if vals is None or any(d is None for d in dims): raise ValueUnknown('arith.constant：tensor 常量缺 dense 值或非静态形状')
+        nel = 1
+        for d in dims: nel *= d
+        if len(vals) != nel and len(vals) != 1: raise ValueUnknown('arith.constant：dense 元素数与形状不符')
+        if len(vals) == 1: val = zbv(vals[0], e)
+        else:
+            lin = z3.IntVal(0)
+            for k, d in enumerate(dims): lin = lin * d + iv[k]
+            val = zbv(vals[-1], e)
+            for k in range(len(vals) - 2, -1, -1): val = z3.If(lin == k, zbv(vals[k], e), val)
+        return [(mkt(tsort(r, e), [z3.IntVal(d) for d in dims], z3.Lambda(iv, val), z3.Lambda(iv, F_)), F_)], F_
+    if not args or not all(is_t(v) and rank(v) == r for v, _ in args): raise ValueUnknown(f'{op}：逐元素操作数不全是同秩 tensor')
+    es0 = ext(args[0][0]); whole = _anyp(args)
+    mism = z3.Or([x != y for v, _ in args[1:] for x, y in zip(ext(v), es0)]) if len(args) > 1 else F_
+    eargs = [(dat(v)[I], z3.Or(p_, tpz(v)[I])) for v, p_ in args]
+    pr2 = dict(pr); pr2['__out'] = [tp[1] for tp in tps]
+    eouts, eub = sch.fn(pr2, eargs)
+    res = [(mkt(tsort(r, tp[1]), es0, z3.Lambda(iv, ve), z3.Lambda(iv, pe)), whole) for (ve, pe), tp in zip(eouts, tps)]
+    ub = z3.Or(z3.And(z3.Not(whole), mism), z3.Exists(iv, z3.And(inb(iv, es0), eub)) if not z3.is_false(z3.simplify(eub)) else F_)
+    return res, ub
+
 def instantiate(sch, props, args):
     """复合 op 的摘要实例化 = 项代换（嵌套 ≡ 内联的根据）。"""
     sub = _subst(sch, props, args)
@@ -400,6 +432,11 @@ class Ctx:
                 if getattr(sch, 'reads', None) is not None:
                     unread = {k for k, v in pr.items() if k not in GENERIC_PROPS and v is not False and k not in sch.reads}
                     if unread: raise ValueUnknown(f'{op}：参数 {sorted(unread)} 值层未建模（不静默忽略，第 23 轮）')
+                if op.startswith('arith.') and any(tparse(t) for _, t in n['outs']) and not (op == 'arith.select' and not is_t(args[0][0])):
+                    outs, ub = elementwise(sch, pr, args, n)       # 第 33 轮：arith 逐元素作用于 tensor
+                    s.ub = z3.Or(s.ub, z3.And(g, ub))
+                    for (o, ty), r in zip(n['outs'], outs): s.env[o] = (r[0], s.static_check(n['id'], r[0], r[1], ty, g))
+                    continue
                 if not op.startswith('memref.'):     # 第 32 轮：操作数/结果类型值层未建模（无秩 tensor、浮点元素、带 encoding）⇒ 显式未知，不靠下游异常
                     if any(v is None for v, _ in args): raise ValueUnknown(f'{op}：操作数类型值层未建模')
                     if any(isinstance(t, str) and t.startswith('tensor<') and zsort(t) is None for _, t in n['outs']):
