@@ -84,7 +84,7 @@ def derive_imported(name, fn, flip=None):
     try: S = C.derive(name, [(f'p{i}', t) for i, t in enumerate(ins_ty)], [(f'r{i}', t) for i, t in enumerate(outs)], bs)
     except Exception as e: return None, f'core 异常 {type(e).__name__}: {str(e)[:80]}'
     finally: C.ORACLE_ON = old
-    if not S.value_known: return None, '值层未知（类型/结构/ValueUnknown）'
+    if not S.value_known: return None, '值层未知：' + (getattr(S, 'value_why', '') or '?')
     return S, None
 
 def run_file(path, q, seed):
