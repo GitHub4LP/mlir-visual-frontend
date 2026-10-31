@@ -161,3 +161,33 @@ T2 的覆盖面：13 种二元 op（含可能 UB 的除法/取余/移位）、ns
 两者都是合法 IR，触发的是本提交 MLIR 的已知缺陷，不影响模型结论；这些程序记为不可执行。
 
 **剩余未知**：0 维 tensor（约 14）、降秩/步长切片（约 37）、insert_slice 尺寸、浮点。
+
+### 9.2 第 34 轮：0 维 tensor；标量条件 select 的可靠性缺陷
+
+**0 维表示**：
+- z3 数组至少要一个下标，所以 0 维 tensor 的 data/pz 数组用一个恒为 0 的哑下标，extent 列表为空。
+- 取元素、建数组、写元素、量化统一走 `sel`/`lam`/`store`/`forall`/`exists`，空下标时分别退化为“取下标 0 / 常数组 K / 写下标 0 / 公式本身”。
+- tparse 接受 `tensor<i8>`。
+- `tensor.dim` 作用于 0 维 ⇒ 毒值（MLIR：UB，降低时插守卫）。
+- `tensor.from_elements` 支持 0 维。
+- valimport 去掉了第 25 轮的 0 维拒绝。
+
+**缺陷（JIT 反例，已修）**：第 33 轮把“条件为标量的 arith.select 作用于 tensor”按“选整个 tensor”建模。MLIR 的 `OpDefinition.h` 在 Elementwise 性质 3 中写明：所有 vector/tensor 操作数与结果须同形，动态形状不一致时行为未定义。arith.select 带 ElementwiseMappable，标量条件只是广播。
+
+反例 t2_193：`select %s, %b, %a`，其中 %a、%b 的动态维不同。
+- 模型给出有定义值：dim 3。
+- JIT（convert-elementwise-to-linalg）按 %b 的形状生成：dim 1。
+
+修复：标量条件 select 也走 `core.elementwise`，条件广播，tensor 操作数形状不一致 ⇒ UB。这是“模型在 MLIR 为 UB 处给出定义值”的方向，对前端不可靠，不是保守误差。第 33 轮 T2 没抓到它，是因为同类型参数 80% 共用 extent，而形状不一致的那部分又多半被别的 UB 跳过了。教训：生成器的输入分布要刻意覆盖“声明允许而语义未定义”的区域。
+
+**结果**（9bae84b0）：
+
+| | 有事实 | 执行 | 比较 | 不一致 |
+|---|---|---|---|---|
+| T 语料 tensor 签名 | 39（第 33 轮为 35） | 35 | 945 | 0 |
+| T2 定向，240 程序 | 240 | 218 | 2886 | 0（修复前 4，均来自 t2_193） |
+
+- T2 按形状分：2x3 一致 1741，?x3 一致 899，0 维一致 246（75 个程序，含 extract[]、insert[]、from_elements）。
+- 变异：pred 57/673，seed+1 88/99。
+- MLIR 已知断言崩溃 16 个（xori/cmpi x,x，上游已修）。
+- 语料另有 6 个函数有事实，但签名含非整数 tensor，harness 无法构造输入，记为跳过，不计入执行。

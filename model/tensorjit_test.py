@@ -16,9 +16,9 @@ import z3
 ELEM = ('i1', 'i8', 'i16', 'i32', 'i64', 'index')
 def W(t): return 64 if t == 'index' else int(t[1:])
 def tparse(t):
-    m = re.fullmatch(r'tensor<((?:(?:\d+|\?)x)+)(\w+)>', t)
+    m = re.fullmatch(r'tensor<((?:(?:\d+|\?)x)*)(\w+)>', t)
     if not m or m.group(2) not in ELEM: return None
-    return [None if d == '?' else int(d) for d in m.group(1).rstrip('x').split('x')], m.group(2)
+    return ([None if d == '?' else int(d) for d in m.group(1).rstrip('x').split('x')] if m.group(1) else []), m.group(2)
 def ok_ty(t): return t in ELEM or tparse(t) is not None
 
 def mk_inputs(rng, ins):
@@ -43,7 +43,7 @@ def ztensor(t, x):
     iv = [z3.Int(f'_g{k}') for k in range(len(dims))]
     lin = seed + z3.Sum([c * i for c, i in zip(cs, iv)]) if iv else z3.IntVal(seed)
     val = lin if e == 'index' else z3.Int2BV(lin, W(e))
-    return C.mkt(S_, [z3.IntVal(d) for d in ex], z3.Lambda(iv, val), z3.Lambda(iv, z3.BoolVal(False)))
+    return C.mkt(S_, [z3.IntVal(d) for d in ex], C.lam(iv, val), C.lam(iv, z3.BoolVal(False)))
 
 def model_run(S, ins, outs, xs, rng):
     """返回 ('skip', 原因) 或 ('val', [每个结果：('s', 值) | ('t', extent, {下标: 值})])。"""
@@ -83,9 +83,9 @@ def model_run(S, ins, outs, xs, rng):
         if n: [pts.add(tuple(rng.randrange(e) for e in ex)) for _ in range(8)]
         for ix in sorted(pts):
             I = tuple(z3.IntVal(i) for i in ix)
-            pz = sub(C.tpz(v)[I] if I else C.tpz(v))
+            pz = sub(C.sel(C.tpz(v), I))
             if not z3.is_false(pz): continue                         # 毒值元素：JIT 不可观测
-            vv = sub(C.dat(v)[I])
+            vv = sub(C.sel(C.dat(v), I))
             if not (z3.is_int_value(vv) or z3.is_bv_value(vv)): return 'skip', '未定'
             els[ix] = vv.as_long()
         res.append(('t', ex, els))
@@ -277,7 +277,7 @@ def run_file(path, q, seed):
 # ───────────────────────── T2 定向：arith 逐元素作用于 tensor（第 33 轮；生成器只作补充，判定仍是 JIT）
 BIN = ['addi', 'subi', 'muli', 'andi', 'ori', 'xori', 'divui', 'divsi', 'remui', 'remsi', 'shli', 'shrui', 'shrsi']
 def gen_ew(rng):
-    static = rng.random() < 0.5; ty = 'tensor<2x3xi8>' if static else 'tensor<?x3xi8>'
+    ty = rng.choice(['tensor<2x3xi8>', 'tensor<?x3xi8>', 'tensor<i8>']); static = '?' not in ty      # 第 34 轮：加 0 维
     L = []; vs = ['%a', '%b']; k = [0]
     def nv():
         k[0] += 1; return f'%v{k[0]}'
@@ -295,9 +295,13 @@ def gen_ew(rng):
         elif r < 0.9:
             w = nv(); ext = rng.choice(['extsi', 'extui'])
             L.append(f'{w} = arith.{ext} {x} : {ty} to {ty.replace("i8", "i16")}'); L.append(f'{o} = arith.trunci {w} : {ty.replace("i8", "i16")} to {ty}')
+        elif ty == 'tensor<i8>' and rng.random() < 0.5:                 # 0 维：extract[] / insert[] / from_elements
+            e = nv(); L.append(f'{e} = tensor.extract {x}[] : {ty}')
+            if rng.random() < 0.5: L.append(f'{o} = tensor.from_elements {e} : {ty}')
+            else: L.append(f'{o} = tensor.insert {e} into {y}[] : {ty}')
         elif static:
             c = nv(); val = rng.choice(['dense<' + str(rng.randrange(-4, 5)) + '>',
-                                        'dense<' + str([[rng.randrange(-4, 5) for _ in range(3)] for _ in range(2)]) + '>'])
+                                        'dense<' + str([[rng.randrange(-4, 5) for _ in range(3)] for _ in range(2)]) + '>' if '2x3' in ty else 'dense<7>'])
             L.append(f'{c} = arith.constant {val} : {ty}'); L.append(f'{o} = arith.addi {x}, {c} : {ty}')
         else: L.append(f'{o} = arith.xori {x}, {y} : {ty}')
         vs.append(o)
@@ -317,8 +321,9 @@ def T2(n, seed=11):
         fn = I.import_module(m)['regions'][0][0]['ops'][0]
         S, why = derive_imported(f't2_{t}', fn)
         if S is None: st['未知/' + why[:40]] += 1; note('未知', why); continue
-        st['程序'] += 1
+        st['程序'] += 1; st['程序/' + ins[0]] += 1; n0 = st['一致']
         res = check_fn(S, txt, 'main', ins, outs, rng, st, lambda k, v: note(k, v + '\n' + txt), f't2_{t}')
+        st['一致/' + ins[0]] += st['一致'] - n0
         if res:                                                         # 变异：把所有 arith.cmpi 的谓词换掉（valimport pred）
             S2, _ = derive_imported(f't2_{t}_p', fn, 'pred')
             runs, keys, got = res[0]
