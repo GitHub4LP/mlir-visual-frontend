@@ -132,3 +132,32 @@ valimport 的 pred / static_zero 变异在这批函数上 0/100：这批函数�
 - 浮点或无秩：其余大部分。
 
 前三类可以在 core 里建模，下一步按这个顺序推进。浮点值层另立（G1.5）。
+
+### 9.1 第 33 轮：arith 逐元素作用于 tensor（core.elementwise）
+
+**语义**（MLIR Elementwise / ElementwiseMappable）：
+- 结果 extent 等于操作数 extent。
+- 元素 i 的值 = 标量语义作用于各操作数的元素 i。操作数的整体毒值并入元素毒值，所以“对毒值除”等标量规则逐元素成立。
+- 运行时 extent 不一致（只可能出现在动态维）⇒ UB。
+- 任一域内元素有标量 UB ⇒ 整体 UB，形式为 ∃i（例如某个元素除以 0）。
+- 条件为标量的 arith.select 选择整个 tensor，走原标量路径。
+- dense 整数常量（splat 或嵌套列表）由 valimport._dense 解析，嵌套结构须与形状一致；十六进制、资源、浮点、i1 列表 ⇒ 未知。
+
+**对照管线**：前面加 convert-elementwise-to-linalg（MLIR 标准降级）。JIT 在 fork 子进程里跑，MLIR 断言只记为“JIT 不可用（崩溃）”。父进程的 MLIR Context 关掉多线程，否则 fork 出的子进程会死锁。
+
+**结果**（9bae84b0）：
+
+| | 有事实 | 执行 | 比较 | 不一致 | 变异 |
+|---|---|---|---|---|---|
+| T 语料 tensor 签名 | 35（第 32 轮为 10） | 31 | 930（dim 214、元素 708、标量 8） | 0 | seed+1 75/87 |
+| T2 逐元素定向，200 程序 | 200 | 167 | 3009 | 0 | pred 39/670 |
+
+T2 的覆盖面：13 种二元 op（含可能 UB 的除法/取余/移位）、nsw/nuw/exact、cmpi + tensor 条件 select、标量条件 select、ext/trunc、dense 常量；形状有静态的，也有动态的。
+
+**MLIR 崩溃（上游均已修复，不提 issue）**：T2 中 28 个程序在本提交的 canonicalize/folding 处断言崩溃（`type must have static shape`）。原因有两类：
+- `arith.xori %x, %x` 作用于动态形状 tensor：上游 677f13e（#212072，2026-07-26）修复；
+- `arith.cmpi p, %x, %x` 作用于动态形状 tensor：上游 main 的 getBoolAttribute 已对动态形状返回空。
+
+两者都是合法 IR，触发的是本提交 MLIR 的已知缺陷，不影响模型结论；这些程序记为不可执行。
+
+**剩余未知**：0 维 tensor（约 14）、降秩/步长切片（约 37）、insert_slice 尺寸、浮点。
