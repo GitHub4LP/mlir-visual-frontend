@@ -92,7 +92,8 @@ def sig(dialect, opname):
             b, m = _base(d, c); S['ins'].append((nm, _tp(dialect, b, S), m, b))
         else:
             req = not (any(k in sc for k in ('OptionalAttr', 'DefaultValuedAttr', 'DefaultValuedOptionalAttr', 'UnitAttr', 'UnitProp'))
-                       or c in ('UnitAttr', 'UnitProp') or d.get(c, {}).get('isOptional') == 1)       # UnitAttr 缺省即 false
+                       or c in ('UnitAttr', 'UnitProp') or d.get(c, {}).get('isOptional') == 1       # UnitAttr 缺省即 false
+                       or bool((d.get(c, {}).get('defaultValue') or '').strip()))   # 第 31 轮：记录自带 defaultValue（如 gpu 的 EnumAttr）也非必需，与 mlir::tblgen::Attribute::hasDefaultValue 一致
             S['attrs'].append((nm, c, sc[-1] if sc else '?', req))
     for c, nm in O.dag_args(r['results']):
         b, m = _base(d, unwrap(c)); S['outs'].append((nm, _tp(dialect, b, S), m, b))
