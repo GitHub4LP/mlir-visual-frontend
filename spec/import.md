@@ -70,3 +70,19 @@
 - 可伸缩向量、memref 布局与地址空间不在类型池中，相应原子的实现（`isStrided` 恒真、`ScalableVectorType` 恒假）只对类型池成立。
 - linalg 未导入：它的命名 op 由 yaml 生成，需要 `mlir-linalg-ods-yaml-gen`。
 - 第 7 轮的 typesig.py（23 个 op、正则导入）仍然保留，作为 core 的类型检查。下一步把它切换到 odssig，两者的差分结果均为 0 分歧。
+
+## 8 第 31 轮：对照 mlir-tblgen 自己的解释（`model/odsdiff_test.py`，T1）
+odssig 从 `llvm-tblgen -dump-json` 的原始记录**重新实现**了 mlir-tblgen 的一部分语义。此前这部分只有语料间接验证。
+现在用 eudsl-tblgen（mlir::tblgen 的 Python 绑定）读同一份 .td（wheel 9bae84b0 自带），逐 op 对照 `mlir::tblgen::Operator`：
+端口名与多重性（one/optional/variadic/varvar）、属性与 property 是否必需、区域与后继个数、是否自动生成 inferReturnTypes（`allResultTypesKnown`）。
+
+| 项 | 一致/总数 | 处理 |
+|---|---|---|
+| ins / outs / regions / successors | 650/650 | 匿名端口 None≡'' |
+| attrs（必需性） | 修复前 640/650，修复后 650/650 | **缺陷**：gpu 稀疏 op（spmv、spmm、sddmm 等 10 个）的 `modeA/modeB/pruneFlag` 是 EnumAttr，`defaultValue` 写在记录里，没有包在 DefaultValuedAttr 中，odssig 误判为必需。MLIR verifier 接受缺 modeA 的 `gpu.spmv`（会补默认值）。后果只在保守一侧：预言机发射时的忠实性守卫抛 LookupError，预言机不可用，没有误拒。修复：按记录的 `defaultValue` 字段判定，与 `Attribute::hasDefaultValue` 一致 |
+| infer | 646/650 | 4 个都是 odssig 判“无规则”、tblgen 判“可推断”：arith.constant（结果取自属性 value 的类型）、vector.interleave/deinterleave、gpu.subgroup_mma_extract_thread_local（TypesMatchWith 变换不在 XF 表中，已登记为 unknown）。方向保守：结果类型保持字面量，不前推，类型关系仍由 rel/预言机检查。没有反方向的分歧 |
+
+- 版本：eudsl-tblgen 0.0.1（2026-10-29 构建，LLVM 比 9bae84b0 新）。这里只用它的 C++ 解释逻辑，.td 仍是被测提交自带的那份。分歧须逐条归因，本轮 11 处都归因到 odssig，没有版本漂移。
+- 定位：交叉检验，不是新真值。真值仍是同一提交的 verifier。eudsl-tblgen 不可用时这项检验跳过（setup_env.sh 安装失败不阻塞）。
+- 回归：odssig_test L1 auto 账目 191 op / 11460 实例 0 分歧；oracle_test O3–O5 不变（O5 300/300）。
+- 不替换 odsjson：Pred 树的语义解释（ATOM/XFORM ⇒ Unknown）是模型自己的义务，mlir::tblgen 只给出 C++ 条件字符串，没有给出语义。
