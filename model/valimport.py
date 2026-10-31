@@ -82,13 +82,11 @@ def to_core(blocks, flip=None):
         if m['succs']: raise Unknown(f'{op}：后继（多块 CFG）')
         if any(re.search(r'\bi0\b', t) for t in [t for _, t in n['outs']] + list((n.get('props') or {}).get('_types') or [])):
             raise Unknown(f'{op}：i0（零宽整数）值层未建模')
-        if any(re.fullmatch(r'tensor<[a-z]\w*>', t) for t in [t for _, t in n['outs']] + list((n.get('props') or {}).get('_types') or [])):
-            raise Unknown(f'{op}：0 维 tensor 值层未建模（core 的 tensor 排序要求秩 ≥ 1）')                  # 第 25 轮：此前 z3 以 “bit-vector size must be > 0” 崩溃
         pre = []
         tys = [t for _, t in n['outs']] + list((n.get('props') or {}).get('_types') or [])
         if op.startswith(('arith.', 'ub.')) and any(re.match(r'(vector|memref)<', t) for t in tys):
             raise Unknown(f'{op}：逐元素作用于 vector/memref 未建模（core 的 arith 只有标量与 ranked tensor 语义）')
-        if op.startswith(('arith.', 'ub.')) and any(t.startswith('tensor<') and not re.fullmatch(r'tensor<(?:(?:\d+|\?)x)+(?:i\d+|index)>', t) for t in tys):
+        if op.startswith(('arith.', 'ub.')) and any(t.startswith('tensor<') and not re.fullmatch(r'tensor<(?:(?:\d+|\?)x)*(?:i\d+|index)>', t) for t in tys):
             raise Unknown(f'{op}：逐元素作用于非整数元素/无秩/带 encoding 的 tensor 未建模')     # 第 33 轮：ranked 整数 tensor 交给 core.elementwise
         for a in list(at):
             if a in STRUCTURAL or (op, a) in IRRELEVANT: continue
