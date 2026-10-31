@@ -103,3 +103,32 @@ index 操作数按 IW 位的位向量计算。
 丢 nsw 不可测：nsw 只会把值变成毒值，而毒值输入本来就跳过——毒值的精化自由度无法用执行来检验（这一项由 V3 的翻译确认负责）。
 
 **局限。** 可丢弃属性（如 `__test_pipelining_op_order__`）一律拒绝。这比 MLIR 保守：MLIR 中不带方言前缀的可丢弃属性不改变 op 语义。但带方言前缀的属性可以由方言赋予语义，所以暂不放宽。A2 的候选只覆盖标量签名的函数，tensor 签名的语料函数尚未执行。
+
+## 9 第 32 轮：tensor 签名的语料函数接入 JIT（model/tensorjit_test.py，G1.4）
+
+**方法**：输入 tensor 用 `tensor.generate` 按公式 e(i) = trunc(seed + Σc_k·i_k) 生成，动态维随机取 0..3。模型侧用同一个公式构造具体的 z3 tensor（extent、Lambda 元素、元素毒值全假）代入洞。外包 main 只有 i64 参数：标量结果直接比较；tensor 结果先比较 `tensor.dim`，再在 extent 内抽样下标比较元素。模型判 UB、毒值或守卫不成立的输入跳过；毒值元素跳过，因为 JIT 观测不到。降级管线在 A2 的基础上改了两处：函数边界用 identity-layout-map（否则参数的 strided 布局 cast 降不到 LLVM），并且加了 convert-linalg-to-loops（tensor.generate 会缓冲化成 linalg.map）。
+
+**结果**（同一提交 9bae84b0）：
+
+| 项 | 数 |
+|---|---|
+| 单块 tensor 签名函数 | 616 |
+| 含值层未覆盖的 op | 454 |
+| 有值层事实（候选） | 10 |
+| 已执行 | 7（另 3 个所有输入都不满足守卫） |
+| 比较（dim 52、元素 117、标量 4） | 173，一致 173 |
+| 比较器灵敏度：模型侧 seed+1 | 24/24 发现 |
+
+valimport 的 pred / static_zero 变异在这批函数上 0/100：这批函数没有 cmpi，切片偏移也全是 0。这说明它们在这里没有判别力，不能当作灵敏度证据。切片偏移的灵敏度仍由 A3/A4 提供（static_zero 92/424）。
+
+**core 修复**：无秩 tensor、浮点元素、带 encoding 的 tensor 作为 tensor op 的操作数或结果时，以及 scf.if / scf.for 携带未建模类型的值时，此前会以 z3 或 Python 异常告终（48 个语料函数）。外层把它们当作“core 异常”判未知，路径本身是安全的，但原因不可审计，而且同一个 except 也可能吞掉真实缺陷。现在这些情况一律显式抛出 ValueUnknown，扫描结果中 core 异常为 0。
+
+**缺口（G1.4 的分母，即 tensor 值层事实率）**，按未知原因计：
+- 逐元素作用于 tensor 的 arith：约 25；
+- 0 维 tensor：约 14；
+- 降秩切片：22；
+- 步长 ≠ 1 的切片：14；
+- insert_slice 尺寸不是静态或与源形状不等：9；
+- 浮点或无秩：其余大部分。
+
+前三类可以在 core 里建模，下一步按这个顺序推进。浮点值层另立（G1.5）。
