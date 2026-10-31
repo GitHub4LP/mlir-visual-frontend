@@ -124,15 +124,18 @@ def to_core(blocks, flip=None):
                         if flip == 'static_zero' and sv is stat[0]: x = 0
                         c, o = const(x); pre.append(c); row.append(o)
                 vals.append(row)
-            if dyn[2] or any(x != 1 for x in stat[2]): raise Unknown(f'{op}：步长 ≠ 1')
+            # 第 34b 轮：全形式（步长、降/升秩、insert 的尺寸）翻译到 core 的 *.g；降秩掩码按 MLIR computeRankReductionMask 的贪心匹配
             big = _rank(src_ty if op == 'tensor.extract_slice' else n['props']['_types'][1])
             small = _rank(n['outs'][0][1] if op == 'tensor.extract_slice' else src_ty)
-            if len(big) != len(small) or len(stat[0]) != len(big): raise Unknown(f'{op}：降秩切片')
-            if op == 'tensor.extract_slice': m['ins'] = fixed + vals[0] + vals[1]
-            else:
-                if dyn[1] or any(s is None or s != d for s, d in zip(stat[1], small)):
-                    raise Unknown('insert_slice：尺寸须为静态且等于源形状（core 取源的 extent）')
-                m['ins'] = fixed + vals[0]
+            if not (len(stat[0]) == len(stat[1]) == len(stat[2]) == len(big)): raise Unknown(f'{op}：偏移/尺寸/步长个数与秩不符')
+            szs = [None if x == KDYN else x for x in stat[1]]; drop, j = [], 0
+            for kk, sk in enumerate(szs):
+                if j < len(small) and small[j] == sk: j += 1
+                elif sk == 1: drop.append(kk)
+                else: raise Unknown(f'{op}：降秩掩码无法匹配')
+            if j != len(small): raise Unknown(f'{op}：降秩掩码无法匹配')
+            m['op'] = op + '.g'; p['drop'] = tuple(drop)
+            m['ins'] = fixed + vals[0] + vals[1] + vals[2]
         if op == 'arith.constant' or op.startswith(('arith.', 'tensor.', 'memref.', 'ub.')): pass
         elif op in ('scf.for', 'scf.if', 'scf.yield', 'func.return'): pass
         else: raise Unknown(f'{op}：值层未覆盖')
