@@ -243,7 +243,7 @@ def run_file(path, q, seed):
             mm = re.fullmatch(r'\((.*)\) -> \(?([^()]*?)\)?', ft)
             outs = [x.strip() for x in mm.group(2).split(',')] if mm and mm.group(2).strip() else []
             S, why = derive_imported(f'tj{seed}_{ci}_{fi}', fn)
-            if S is None: st['未知/' + re.sub(r'[：:].*', '', why.split('：', 1)[-1] if why.startswith('core') else why)[:36]] += 1; note('未知', f'{path} {why[:90]}'); continue
+            if S is None: st['未知/' + (re.sub(r'%\w+', '%', why)[:44] if why.startswith('值层未知') else re.sub(r'[：:].*', '', why.split('：', 1)[-1] if why.startswith('core') else why)[:36])] += 1; note('未知', f'{path} {why[:90]}'); continue
             if not all(ok_ty(t) for t in ins + outs): st['有事实但签名含非整数 tensor'] += 1; continue
             st['有事实（候选）'] += 1
             name = fn['props']['_attrs']['sym_name'].strip('"')
@@ -333,7 +333,68 @@ def T2(n, seed=11):
                 if r2[0] == 'val' and ix in r2[1][j][2]: st['变异 pred 比较'] += 1; st['变异 pred 发现'] += (r2[1][j][2][ix] - jv) % 256 != 0
     return st, ex
 
+# ───────────────────────── T3 定向：全形式切片（第 34b 轮：步长、降秩/升秩、动态尺寸；含越界/负值/形状不一致输入区域）
+def gen_slice(rng):
+    src = rng.choice([[6, None], [5], [None, 4, None], [3, 1, 4]])
+    sty = lambda ds: 'tensor<' + ''.join(('?' if d is None else str(d)) + 'x' for d in ds) + 'i8>'
+    def ofr(lo, hi, dyns, allow_dyn=True):
+        if allow_dyn and rng.random() < 0.35: x = rng.choice(['%i0', '%i1', '%i2']); dyns.append(x); return x, None
+        v = rng.randrange(lo, hi); return str(v), v
+    def triple(ds):
+        os_, ns, ss, dy = [], [], [], []
+        for d in ds:
+            o = ofr(0, (d if d else 4), dy); n = ofr(0, 4, dy) if rng.random() < 0.7 else ('1', 1); st_ = ofr(1, 4, dy)
+            os_.append(o); ns.append(n); ss.append(st_)
+        return os_, ns, ss
+    def fmt(xs): return '[' + ', '.join(x for x, _ in xs) + ']'
+    os_, ns, ss = triple(src)
+    res = []
+    for _, v in ns:
+        if v == 1 and rng.random() < 0.5: continue                    # 降秩：丢静态单位维
+        res.append(v)
+    L = [f'%e = tensor.extract_slice %a{fmt(os_)} {fmt(ns)} {fmt(ss)} : {sty(src)} to {sty(res)}']
+    out, oty = '%e', sty(res)
+    if rng.random() < 0.5:                                            # 写回：insert_slice 到 %a（尺寸沿用，偏移/步长重抽）
+        o2, _, s2 = triple(src)
+        L.append(f'%w = tensor.insert_slice %e into %a{fmt(o2)} {fmt(ns)} {fmt(s2)} : {sty(res)} into {sty(src)}')
+        out, oty = '%w', sty(src)
+    body = '\n  '.join(L)
+    return (f'func.func @main(%a: {sty(src)}, %i0: index, %i1: index, %i2: index) -> {oty} {{\n  {body}\n  return {out} : {oty}\n}}',
+            [sty(src), 'index', 'index', 'index'], [oty])
+
+def T3(n, seed=13):
+    import mlir.ir as ir, irimport as I
+    from valimport_test import derive_imported
+    rng = random.Random(seed); st = collections.Counter(); ex = collections.defaultdict(list)
+    def note(k, v):
+        if len(ex[k]) < 3: ex[k].append(v)
+    for t in range(n):
+        txt, ins, outs = gen_slice(rng)
+        try: m = ir.Module.parse(txt, ctx1()); assert m.operation.verify()
+        except Exception: st['不合法（跳过）'] += 1; continue
+        fn = I.import_module(m)['regions'][0][0]['ops'][0]
+        S, why = derive_imported(f't3_{t}', fn)
+        if S is None: st['未知/' + why[:40]] += 1; note('未知', why); continue
+        st['程序'] += 1; kind = ('降秩' if txt.count('x') and 'to tensor' in txt and len(tparse(re.search(r'to (tensor<[^>]*>)', txt).group(1))[0]) < len(tparse(ins[0])[0]) else '同秩') + ('+insert' if 'insert_slice' in txt else '')
+        st['程序/' + kind] += 1; st['程序/步长≠1'] += bool(re.search(r'\] \[[^\]]*\b[23]\b[^\]]*\] :', txt)) or '%i' in txt.split('] [')[-1]
+        n0 = st['一致']
+        res = check_fn(S, txt, 'main', ins, outs, rng, st, lambda k, v: note(k, v + '\n' + txt), f't3_{t}')
+        st['一致/' + kind] += st['一致'] - n0
+        if res:                                                         # 变异：静态偏移当 0
+            S2, _ = derive_imported(f't3_{t}_z', fn, 'static_zero')
+            runs, keys, got = res[0]
+            for (ri, j, kd, ix, mv), jv in zip(keys, got):
+                if kd != 'el' or S2 is None: continue
+                r2 = model_run(S2, ins, outs, runs[ri][0], random.Random(0))
+                if r2[0] == 'val' and ix in r2[1][j][2]: st['变异 static_zero 比较'] += 1; st['变异 static_zero 发现'] += (r2[1][j][2][ix] - jv) % 256 != 0
+    return st, ex
+
 if __name__ == '__main__':
+    if len(sys.argv) > 4 and sys.argv[4] != '0':
+        st, ex = T3(int(sys.argv[4]))
+        print('── T3 全形式切片定向:'); [print(f'   {k}: {v}') for k, v in sorted(st.items())]
+        for k, v in ex.items(): print('──', k); [print('    ', x) for x in v]
+        sys.exit()
     if len(sys.argv) > 2 and sys.argv[2] != '0':
         st, ex = T2(int(sys.argv[2]))
         print('── T2 逐元素定向:'); [print(f'   {k}: {v}') for k, v in sorted(st.items())]

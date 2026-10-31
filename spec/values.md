@@ -191,3 +191,36 @@ T2 的覆盖面：13 种二元 op（含可能 UB 的除法/取余/移位）、ns
 - 变异：pred 57/673，seed+1 88/99。
 - MLIR 已知断言崩溃 16 个（xori/cmpi x,x，上游已修）。
 - 语料另有 6 个函数有事实，但签名含非整数 tensor，harness 无法构造输入，记为跳过，不计入执行。
+
+### 9.3 第 34b 轮：全形式切片（步长、降秩/升秩、insert_slice 动态尺寸）
+
+**模型**：core 新增 `tensor.extract_slice.g` / `tensor.insert_slice.g`，端口为 offs/sizes/strides 各 r 个，参数 `drop` 记被丢弃的单位维。valimport 的切片全部翻译到这两个 op；简式切片只留给手写模型。
+- extract：`r[J] = src[o + embed(J)·s]`，被丢弃的维取 0。
+- insert：窗口为 `d−o ≥ 0 ∧ (d−o) mod s = 0 ∧ (d−o)/s < n`，源下标为 `(d−o)/s`，再去掉被丢弃的维。
+- 界内条件：o ≥ 0、n ≥ 0、s ≥ 1；n = 0 时 o ≤ e，n > 0 时 o + (n−1)·s < e；被丢弃的维 n = 1；insert 还要求源 extent 等于对应尺寸。不满足 ⇒ 毒值，`_mlir_def` 同步给出守卫。
+- s ≤ 0：MLIR 文档没有给出语义，这里按毒值处理。这比 MLIR 严，代价只是多插守卫。
+- 降秩掩码按 computeRankReductionMask 的贪心匹配计算。歧义只出现在单位维之间，被丢弃维的下标恒为 0，所以不影响值。
+- 静态 verifier 比动态语义更严（verifyInBoundsSlice：静态 offset ≥ 静态 dim 即非法，即使 size = 0）。这属于结构层的约束，值层不复制。
+
+**诊断**：core 的 ValueUnknown 现在把原因带出（`Schema.value_why`），不再只报“值层未知”。
+
+**结果**（9bae84b0 JIT）：
+
+| | 有事实 | 执行 | 比较 | 不一致 |
+|---|---|---|---|---|
+| 语料 tensor 签名 | 41（第 34 轮为 39） | 37 | 1030 | 0 |
+| T3 定向，400 生成，353 进入值层 | 353 | 112 | 743 | 0 |
+
+- 语料变异：static_zero 2/386，seed+1 90/101。
+- T3 按类别（程序数 / 一致数）：同秩 124 / 275，同秩+insert 84 / 217，降秩 65 / 61，降秩+insert 80 / 190；含步长 ≠ 1 的程序 324 个。
+- T3 变异：static_zero 136/408。
+- T3 守卫跳过 1154 组输入：负值、越界、形状不一致的区域被刻意采样，模型在这些输入上均判毒值或守卫，没有一处给出定义值。
+- MLIR 断言崩溃 6 个，都是 size 0 配动态步长，不计入一致。
+
+**分母的真实缺口**：语料仍有 95 个函数报值层未知，原因按位置统计：
+- extract_slice.g 35，insert_slice.g 15；
+- tensor.cast 15，tensor.empty 8；
+- scf.for / scf.if 携带 10；
+- 其余 12。
+
+几乎全部是“操作数或结果的元素类型未建模”（f32 等）。切片的结构缺口已经关闭；G1.4 剩下的主要缺口是浮点值层（G1.5），属于另一类工作。

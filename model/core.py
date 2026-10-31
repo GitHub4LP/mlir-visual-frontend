@@ -318,6 +318,33 @@ def _insert_slice(p, a):
     win = z3.And([z3.And(i >= o, i < o + n) for i, (o, _), n in zip(iv, offs, ext(s_))])
     res = mkt(t.sort(), ext(t), lam(iv, z3.If(win, sel(dat(s_), J), sel(dat(t), I))), lam(iv, z3.If(win, sel(tpz(s_), J), sel(tpz(t), I))))
     return [(res, z3.Or(ps, pt, _anyp(offs), _slice_oob([o for o, _ in offs], ext(s_), ext(t))))], F_
+# 第 34b 轮：MLIR 全形式切片（步长、降秩/升秩）。valimport 的切片全部翻译到这两个 op；上面的简式保留给手写模型。
+# 端口：offs/sizes/strides 各 r 个（r = 大 tensor 的秩）；参数 drop = 被丢弃的单位维（大 tensor 维号）。
+# 界内（否则毒值；MLIR 未定义，降低时守卫）：o ≥ 0、n ≥ 0、s ≥ 1、(n = 0 ⇒ o ≤ e)、(n > 0 ⇒ o + (n−1)·s < e)；
+# s ≤ 0 在 MLIR 文档中没有定义语义 ⇒ 按毒值处理（比 MLIR 严，只会多插守卫）；insert_slice 另要求源 extent = 对应尺寸。
+def _slice_ok(offs, szs, sts, es):
+    return z3.And([z3.And(o >= 0, n >= 0, s >= 1, z3.If(n == 0, o <= e, o + (n - 1) * s < e)) for o, n, s, e in zip(offs, szs, sts, es)])
+def _gsplit(a, r): return [x for x, _ in a[:r]], [x for x, _ in a[r:2 * r]], [x for x, _ in a[2 * r:3 * r]], a[:3 * r]
+def _extract_slice_g(p, a):
+    (t, pt), r = a[0], rank(a[0][0]); offs, szs, sts, ops_ = _gsplit(a[1:], r)
+    drop = set(p.get('drop') or ()); keep = [k for k in range(r) if k not in drop]
+    iv = _ivars(len(keep)); full = {k: i for k, i in zip(keep, iv)}
+    src = tuple(offs[k] + full.get(k, z3.IntVal(0)) * sts[k] for k in range(r))
+    S_ = zsort(outty(p))
+    if S_ is None or rank(z3.FreshConst(S_)) != len(keep): raise ValueUnknown('extract_slice：结果秩与 drop 不符')
+    res = mkt(S_, [szs[k] for k in keep], lam(iv, sel(dat(t), src)), lam(iv, sel(tpz(t), src)))
+    ok = z3.And(_slice_ok(offs, szs, sts, ext(t)), *[szs[k] == 1 for k in drop])
+    return [(res, z3.Or(pt, _anyp(ops_), z3.Not(ok)))], F_
+def _insert_slice_g(p, a):
+    (s_, ps), (t, pt) = a[0], a[1]; r = rank(t); offs, szs, sts, ops_ = _gsplit(a[2:], r)
+    drop = set(p.get('drop') or ()); keep = [k for k in range(r) if k not in drop]
+    if rank(s_) != len(keep): raise ValueUnknown('insert_slice：源秩与 drop 不符')
+    iv = _ivars(r); D = [i - o for i, o in zip(iv, offs)]
+    win = z3.And([z3.And(d >= 0, d % s == 0, d / s < n) for d, s, n in zip(D, sts, szs)])
+    J = tuple(D[k] / sts[k] for k in keep)
+    res = mkt(t.sort(), ext(t), lam(iv, z3.If(win, sel(dat(s_), J), sel(dat(t), tuple(iv)))), lam(iv, z3.If(win, sel(tpz(s_), J), sel(tpz(t), tuple(iv)))))
+    ok = z3.And(_slice_ok(offs, szs, sts, ext(t)), *[szs[k] == 1 for k in drop], *[e == szs[k] for e, k in zip(ext(s_), keep)])
+    return [(res, z3.Or(ps, pt, _anyp(ops_), z3.Not(ok)))], F_
 def _tcast(p, a):
     (t, pt), ty = a[0], outty(p)
     return [(mkt(zsort(ty), ext(t), dat(t), tpz(t)), z3.Or(pt, z3.Not(static_ok(t, ty))))], F_
@@ -329,14 +356,21 @@ nat('tensor.extract', [('t', 'tensor'), ('idx', 'index*')], [('r', 'E')], _extra
 nat('tensor.insert', [('v', 'E'), ('t', 'tensor'), ('idx', 'index*')], [('r', 'tensor')], _insert, reads=())
 nat('tensor.extract_slice', [('t', 'tensor'), ('offs', 'index*'), ('sizes', 'index*')], [('r', 'tensor')], _extract_slice, reads=())
 nat('tensor.insert_slice', [('s', 'tensor'), ('t', 'tensor'), ('offs', 'index*')], [('r', 'tensor')], _insert_slice, reads=())
+nat('tensor.extract_slice.g', [('t', 'tensor'), ('offs', 'index*'), ('sizes', 'index*'), ('strides', 'index*')], [('r', 'tensor')], _extract_slice_g, reads=('drop',))
+nat('tensor.insert_slice.g', [('s', 'tensor'), ('t', 'tensor'), ('offs', 'index*'), ('sizes', 'index*'), ('strides', 'index*')], [('r', 'tensor')], _insert_slice_g, reads=('drop',))
 nat('tensor.cast', [('t', 'tensor')], [('r', 'tensor')], _tcast, reads=())
 # MLIR 中这些 op 的良定义条件（不满足即 UB）。降低到 MLIR 时，不能证明它成立的地方要插守卫（L24）。
-def _mlir_def(op, a, outs_ty):
+def _mlir_def(op, a, outs_ty, pr=None):
     if op == 'tensor.dim': return z3.And(a[1][0] >= 0, a[1][0] < rank(a[0][0]))
     if op == 'tensor.extract': return inb(tuple(x for x, _ in a[1:]), ext(a[0][0]))
     if op == 'tensor.insert': return inb(tuple(x for x, _ in a[2:]), ext(a[1][0]))
     if op == 'tensor.extract_slice':
         r = rank(a[0][0]); return z3.Not(_slice_oob([o for o, _ in a[1:1 + r]], [n for n, _ in a[1 + r:1 + 2 * r]], ext(a[0][0])))
+    if op in ('tensor.extract_slice.g', 'tensor.insert_slice.g'):
+        g = op == 'tensor.extract_slice.g'; t = a[0][0] if g else a[1][0]; r = rank(t)
+        offs, szs, sts, _ = _gsplit(a[1:] if g else a[2:], r)
+        drop = set((pr or {}).get('drop') or ()); keep = [k for k in range(r) if k not in drop]
+        return z3.And(_slice_ok(offs, szs, sts, ext(t)), *[szs[k] == 1 for k in drop], *([] if g else [e == szs[k] for e, k in zip(ext(a[0][0]), keep)]))
     if op == 'tensor.insert_slice': return z3.Not(_slice_oob([o for o, _ in a[2:]], ext(a[0][0]), ext(a[1][0])))
     if op in ('tensor.splat', 'tensor.empty'): return z3.And([x >= 0 for x, _ in (a[1:] if op == 'tensor.splat' else a)])
     if op == 'tensor.cast': return static_ok(a[0][0], outs_ty[0])
@@ -455,7 +489,7 @@ class Ctx:
                     if any(isinstance(t, str) and t.startswith('tensor<') and zsort(t) is None for _, t in n['outs']):
                         raise ValueUnknown(f'{op}：结果类型值层未建模')
                 outs, ub = sch.fn(pr, args)
-                md = _mlir_def(op, args, pr['__out']) if op.startswith('tensor.') else None
+                md = _mlir_def(op, args, pr['__out'], pr) if op.startswith('tensor.') else None
                 if md is not None: s.guards.append((n['id'], z3.Implies(z3.And(g, z3.Not(_anyp(args))), md)))
             s.ub = z3.Or(s.ub, z3.And(g, ub))                           # 分支里的 UB 只在该路径上算数
             for (o, ty), r in zip(n['outs'], outs):
@@ -749,8 +783,8 @@ def derive(name, ins, outs, blocks, mode='transparent', params=()):
     try:
         ys = c.walk(blocks, T_, ())
         ys = [(v, c.static_check(f'出口.{p}', v, pv, ty, T_)) if v is not None else (v, pv) for (p, ty), (v, pv) in zip(outs, ys)]
-    except ValueUnknown:
-        sch.value_known, sch.exact = False, False
+    except ValueUnknown as e:
+        sch.value_known, sch.exact = False, False; sch.value_why = str(e)[:60]      # 第 34b 轮：原因随结果带出（警告须可读，不只是“未知”）
         reg(sch); return sch
     sch.holes, sch.outv, sch.ubf = holes, [(z3.simplify(v) if v is not None else None, z3.simplify(p)) for v, p in ys], z3.simplify(c.ub)
     sch.wf, sch.guards = c.wf, c.guards; sch.hole_sum = set(c.hole_sum)
