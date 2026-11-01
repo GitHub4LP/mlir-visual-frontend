@@ -274,12 +274,15 @@ def from_core(n):
         if (isinstance(v, str) and v.startswith('$')) or not isinstance(v, (int, bool, str, float)): raise Symbolic(k)   # $参数、z3 模式变量
     if 'value' in p:
         v = p.pop('value')
-        if not (isinstance(v, (int, bool)) or re.fullmatch(r'-?\d+|true|false', str(v))): raise Symbolic('value')
+        if not (isinstance(v, (int, bool)) or re.fullmatch(r'-?\d+|true|false', str(v))
+                or re.fullmatch(r'-?\d+\.?\d*(?:[eE][-+]?\d+)?|0x[0-9A-Fa-f]+', str(v))): raise Symbolic('value')   # 第 35 轮：浮点字面量
         own('value'); out['value'] = f"{str(v).lower() if isinstance(v, bool) else v} : {p.get('type') or n['outs'][0][1]}"
     p.pop('type', None)
     fl = [k for k in ('nsw', 'nuw') if p.pop(k, False) is True]
     if fl: own('overflowFlags'); out['overflowFlags'] = f"#arith.overflow<{', '.join(fl)}>"
     if 'predicate' in p and isinstance(p['predicate'], int): own('predicate'); out['predicate'] = f"{p.pop('predicate')} : i64"
+    fm = [k for k in ('nnan', 'ninf') if p.pop(k, False) is True]
+    if fm: own('fastmath'); out['fastmath'] = f"#arith.fastmath<{','.join(fm)}>"
     if 'exact' in p:
         if p.pop('exact') is True: own('isExact'); out['isExact'] = 'unit'
     if p: raise NotMLIR(f'未登记的 core 参数 {sorted(p)}')
