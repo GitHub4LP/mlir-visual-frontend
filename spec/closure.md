@@ -146,4 +146,20 @@ MLIR 升级后，IRDL 能力的变化会先在这里报出来。
 参照（K4，不作真值）：MLIR 自己的 inline pass 把 func.call 内联进这三种宿主时都不包 alloca_scope，大迭代全部崩溃；原样 func.call 全部正确。
 
 **MLIR 的已知不一致（只记录）**：scf.for 带 AutomaticAllocationScope trait，按 trait 语义每次迭代结束释放 alloca；canonicalize 据此把 alloca_scope 里的 alloca 提升到 scf.for（AllocaScopeHoister/内联），但 convert-scf-to-cf 不为每次迭代 stacksave/stackrestore ⇒ 栈随迭代增长。上游讨论“Should scf.for have AutomaticAllocationScope trait?”（discourse 2023-10，PR #69765）至今未定论。
-**结论**：值层 Sem 不含栈资源，按 M5.1 的精化判据这不是语义违反；但它是降级后资源性质的真实失效。前端对 scope 宿主（scf.for/forall/parallel、affine）中含 alloca 的复合 op 目前**没有可靠保证**——M5.3 状态为“部分”。可选缓解（未实现，需论证）：静态形状、不逃逸的 alloca 提升到函数入口（与 D124366 对 vector 的处理同理：新 alloca 内容未定义，复用旧缓冲是精化）。
+**结论**：值层 Sem 不含栈资源，按 M5.1 的精化判据这不是语义违反；但它是降级后资源性质的真实失效。前端对 scope 宿主（scf.for/forall/parallel、affine）中含 alloca 的复合 op 目前**没有可靠保证**——M5.3 状态为“部分”。第 38 轮已在降级管线中修复，见 §8.1。
+
+### 8.1 降级管线：作用域落成 stacksave/stackrestore（第 38 轮，model/lowering.py）
+**为什么不选“提升到函数入口”**（第 37 轮的候选缓解）：scf.parallel/forall 的迭代可能并发执行，共用一块缓冲是数据竞争；动态尺寸的 alloca 也提不出去。否决。
+**为什么不在 IR 层再包 alloca_scope**：canonicalize 会再次把它消去（AllocaScopeInliner：父 op 是作用域、且它是终结符前最后一个 op）；而且发现了第二个缺陷——
+- **D2**：alloca_scope 是 SingleBlock。体内有 scf 控制流时，scf-to-cf 先跑 ⇒ 体变成多块，校验失败；memref-to-llvm 先跑 ⇒ 多块被内联进外层 scf 的单块区域，同样失败（K9；func 顶层的 alloca_scope 只有在 memref 先降时才能通过）。这意味着第 37 轮的包裹在“复合 op 体内有控制流”时会让标准管线失败，§8 的表格只覆盖了体内是直线代码的情形。
+
+**做法**：在全部优化之后、方言降低之前，跑 `lower_alloca_scopes`：每个 alloca_scope ⇒ stacksave + 内联体 + stackrestore；体内（不进入内层作用域 op）有自动作用域分配的 scf.for/scf.parallel ⇒ 体首 stacksave、终结符前 stackrestore。这正是 trait 与 alloca_scope 的语义，也是 MemRefToLLVM 对 alloca_scope 的降低本身；llvm.intr.stacksave/stackrestore 没有区域，任意嵌套、任意降低次序下都合法。代价：降低后的 IR 依赖 LLVM 方言（JIT 与 WASM 都经 LLVM）。多块循环体不处理，报原因。
+
+**证据**（JIT；20 万次迭代，16 KB alloca）：
+- K6：三种宿主在“包 + canonicalize + 降低”后，小迭代和大迭代全部正确（scf.for 宿主在第 37 轮是崩溃的）；直接写在 scf.for 体内的 alloca：原样崩溃，降低后正确。
+- K9：复合 op 体内有 scf.if，宿主为 scf.while：标准管线校验失败；降低后小迭代、大迭代都正确。
+- K8（自生成器，只作补充；真值是 JIT）：随机嵌套 scf.for/parallel/if/while，alloca 位置随机，共 60 个程序。canonicalize 后与降低后比较 120/120 一致；外层 2 万次迭代：降低后 60/60 正确，原样 45 个崩溃，两者都正常的那些程序值也一致。
+- K7：语料中含 scf.for/parallel、可解析且可校验的 296 段，降低后 verify 全部通过；但只有 1 个循环真的被改写，覆盖很薄。
+
+**仍然开放**：alloca 逃逸未建模（拒发）；MLIR 自己的 inline pass 在非作用域宿主（scf.while）里不包作用域（K4）——前端不使用它，只作参照；D1、D2 只记录，未提 upstream。
+
