@@ -224,3 +224,44 @@ T2 的覆盖面：13 种二元 op（含可能 UB 的除法/取余/移位）、ns
 - 其余 12。
 
 几乎全部是“操作数或结果的元素类型未建模”（f32 等）。切片的结构缺口已经关闭；G1.4 剩下的主要缺口是浮点值层（G1.5），属于另一类工作。
+
+## 10 第 35 轮：浮点值层（G1.5；model/core.py 浮点节、valimport、floatjit_test.py）
+
+### 10.1 语义（逐条对 LLVM LangRef，经 arith-to-llvm 降低）
+- 类型：f16、bf16、f32、f64 ↦ z3 FPSort。f8 系列、tf32、f80/f128 不登记，值层判未知。
+- **NaN**：z3 只有一个 NaN，所以值层的相等就是“不分载荷、不分符号的 NaN 相等”。LLVM 的 NaN 结果载荷不确定，这一点与它一致。**前提**：本片段没有能观察 NaN 位的 op。具体措施：
+  - `arith.bitcast` 浮点 → 整数判未知，整数 → 浮点照常建模；
+  - copysign、`math.*` 不登记；
+  - 以后新增任何读取位的 op，都必须重新检查这个前提。
+- 运算：addf、subf、mulf、divf 按 RNE；negf、cmpf 共 16 个谓词（有序：NaN 为假；无序：NaN 为真）；maximumf/minimumf（任一 NaN ⇒ NaN，−0 < +0）。
+- **remf**：降低为 `llvm.frem`，即 C 的 fmod（结果与被除数同号），**不是** IEEE remainder（z3 fpRem）。值层由 IEEE remainder 修正得到 fmod：数学结果可精确表示，所以这一步没有误差。若直接用 fpRem，就是可靠性错误。
+- maxnumf/minnumf：±0 的结果不确定，sNaN 的语义也不稳定，因此不登记，判未知。
+- 转换：
+  - extf 精确；truncf、sitofp、uitofp 按 RNE；
+  - fptosi/fptoui 按 RTZ，NaN、±Inf 或越界 ⇒ 毒值（LangRef）。上界用 RTZ(hi) 比较：可表示的整数值都满足 `tz ≤ RTZ(hi) ⇔ tz ≤ hi`。
+- **fastmath**：
+  - nnan/ninf：操作数或结果为 NaN/Inf ⇒ 毒值（精确语义）；
+  - reassoc、nsz、arcp、contract、afn、fast：允许近似或不定符号，valimport 判未知。contract 会让降低把乘加融合，单个 op 的语义不足以描述结果。
+- 常量：十六进制按位模式；十进制按精确有理数 RNE（APFloat convertFromString）。attrsig 已能把它打印回 MLIR。
+
+### 10.2 MLIR 文档与降低不一致：truncf 的 roundingmode
+- **文档**：“rounded using the provided rounding mode”。
+- **F3 探针**：输入 ±(1+2⁻²⁴)（恰在两个 f32 的中点），5 种舍入模式在 JIT 中的结果全部是 0x3f800000 / 0xbf800000，即都按 RNE 处理。
+- **原因（推断）**：降低到 LLVM 受约束内建后，舍入模式只是“对当前动态模式的假设”，不是指令。
+- **处理**：值层判未知（不选文档语义，也不选 JIT 行为）。不提 upstream issue，只记录在此，待用户决定。
+
+### 10.3 证据（MLIR 9bae84b0 JIT；包装函数以整数位模式进出，NaN 只比较类别）
+| | 程序/函数 | 执行 | 比较 | 不一致 | NaN 结果 | 变异 pred |
+|---|---|---|---|---|---|---|
+| F1 定向（f16 115、bf16 93、f32 94、f64 98） | 400 | 397 | 3500 | 0 | 388 | 503/1182 |
+| F2 语料，含浮点的标量签名函数 | 有事实 75/204 | 68 | 1333 | 0 | 71 | 160/160 |
+
+- **输入**：60% 取特殊值（±0、±Inf、qNaN/sNaN、最小次正规、最大有限值、最小正规、带舍入位的值），其余为随机位模式。
+- **变异**：cmpf 谓词取逻辑否定。异或 1 只在相等或 NaN 时有差别，第一次试只发现 0/10，太弱，已改。
+- **语料里的未知（显式）**：bitcast 浮点 → 整数 9、fastmath contract/fast/nsz 5、roundingmode 1、多维 from_elements 2。
+- **语料里未覆盖的 op（112 个函数）**：主要是 math.*（sin 14、absf 11、powf 10、cos 8、log2 7 等）、func.call 12、complex.*。
+- **测试工具的坑**：ExecutionEngine.invoke 遇到多结果 C 接口（sret）会挂起或崩溃，已改为每个结果一个包装函数。
+
+### 10.4 边界
+- **浮点 tensor**：valimport 仍判未知。core.elementwise 对元素语义是参数化的，但还没有浮点 tensor 的 JIT 证据，按原则不开放。
+- **math 方言**：超越函数在 libm 里的实现不是正确舍入，只能建成不确定的 UF 加区间约束，否则判未知。可精确建模的 absf、ceil、floor、trunc、roundeven、sqrt、fma、copysign、isnan 等可以作为下一步。copysign 会观察 NaN 符号，需要单独论证。
