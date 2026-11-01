@@ -17,6 +17,7 @@ TRANSLATED = {
     ('arith.truncf', 'roundingmode'): '⇒ 未知：JIT 中不生效（floatjit F3），文档语义与降低不一致（values §10.2）',
     **{(f'arith.{o}', 'fastmath'): '#arith.fastmath<…>：none/nnan/ninf → 参数；reassoc/nsz/arcp/contract/afn/fast 允许近似 ⇒ 未知（第 35 轮）'
        for o in ('addf', 'subf', 'mulf', 'divf', 'remf', 'negf', 'cmpf', 'maximumf', 'minimumf', 'extf', 'truncf')},
+    **{(f'math.{o}', 'fastmath'): '同 arith（第 35b 轮）' for o in ('absf', 'ceil', 'floor', 'trunc', 'round', 'roundeven', 'sqrt', 'fma', 'isnan', 'isfinite')},
     **{(f'arith.{o}', 'overflowFlags'): '#arith.overflow<…> → nsw/nuw' for o in ('addi', 'subi', 'muli', 'shli', 'trunci')},
     **{(f'arith.{o}', 'isExact'): 'isExact → exact' for o in ('divui', 'divsi', 'shrui', 'shrsi')},
     **{(f'tensor.{o}', a): 'static_* 与动态操作数合并为 core 的全动态记法（静态项物化为 index 常量）；步长须全为 1、不降秩'
@@ -51,7 +52,7 @@ def _fp_lit(s, ty):
     if not m or m.group(2) != ty: raise Unknown(f'浮点字面量 {s[:40]}')
     return m.group(1)
 def _fastmath(s):
-    m = re.fullmatch(r'#arith\.fastmath<([\w, ]*)>', s.strip())
+    m = re.fullmatch(r'#(?:arith|math)\.fastmath<([\w, ]*)>', s.strip())
     if not m: raise Unknown(f'fastmath {s}')
     fl = {f for f in m.group(1).replace(' ', '').split(',') if f and f != 'none'}
     bad = fl - {'nnan', 'ninf'}
@@ -160,6 +161,7 @@ def to_core(blocks, flip=None):
             m['op'] = op + '.g'; p['drop'] = tuple(drop)
             m['ins'] = fixed + vals[0] + vals[1] + vals[2]
         if op == 'arith.constant' or op.startswith(('arith.', 'tensor.', 'memref.', 'ub.')): pass
+        elif op.startswith('math.') and all(re.fullmatch(r'i\d+|bf16|f16|f32|f64', t) for t in tys): pass   # 第 35b 轮：math 只开放标量（逐元素作用于 tensor/vector 无 JIT 证据）
         elif op in ('scf.for', 'scf.if', 'scf.yield', 'func.return'): pass
         else: raise Unknown(f'{op}：值层未覆盖')
         return pre + [m]
