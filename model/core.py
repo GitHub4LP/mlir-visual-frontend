@@ -680,26 +680,39 @@ class Ctx:
         (lb, plb), (ub, pub), (st, pst) = [s.env[v] for v in n['ins'][:3]]
         inits = [s.env[v] for v in n['ins'][3:]]
         if any(v is None for v, _ in inits): raise ValueUnknown('scf.for：迭代值的类型值层未建模')   # 第 32 轮
-        s.ub = z3.Or(s.ub, z3.And(g, z3.Or(plb, pub, pst, st <= 0)))
-        # 第 29 轮：归纳变量越界（最后一趟的 iv + st ≥ 2^(IW−1)）。LangRef 的文字（“iv ∈ [lb, ub) 才执行”）与 canonicalize 给出趟数
+        # 第 41 轮：iN 界（BV）与 unsignedCmp。统一到数学整数域：M(x) = 按比较方式解释的界（有符号 / 无符号），
+        #   R = 该方式下的表示范围上界（有符号 2^(w−1)，无符号 2^w；index 的 w = IW）。步长按有符号必须 > 0（LangRef：“required to be positive”；
+        #   语料 trip_count：无符号循环的负步长“invalid”）。此前 BV 界缺越界 UB 规则、摘要路径 iv 是 Int（与 BV 体不符 ⇒ 异常 ⇒ 未知）。
+        uns = bool((n.get('props') or {}).get('unsignedCmp'))
+        bv = z3.is_bv(lb); w = lb.size() if bv else IW
+        def M(x):
+            if bv: return z3.BV2Int(x, is_signed=not uns)
+            return z3.If(x < 0, x + 2 ** IW, x) if uns else x
+        def back(v):                                     # 数学整数 → 该类型的值
+            if bv: return z3.Int2BV(v, w)
+            return z3.If(v >= 2 ** (IW - 1), v - 2 ** IW, v) if uns else v
+        R = 2 ** w if uns else 2 ** (w - 1)
+        Sst = z3.BV2Int(st, is_signed=True) if bv else st
+        mL, mU = M(lb), M(ub)
+        s.ub = z3.Or(s.ub, z3.And(g, z3.Or(plb, pub, pst, Sst <= 0)))
+        # 第 29 轮：归纳变量越界（最后一趟的 iv + st 超出表示范围）。LangRef 的文字（“iv ∈ [lb, ub) 才执行”）与 canonicalize 给出趟数
         #   ⌈(ub−lb)/st⌉，但 convert-scf-to-cf 降级只比较 iv < ub，回绕后不终止（同一提交 JIT 实测）。MLIR 自身不一致 ⇒ 按 UB（两种行为都是它的精化）。
-        if z3.is_int(lb):
-            s.ub = z3.Or(s.ub, z3.And(g, z3.Not(z3.Or(plb, pub, pst)), st > 0, lb < ub, lb + ((ub - lb + st - 1) / st) * st >= HI))
+        s.ub = z3.Or(s.ub, z3.And(g, z3.Not(z3.Or(plb, pub, pst)), Sst > 0, mL < mU, mL + ((mU - mL + Sst - 1) / Sst) * Sst >= R))
         body = n['regions'][0]; iv, *its = [a for a, _ in body[0]['args']]
-        L, Ub, St = (z3.simplify(x) for x in (lb, ub, st))
+        L, Ub, St = (z3.simplify(x) for x in (mL, mU, Sst))
         if all(z3.is_int_value(x) for x in (L, Ub, St)) and St.as_long() > 0:
             l, u, k = L.as_long(), Ub.as_long(), St.as_long(); trip = max(0, -(-(u - l) // k))
             if trip <= KUNROLL:
                 cur = inits
                 for j in range(trip):
-                    s.env[iv] = (z3.IntVal(l + j * k), F_)
+                    s.env[iv] = (z3.simplify(back(z3.IntVal(l + j * k))), F_)
                     for a, c in zip(its, cur): s.env[a] = c
                     cur = s.walk(body, g, path + ((n['id'], j),))
                 for (o, _), c in zip(n['outs'], cur): s.env[o] = c
                 return
         # 摘要：体在符号状态上走一遍（收集效应、体的 UB、一步转移），不计入外层 UB
         caps = free_vals(body, set([iv] + its))
-        siv = z3.Int(fv('iv')); sits = [(z3.FreshConst(zsort(t), 'it'), z3.FreshBool('itp')) for (_, t) in body[0]['args'][1:]]
+        siv = z3.BitVec(fv('iv'), w) if bv else z3.Int(fv('iv')); sits = [(z3.FreshConst(zsort(t), 'it'), z3.FreshBool('itp')) for (_, t) in body[0]['args'][1:]]
         s.env[iv] = (siv, F_)
         for a, c in zip(its, sits): s.env[a] = c
         ub0, ne = s.ub, len(s.eff); s.ub = F_
@@ -712,11 +725,11 @@ class Ctx:
         #   语义开关（IW、IXOVF、REMSI_MIN、FLAGS_EXT、NSW）：进名字，不同设定的摘要不会被当成同一个函数。
         pn = param_refs(body)
         args += [s.params[q] if q in s.params else z3.Int(f'?unbound.${q}') for q in pn]
-        key = 'loop_' + canon(n) + '_' + sem_tag()
+        key = 'loop_' + canon(n) + '_' + sem_tag() + ('_u' if uns else '')   # 第 41 轮：比较方式改变语义 ⇒ 进名字（L18′）
         hs = hole_refs(body)
         if hs:                                   # 第 27 轮：体内有洞 ⇒ 摘要名带所属定义（否则两个定义的同形洞循环被当成同一函数）；L20 代换看不进摘要
             key += '_' + re.sub(r'[^A-Za-z0-9_]', '_', s.owner); s.hole_sum |= {(s.owner, h) for h in hs}
-        nonempty = lb < ub
+        nonempty = mL < mU
         def F(nm, rng):
             if pure:
                 return z3.Function(f'{key}.{nm}', *[a.sort() for a in args], rng)(*args) if args else z3.Const(f'{key}.{nm}', rng)
@@ -727,6 +740,8 @@ class Ctx:
         s.ax += [wf((v, p), None) for v, p in outs]
         s.exact = False
         inv = n.get('props', {}).get('inv')
+        if inv is not None and (bv or uns):
+            s.diag.append(f"{n['id']}: 不变式只支持有符号 index 循环，忽略"); inv = None
         if inv is not None:                      # inv(iv, [(值, 毒值)], {'lb','ub','st'}) -> z3 Bool
             B = {'lb': lb, 'ub': ub, 'st': st}
             pre_body = z3.And(z3.Not(z3.Or(plb, pub, pst)), lb <= siv, siv < ub, st > 0, inrange(siv),   # 边界是毒值时循环本身就是 UB，体的事实只在非毒值时需要
@@ -741,7 +756,7 @@ class Ctx:
                 if not prove(z3.Implies(z3.And(g, st > 0, nonempty), inv(lb, inits, B))):
                     s.diag.append(f"{n['id']}: 不变式在入口不一定成立（仍可靠，但出口事实只在满足入口条件时可用）")
             else: s.diag.append(f"{n['id']}: 不变式不是归纳的，忽略")
-        s.ub = z3.Or(s.ub, z3.And(g, z3.Not(z3.Or(plb, pub, pst)), st > 0, nonempty, fub))
+        s.ub = z3.Or(s.ub, z3.And(g, z3.Not(z3.Or(plb, pub, pst)), Sst > 0, nonempty, fub))
         for (o, _), c in zip(n['outs'], outs): s.env[o] = c
 
 def free_vals(blocks, bound):
