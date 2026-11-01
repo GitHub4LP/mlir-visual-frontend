@@ -43,7 +43,7 @@ A/B 级的“0 分歧”必须同时报告**触发数**（L38）和**送达率**
 | L21 | 增量 = Merkle 键 + 指纹早截断 | edit | C | 同上；预言机层的对应是 L45（A） |
 | L22 | 静态维是 extent 的投影 | shapes | B | S6 bufferize + JIT，361/361 |
 | L23 | 相等只看域内 | shapes | D | |
-| L24 | tensor 层没有 UB，降低时插守卫 | shapes | D（守卫义务 B） | 这是前端主动比 MLIR 更强的选择；守卫的充分性只有 JIT 跳过的计数，证据弱 |
+| L24 | tensor 层没有 UB，降低时插守卫 | shapes、guards.py | D（设计选择）；守卫的落地 B | 第 40 轮：守卫真正插入（guards.insert_guards），每个程序由 refines(core, 插守卫后语义) 证明可降低；JIT 越界输入 344/344，未插守卫 16 程序崩溃（values §13） |
 | L25 | 复合签名闭包：Φ ⇔ 内联后逐节点检查 ⇔ MLIR | compsig、closure | **A**（第 22 轮） | 节点检查器改为有拒绝权的层（L47）。语料切片 10703 + 变异 40681：Φ_full ≡ MLIR，Φ_ods 误拒 0（closure.md）。原 C1 的 1734/1734 承载在 typesig 上，而 typesig 在真实切片上误拒 24% |
 | L26 | 结果类型的选择须能相对表达 | compsig | D | MLIR IR 里没有对应写法；“前端强于 IR”的边界还没有精确刻画 |
 | L27 | 端口投影可靠；相对 Φ_ods 完备（第 24 轮改建在有拒绝权的层上） | closure §7 | **A** | 真实切片 24070 候选不可靠 0；其余端口已知时 ≡ Φ_ods（14821/14821） |
