@@ -402,17 +402,33 @@ def _from_elements(p, a):
     d, pz = z3.K(z3.IntSort(), _zero(e)), z3.K(z3.IntSort(), F_)
     for k, (v, pv) in enumerate(a): d, pz = z3.Store(d, k, v), z3.Store(pz, k, pv)
     return [(mkt(tsort(1, e), [z3.IntVal(len(a))], d, pz), F_)], F_
+# 第 40 轮（L24 落地，values §13）：GUARD_LOWER = “降低时对 extract/insert/dim/cast 一律插守卫”后的 MLIR 语义（guards.insert_guards）：
+#   相关操作数是毒值 ⇒ UB（scf.if 以毒值为条件）；否则良定义 ⇒ 原 op，不良定义 ⇒ 替身（extract/dim：0；insert：原 tensor；cast：tensor.empty，元素毒值）。
+#   是全局语义开关 ⇒ 进 sem_tag（L18′）。core.lowering_ok 证明 core 语义 ⊑ 此语义，才允许按此降低。
+GUARD_LOWER = False
+def _zv(x): return z3.BitVecVal(0, x.size()) if z3.is_bv(x) else z3.IntVal(0)
 def _dim(p, a):
     (t, pt), (i, pi) = a; es = ext(t)
+    if GUARD_LOWER:
+        if not es: return [(z3.IntVal(0), pi)], pi
+        val = es[-1]
+        for k in range(len(es) - 2, -1, -1): val = z3.If(i == k, es[k], val)
+        return [(z3.If(z3.And(i >= 0, i < len(es)), val, z3.IntVal(0)), pi)], pi
     if not es: return [(z3.IntVal(0), T_)], F_                        # 第 34 轮：0 维 tensor 的 dim 下标必越界 ⇒ 毒值（MLIR：UB，降低时守卫）
     val = es[-1]
     for k in range(len(es) - 2, -1, -1): val = z3.If(i == k, es[k], val)
     return [(val, z3.Or(pt, pi, i < 0, i >= len(es)))], F_
 def _extract(p, a):
     (t, pt), idx = a[0], a[1:]; I = tuple(x for x, _ in idx)
+    if GUARD_LOWER:
+        bad = z3.Or(pt, _anyp(idx)); ok = inb(I, ext(t)); v = sel(dat(t), I)
+        return [(z3.If(ok, v, _zv(v)), z3.Or(bad, z3.And(ok, sel(tpz(t), I))))], bad
     return [(sel(dat(t), I), z3.Or(pt, _anyp(idx), z3.Not(inb(I, ext(t))), sel(tpz(t), I)))], F_
 def _insert(p, a):
     (v, pv), (t, pt), idx = a[0], a[1], a[2:]; I = tuple(x for x, _ in idx)
+    if GUARD_LOWER:
+        bad = z3.Or(pt, _anyp(idx)); ok = inb(I, ext(t))
+        return [(z3.If(ok, mkt(t.sort(), ext(t), store(dat(t), I, v), store(tpz(t), I, pv)), t), bad)], bad
     return [(mkt(t.sort(), ext(t), store(dat(t), I, v), store(tpz(t), I, pv)), z3.Or(pt, _anyp(idx), z3.Not(inb(I, ext(t)))))], F_
 def _slice_oob(offs, szs, es): return z3.Or([z3.Or(o < 0, n < 0, o + n > e) for o, n, e in zip(offs, szs, es)])
 def _extract_slice(p, a):
@@ -455,6 +471,10 @@ def _insert_slice_g(p, a):
     return [(res, z3.Or(ps, pt, _anyp(ops_), z3.Not(ok)))], F_
 def _tcast(p, a):
     (t, pt), ty = a[0], outty(p)
+    if GUARD_LOWER:
+        tp = tparse(ty); es = [z3.IntVal(k) if k is not None else e for e, k in zip(ext(t), tp[0])] if tp else ext(t)
+        fresh = mkt(zsort(ty), es, z3.FreshConst(dat(t).sort(), 'empty'), lam(_ivars(len(es)), z3.BoolVal(True)))   # 与 core 的 tensor.empty 一致：元素是毒值
+        return [(z3.If(static_ok(t, ty), mkt(zsort(ty), ext(t), dat(t), tpz(t)), fresh), pt)], pt
     return [(mkt(zsort(ty), ext(t), dat(t), tpz(t)), z3.Or(pt, z3.Not(static_ok(t, ty))))], F_
 nat('tensor.splat', [('v', 'E'), ('dyn', 'index*')], [('r', 'tensor')], lambda p, a: _fill(p, a, False), reads=())
 nat('tensor.empty', [('dyn', 'index*')], [('r', 'tensor')], lambda p, a: _fill(p, a, True), reads=())
@@ -555,7 +575,7 @@ class Ctx:
         s.env, s.ub, s.eff, s.exact, s.params, s.ax, s.diag = {}, F_, [], True, params or {}, [], []
         s.owner, s.hole_sum = '', set()   # 第 27 轮：洞的项按（所属定义, hid）命名；被循环摘要吞掉的洞（L20 代换对它无效）
         s.wf, s.guards = [], []       # L22 静态维的证明义务、L24 降低到 MLIR 的守卫义务：[(节点, 公式)]
-        s.gspec = []                  # 第 39 轮：推测执行版守卫（输入可能是毒值：毒值操作数本身即违反 MLIR 良定义）
+        s.gspec, s.gpoison = [], []   # 第 39/40 轮：推测执行版守卫（输入可能是毒值：毒值操作数本身即违反 MLIR 良定义）
     def static_check(s, nid, v, pv, ty, g):
         """L22：边上的静态维不符 ⇒ 毒值；同时立义务“非毒值时成立”。返回新的毒值标志。"""
         if not is_t(v) or not tparse(ty) or all(k is None for k in tparse(ty)[0]): return pv
@@ -597,6 +617,7 @@ class Ctx:
                 s.wf += [(f"{n['id']}/{i}", z3.Implies(g, sb(f))) for i, f in getattr(sch, 'wf', ())]
                 s.guards += [(f"{n['id']}/{i}", z3.Implies(g, sb(f))) for i, f in getattr(sch, 'guards', ())]
                 s.gspec += [(f"{n['id']}/{i}", z3.Implies(g, sb(f))) for i, f in getattr(sch, 'gspec', ())]
+                s.gpoison += [(f"{n['id']}/{i}", z3.Implies(g, sb(f))) for i, f in getattr(sch, 'gpoison', ())]
                 for k, ((_, pty), (av, ap)) in enumerate(zip(sch.ins, args)): s.static_check(f"{n['id']}#{k}", av, ap, pty, g)   # 调用点义务
             else:
                 if getattr(sch, 'reads', None) is not None:
@@ -613,9 +634,12 @@ class Ctx:
                         raise ValueUnknown(f'{op}：结果类型值层未建模')
                 outs, ub = sch.fn(pr, args)
                 md = _mlir_def(op, args, pr['__out'], pr) if op.startswith('tensor.') else None
+                if md is not None and GUARD_LOWER and op in ('tensor.extract', 'tensor.insert', 'tensor.dim', 'tensor.cast'): md = None   # 已插守卫：无义务
                 if md is not None:
                     s.guards.append((n['id'], z3.Implies(z3.And(g, z3.Not(_anyp(args))), md)))
-                    s.gspec.append((n['id'], z3.Implies(g, z3.And(z3.Not(z3.Or(F_, *[p for v, p in args if v is not None and _occurs(v, md)])), md))))
+                    relp = z3.Or(F_, *[p for v, p in args if v is not None and _occurs(v, md)])
+                    s.gspec.append((n['id'], z3.Implies(g, z3.And(z3.Not(relp), md))))
+                    s.gpoison.append((n['id'], z3.Implies(g, z3.Not(relp))))   # 第 40 轮：降低插守卫要求守卫条件用到的操作数非毒值（MLIR 以毒值条件分支 = UB）
             s.ub = z3.Or(s.ub, z3.And(g, ub))                           # 分支里的 UB 只在该路径上算数
             for (o, ty), r in zip(n['outs'], outs):
                 s.env[o] = (r[0], s.static_check(n['id'], r[0], r[1], ty, g)) if r[0] is not None else r
@@ -636,6 +660,7 @@ class Ctx:
         s.wf += [(f"{path[-1][0]}/{i}", z3.Implies(g, f)) for i, f in sub.wf]
         s.guards += [(f"{path[-1][0]}/{i}", z3.Implies(g, f)) for i, f in sub.guards]
         s.gspec += [(f"{path[-1][0]}/{i}", z3.Implies(g, f)) for i, f in sub.gspec]
+        s.gpoison += [(f"{path[-1][0]}/{i}", z3.Implies(g, f)) for i, f in sub.gpoison]
         s.ax += sub.ax; s.diag += sub.diag; s.exact &= sub.exact; s.hole_sum |= {(o, h) for o, h in sub.hole_sum}
         return ys, sub.ub
 
@@ -753,7 +778,7 @@ def param_refs(blocks):
                     if isinstance(v, str) and v.startswith('$'): out.add(v[1:])
                 for r in x['regions']: sc(r)
     sc(blocks); return sorted(out)
-def sem_tag(): return f'w{IW}{IXOVF[0]}{REMSI_MIN[0]}{int(FLAGS_EXT)}{int(NSW)}'
+def sem_tag(): return f'w{IW}{IXOVF[0]}{REMSI_MIN[0]}{int(FLAGS_EXT)}{int(NSW)}' + ('G' if GUARD_LOWER else '')
 def canon(n):
     """与命名无关的结构键：输入按位置、捕获按首次出现、内部定义按出现顺序编号；不变式不参与（不改变语义）。"""
     import hashlib
@@ -916,7 +941,7 @@ def derive(name, ins, outs, blocks, mode='transparent', params=()):
         sch.value_known, sch.exact = False, False; sch.value_why = str(e)[:60]      # 第 34b 轮：原因随结果带出（警告须可读，不只是“未知”）
         reg(sch); return sch
     sch.holes, sch.outv, sch.ubf = holes, [(z3.simplify(v) if v is not None else None, z3.simplify(p)) for v, p in ys], z3.simplify(c.ub)
-    sch.wf, sch.guards, sch.gspec = c.wf, c.guards, c.gspec; sch.hole_sum = set(c.hole_sum)
+    sch.wf, sch.guards, sch.gspec, sch.gpoison = c.wf, c.guards, c.gspec, c.gpoison; sch.hole_sum = set(c.hole_sum)
     sch.exact = c.exact; sch.ax = z3.simplify(z3.And(c.ax)) if c.ax else T_; sch.loop_diag = c.diag
     sch.env = {v: c.env[v] for v in _toplevel_vals(blocks) if v in c.env}     # 顶层值的项：补全查询用
     boundary = {v: p for (p, _), (v, _) in zip(ins, blocks[0]['args'])} | {v: p for (p, _), v in zip(outs, _term(blocks))}
@@ -940,6 +965,13 @@ def shape_diag(s):
     if not s.value_known: return None
     ctx = z3.And(s.ax, no_poison(s), z3.Not(s.ubf))
     return [nid for nid, f in s.wf if not prove(z3.Implies(ctx, f))]
+def guard_plan(s):
+    """第 40 轮（L24）：降低时须插守卫的节点。返回 (须守卫的节点集合, 无法安全插守卫的节点及原因)。
+    无法安全插：守卫条件用到的操作数可能是毒值——MLIR 以毒值为条件分支是 UB，而 core 在此给毒值结果；arith 无 freeze ⇒ 不发射。"""
+    need = set(guards(s))
+    ctx = z3.And(s.ax, no_poison(s), z3.Not(s.ubf))           # 与 guards() 同一上下文：定义自身、入口非毒值
+    bad = {nid: '守卫条件的操作数可能是毒值（需 freeze）' for nid, f in getattr(s, 'gpoison', ()) if nid in need and not prove(z3.Implies(ctx, f))}
+    return need, bad
 def guards(s):
     """L24：降低到 MLIR 时需要运行期守卫的节点（不能证明 MLIR 的良定义条件成立）。在定义自身的上下文里判定。"""
     if not s.value_known: return None
@@ -974,11 +1006,11 @@ def caps(s):
 def same_sem(*ss):
     """第 28 轮：比较的两侧须在同一组语义开关下推导（原生 Schema 无 sem，按当前开关即时求值）。"""
     return len({getattr(x, 'sem', None) for x in ss} - {None}) <= 1
-def refines(src, tgt, assume=True):
+def refines(src, tgt, assume=True, cross_sem=False):
     """tgt 精化 src（把 src 改写成 tgt 有效）：src 不 UB ⇒ tgt 不 UB；src 输出不是毒值 ⇒ tgt 输出相同且不是毒值。
     只覆盖值层：任一方有效应时返回 None（值层精化不足以说明删改效应是否合法，须声明）。assume：参数的前提。"""
     if src.eff or tgt.eff: return None
-    if not same_sem(src, tgt): return None
+    if not cross_sem and not same_sem(src, tgt): return None     # cross_sem：有意比较两种语义（第 40 轮：core ⊑ 插守卫后的 MLIR 语义）
     pairs = [(ht, hs) for xs, xt in zip(src.holes, tgt.holes) for hs, ht in zip(xs, xt) if hs is not None]
     sb = lambda t: z3.substitute(t, pairs) if pairs else t
     conds = [z3.Not(sb(tgt.ubf))]
