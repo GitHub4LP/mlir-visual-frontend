@@ -129,3 +129,21 @@
 - `base "!builtin.ranked_tensor"` 加载失败。
 
 MLIR 升级后，IRDL 能力的变化会先在这里报出来。
+
+## 8 透明内联与自动分配作用域（第 37 轮，M5.3；model/core.py inline_all，allocascope_test.py）
+此前 M5.3 只在规范中：inline_all 把复合 op 体里的 memref.alloca 直接摊进宿主。
+
+**实现**：复合 op 的体（不进入内层作用域 op）含自动作用域分配 ⇒ 内联结果包一层 `memref.alloca_scope`，结果经 `alloca_scope.return` 带出。两个集合取自 ODS：分配者 = 结果装饰器 MemAlloc<AutomaticAllocationScopeResource>（本提交只有 memref.alloca；llvm 方言未导入）；作用域 op = AutomaticAllocationScope trait（affine.for/parallel、func.func、gpu.func/launch、memref.alloca_scope、scf.for/forall/parallel、shape.func）。K0 对账一致。
+**逃逸**：体内有 alloca 且复合 op 有 memref 输出 ⇒ 包作用域后可能悬垂，判定未建模 ⇒ emit_core 返回 None 并记“内联失败：alloca 逃逸”（K3），不静默发射。
+
+**证据**（MLIR 9bae84b0 JIT，fork 子进程；体内 alloca 16 KB，宿主 20 万次迭代）：
+| 宿主 | 小迭代：包/不包 | 大迭代：不包 | 大迭代：包 | 包 + canonicalize |
+|---|---|---|---|---|
+| scf.while 体 | 正确/正确 | 崩溃（栈耗尽） | 正确 | 作用域保留，正确 |
+| scf.while 内 scf.if 体 | 正确/正确 | 崩溃 | 正确 | 作用域保留，正确 |
+| scf.for 体 | 正确/正确 | 崩溃 | 正确 | **作用域被消去，崩溃** |
+
+参照（K4，不作真值）：MLIR 自己的 inline pass 把 func.call 内联进这三种宿主时都不包 alloca_scope，大迭代全部崩溃；原样 func.call 全部正确。
+
+**MLIR 的已知不一致（只记录）**：scf.for 带 AutomaticAllocationScope trait，按 trait 语义每次迭代结束释放 alloca；canonicalize 据此把 alloca_scope 里的 alloca 提升到 scf.for（AllocaScopeHoister/内联），但 convert-scf-to-cf 不为每次迭代 stacksave/stackrestore ⇒ 栈随迭代增长。上游讨论“Should scf.for have AutomaticAllocationScope trait?”（discourse 2023-10，PR #69765）至今未定论。
+**结论**：值层 Sem 不含栈资源，按 M5.1 的精化判据这不是语义违反；但它是降级后资源性质的真实失效。前端对 scope 宿主（scf.for/forall/parallel、affine）中含 alloca 的复合 op 目前**没有可靠保证**——M5.3 状态为“部分”。可选缓解（未实现，需论证）：静态形状、不逃逸的 alloca 提升到函数入口（与 D124366 对 vector 的处理同理：新 alloca 内容未定义，复用旧缓冲是精化）。
