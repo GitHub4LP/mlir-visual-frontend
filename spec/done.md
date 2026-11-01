@@ -50,3 +50,4 @@
 | L20′、L21 | 否：编辑与增量的内部一致性，真值按定义就是全量重推导（E1、E2 已对照） | 不需要外部真值；JIT 只作反例见证 |
 
 - 第 37 轮（M5.3）：inline_all 实现 alloca_scope 包裹 + 逃逸不发射；allocascope_test K0–K5（closure §8）。scf.for 宿主经 canonicalize 后栈资源无保证（MLIR trait/降低不一致，已知上游讨论），M5.3 仍为“部分”。
+- 第 38 轮（M5.3 → 检验）：lowering.lower_alloca_scopes（作用域 ⇒ stacksave/restore，在优化之后、方言降低之前）；修复 D1（scf.for trait 未被 scf-to-cf 尊重）与 D2（结构化区域内含控制流的 alloca_scope 在任何标准次序下都降不下去）。allocascope_test K6–K9。
