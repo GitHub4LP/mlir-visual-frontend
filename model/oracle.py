@@ -56,7 +56,7 @@ class Oracle:
             s.p.wait(); s.stats['崩溃'] += 1; res = ('crash', [(None, 'MLIR verifier 崩溃（断言失败），按拒绝处理')])
         else:
             ok, diags = json.loads(line)
-            ds = [(_loc(l), m) for l, m in diags]
+            ds = [(_loc(l) or (_line_loc(l, text) if ok == 'parse' and _OPDIAG.match(m) else None), m) for l, m in diags]
             if ok == 'parse' and ds and all(x is not None for x, _ in ds): ok = False   # Module.parse 解析后即校验：诊断都落在 loc("节点") 上 ⇒ 是校验拒绝
             res = ('parse' if ok == 'parse' else 'ok' if ok else 'reject', ds)
         s.stats['耗时 s'] += time.perf_counter() - t0
@@ -64,6 +64,15 @@ class Oracle:
     def close(s):
         if s.p and s.p.poll() is None: s.p.stdin.close(); s.p.wait()
 
+# 第 42 轮（L31 真实 IR，diagloc_test）：属性（properties）的约束在**解析时**检查，诊断位置是文本行列（"-":L:C）而不是 loc("节点")
+#   ⇒ 此前这类拒绝无法回映（cmpi 谓词越界 4/4）。emit 每个 op 一行、行尾带 loc ⇒ 按行号取回节点。
+#   只对 op 级诊断（"'x.y' op …"，即 op 自身的约束不满足）这样做：一般语法错误是发射器的缺陷，不能变成对用户程序的拒绝（L33）。
+_OPDIAG = re.compile(r"'[\w.]+' op ")
+def _line_loc(l, text):
+    m = re.search(r'"-":(\d+):\d+', l)
+    if not m: return None
+    lines = text.split('\n'); k = int(m.group(1)) - 1
+    return _loc(lines[k]) if 0 <= k < len(lines) else None
 def _loc(l):
     m = re.search(r'loc\("([^"]+)"\)', l)            # 只认 loc("节点")；文件行列位置（"-":2:30）是语法错误
     return m.group(1) if m else None

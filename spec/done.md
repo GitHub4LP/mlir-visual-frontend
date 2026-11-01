@@ -54,3 +54,4 @@
 - 第 39 轮（M1.8 缺口 → 检验）：caps 对照 MLIR LICM（113 实例，宽松 0）；修 caps 忽略守卫、义务不随复合 op 调用传播两处缺陷；JIT 证实本提交 MLIR remui/remsi 标 Pure 导致 LICM+O3 误编译（上游 #188263 已修）。G3.1：缺口 0。
 - 第 40 轮（L24 落地）：guards.plan（refines(core, GUARD_LOWER) 逐程序证明）+ insert_guards；guards_test G0′/G1/G2：越界输入 344/344，未插守卫 16 程序崩溃。切片守卫与语料全输入回归待做。
 - 第 41 轮（M3.8 → 检验）：iN 界的 scf.for 补越界 UB（此前不可靠）、符号界 iN 摘要、unsignedCmp；loopjit_test JIT 211/211，UB 归因 5/6 与 LangRef 不同。guards_test G3 语料：41 候选中仅 3 个需守卫，越界输入下输出全为毒值，0 组可比（证据薄，如实记录）。
+- 第 42 轮（M2.8/M5.4 → 检验）：L31 真实 IR 统计（diagloc_test，600 函数、253 个被 MLIR 拒绝的变异体，回映 253/253）；修 Oracle：解析时属性约束诊断按行号回映（只限 op 级诊断）。

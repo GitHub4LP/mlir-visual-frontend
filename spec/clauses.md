@@ -33,7 +33,7 @@
 | M2.5 | 预言机是最终权威 | oracle | modular_test:M3 单元级预言机; oracle_test:O1/O2 判定与分工 | L42 | A | 检验 | |
 | M2.6 | typesig 无拒绝权，只警告 | typesig | typesig_test:T4 接入 core | L33 | D | 检验 | 元规则，由 A 级数据支撑 |
 | M2.7 | 值层/效应/caps 无拒绝权；必然 UB 的程序合法 | core、structure | clauses_test:M2.7 | — | A | 检验 | 本轮新增回归：MLIR 接受 + 结构层无诊断 + 推导不抛异常 + UB 恒真 |
-| M2.8 | 判定顺序；诊断归位 | oracle | oracle_test:O1/O2 判定与分工; oracle_test:O3 诊断归位 | L30, L31 | B | 部分 | L31 归位率只在生成器上统计（987/987），真实 IR 无 |
+| M2.8 | 判定顺序；诊断归位 | oracle | oracle_test:O1/O2 判定与分工; oracle_test:O3 诊断归位; diagloc_test:R1; diagloc_test:R2; diagloc_test:R3 | L30, L31 | B | 检验 | 第 42 轮真实 IR：回映 253/253，落在编辑处/直接使用者 253/253；我们的层先抓 201，节点同 MLIR 200 |
 | M2.9 | 无结论是一等结果 | oracle、modular | oracle_test:O4 崩溃隔离; modular_test:M1 | L41 | D | 检验 | |
 | M3.1 | iN 语义 | core | sem_test:V1 无标志程序; sem_test:V3 定向 | L15 | B | 检验 | |
 | M3.2 | index IW 回绕；IW≠64 先降 iIW | core.set_iw | values_test:V5 JIT; values_test:V8 IW=32 | L17″, L49, L50 | A | 检验 | |
@@ -57,7 +57,7 @@
 | M5.1 | 降级含管线，Sem(g) ⊑ Sem(pipeline(⟦g⟧)) | — | shape_test:S6 与 MLIR 执行; loop_test:W2 与 MLIR 执行; allocascope_test:K6 第 38 轮 | L22 | B | 部分 | 只覆盖 bufferize、scf→cf 与作用域降低（第 38 轮）三条管线 |
 | M5.2 | 三种落地；IRDL 是不透明身份 | irdl_export、composite | irdl_boundary_test:any_of | L48 | A | 检验 | |
 | M5.3 | 内联保持作用域：alloca_scope、逃逸、自由符号；降级落成 stacksave/restore | core.inline_all、needs_alloca_scope、lowering.lower_alloca_scopes | allocascope_test:K2 A/B; allocascope_test:K6 第 38 轮; allocascope_test:K8 生成器; allocascope_test:K9 D2; allocascope_test:K3 逃逸; allocascope_test:K0 ODS 对账; core_test:自由符号 | L4 | B | 检验 | JIT：3 宿主包/不包 A/B；包+canonicalize+降低 3/3 大迭代正确；K8 60 程序 120/120 值一致、大迭代 60/60 正确（原样崩溃 45）；语料 296 段降低后 verify 全过（仅 1 个循环被改，覆盖薄）；逃逸拒发 |
-| M5.4 | 诊断经 Location 回映 | oracle | oracle_test:O3 诊断归位 | L31 | B | 部分 | 同 M2.8 |
+| M5.4 | 诊断经 Location 回映 | oracle | oracle_test:O3 诊断归位; diagloc_test:R1; diagloc_test:R2; diagloc_test:R3 | L31 | B | 检验 | 同 M2.8（第 42 轮） |
 
 ## 未引用的 A/B/C 定律
 | 律 | 理由 |
