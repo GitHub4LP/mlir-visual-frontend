@@ -265,3 +265,30 @@ T2 的覆盖面：13 种二元 op（含可能 UB 的除法/取余/移位）、ns
 ### 10.4 边界
 - **浮点 tensor**：valimport 仍判未知。core.elementwise 对元素语义是参数化的，但还没有浮点 tensor 的 JIT 证据，按原则不开放。
 - **math 方言**：超越函数在 libm 里的实现不是正确舍入，只能建成不确定的 UF 加区间约束，否则判未知。可精确建模的 absf、ceil、floor、trunc、roundeven、sqrt、fma、copysign、isnan 等可以作为下一步。copysign 会观察 NaN 符号，需要单独论证。
+
+## 11 第 35b 轮：math 方言的可精确子集（model/core.py math 节、valimport、floatjit_test.py F4 混入 F1）
+
+### 11.1 登记与理由（降低：convert-math-to-llvm → LLVM 内建，逐条 JIT 探针）
+| op | 语义 | 依据 |
+|---|---|---|
+| absf | fpAbs | llvm.fabs（NaN 只清符号，NaN 不比载荷/符号 ⇒ 安全） |
+| ceil/floor/trunc/round/roundeven | roundToIntegral RTP/RTN/RTZ/RNA/RNE | llvm.ceil/floor/trunc/round（远离零）/roundeven；探针 1.5/2.5/−1.5 |
+| sqrt | fpSqrt RNE | llvm.sqrt 正确舍入（f16/bf16/f32 探针） |
+| fma | fpFMA RNE（单次舍入） | llvm.fma；探针 (1+2⁻²³)²−(1+2⁻²²) = 2⁻⁴⁶ |
+| isnan/isfinite | 谓词 | 降到 fcmp/is.fpclass；汇编格式不接受 fastmath |
+| absi | INT_MIN ↦ INT_MIN | llvm.abs(is_int_min_poison=false)，探针 i8 −128 |
+| ctlz/cttz | 0 ↦ 位宽 | is_zero_poison=false，探针 |
+| ctpop | 位计数 | llvm.ctpop |
+
+fastmath 与 arith 同：只建 nnan/ninf，其余 ⇒ 未知。math 只开放标量；逐元素作用于 tensor/vector 无 JIT 证据 ⇒ 未知。
+
+不登记（⇒ 未知），各有理由：sin/cos/exp/log/tanh/erf/atan/powf/rsqrt…（libm 不保证正确舍入，结果依实现）；copysign（读 NaN 符号位，NaN 符号不确定）；fpowi（乘法次序未规定）；isinf/isnormal（本提交 convert-math-to-llvm 不降低，JIT 无法建立证据）；clampf（未审计）。
+
+### 11.2 证据（MLIR 9bae84b0）
+- F1（400 程序，math 混入一元/fma/谓词/整数 math）：比较 3522，一致 3521，**不一致 0**，已归因外部缺陷 1；NaN 结果 416；毒值跳过 478；cmpf 变异 458/1147。
+- F2 语料：含浮点标量签名 204 → 有事实 102（第 35 轮 75）→ 执行 94（68）→ 比较 1749/1749；UB 跳过 27，毒值 144；未覆盖函数 85（超越函数、complex、func.call 为主）。
+
+### 11.3 外部真值缺陷：LLVM AArch64 `sitofp(fptosi f16→i32/i64)→f16` 误编译
+- 现象：f16 65504 经 `fptosi → i32 → sitofp → f16` 得 32768（0x7800），−65504 得 −32768；49152 得 32768。i64 中间值无此现象（直接链路 i64 正确），fptoui/uitofp 正确（u16 可容纳 65535）。
+- 定位：MLIR 发出的 `llvm.fptosi`/`llvm.sitofp` 正确；单独 fptosi、单独 sitofp 均正确；两步之间插入不可内联的恒等调用后结果正确。与 AArch64 TableGen 模式 `(f16 (sint_to_fp (i32 (fp_to_sint f16))))` → `SCVTFv1i16 (FCVTZSv1f16 …)` 一致：中间值被缩成 16 位有符号饱和整数，i32 值域内的 32768..65504 被错误饱和。
+- 处理：模型按 LangRef（不跟随误编译）。floatjit 对含该模式且不一致的程序做 A/B 重跑（`barrier()` 插入 `@__id_iN`），同一输入在隔断版本上与模型一致才计入“已归因”，否则仍算不一致。属 LLVM 后端缺陷，非 MLIR；**未提 upstream issue**（需用户同意）。
