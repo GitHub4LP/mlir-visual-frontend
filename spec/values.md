@@ -307,3 +307,19 @@ core 保守的 15 例归因：
 - 静态下标的 extract/insert/切片 4 例：只因 tensor 操作数可能是毒值（从毒值 tensor 读 = 从毒值指针 load）而保守；'Speculatable|非毒值输入' 为真。
 
 **对前端的指导**：caps 可直接用于外提/改写的方向只有“一致”与“core 保守”；当前无宽松例。MLIR 的 Pure 不能作为前端可推测的依据（remui/remsi、tensor 越界两类反例）。
+
+## 13 第 40 轮：L24 落地——降低时真正插守卫（model/guards.py，guards_test.py）
+**问题**：core 的 tensor 层越界 ⇒ 毒值（L24，比 MLIR 更有定义），但此前“守卫”只是一个查询（core.guards），emit/降低从不插 ⇒ core 的语义没有落地。前端写出的无分支掩码 `select(i<dim, extract t[i], 0)` 在 core 中良定义，原样降到 MLIR 是 UB（越界读在 select 之前已执行）。
+
+**做法**：
+- 语义开关 `GUARD_LOWER`（进 sem_tag）：extract/insert/dim/cast 一律插守卫之后的 MLIR 语义——相关操作数是毒值 ⇒ UB（scf.if 以毒值为条件）；否则良定义走原 op，不良定义走替身（extract/dim 取 0，insert 返回原 tensor，cast 取 tensor.empty、元素为毒值，与 core 对 empty 的建模一致）。
+- `guards.plan`：分别在 core 语义与 GUARD_LOWER 语义下推导同一程序，用 `core.refines(core, 插守卫后, 入口非毒值 ∧ 入口静态维, cross_sem=True)` 证明“插守卫后的程序精化 core 程序”；剩下的、未实现守卫的义务（切片、splat/empty 尺寸）按推测版义务必须可证。两条都成立才允许降低，否则判未知、不发射。
+- `guards.insert_guards`：在 MLIR 模块上改写为 `scf.if (各维 i ult dim) {原 op} else {替身}`（cast：源的动态维 = 目标静态维）。
+- 每个程序的降低都附带一个 z3 证明（精化），而不是对守卫充分性的一般性论证。
+
+**证据**（MLIR 9bae84b0 JIT；生成器只作补充，真值是 JIT）：
+- G0′：nsw 溢出得到的毒值下标流进守卫 ⇒ 规划拒绝；普通下标 ⇒ 接受。
+- G1：120 个程序（静态/动态/二维 tensor；变量、常量、算术下标；extract/insert/dim/cast；70% 的读用无分支掩码），规划全部通过；比较 428/428 一致，其中**越界输入**（此前一律以“守卫”跳过）344/344。
+- G2 A/B：同一批输入跑未插守卫的原模块，16 个程序的 JIT 进程崩溃（SIGSEGV、堆损坏）——守卫是必要的。
+
+**边界**：切片类守卫未实现（替身 tensor 的形状须另行论证）；守卫条件的操作数可能是 MLIR 级毒值时拒绝（arith 无 freeze）。core 把 index 溢出也记作毒值（L17″），所以经 index 算术得到的下标常被拒绝——这是保守，不是错误。语料回归尚未换成插守卫后的全部输入比较。

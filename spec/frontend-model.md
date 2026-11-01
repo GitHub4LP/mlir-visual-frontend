@@ -52,7 +52,7 @@
 - 〔M3.1〕**iN**：位向量。add/sub/mul 回绕；nsw/nuw 溢出产生毒值；divui/divsi/remsi 除以 0 是 UB；毒值进入除数是 UB。
 - 〔M3.2〕**index**：IW 位补码，结果回绕（L17″，A）。目标无关的事实要对 IW ∈ {32, 64} 都成立（L49）。面向 IW≠64 的目标时，先把 index 降为 iIW，再交给 MLIR 变换（L50）。
 - 〔M3.3〕**语义参数**：节点带有值层不读的参数时，值层不给事实（L51）；导入的真实 IR 每个属性须翻译或登记为无关，否则 ⇒ 未知（L53）。
-- 〔M3.4〕**tensor**：⟨extent, 元素, 元素毒值⟩。越界产生毒值而不是 UB（L24，D 级）；降低时对不能证明在界内的节点插守卫。逐元素 arith 作用于 ranked 整数 tensor：形状不一致或任一元素 UB ⇒ UB（values §9.1–9.2）。浮点元素 tensor ⇒ 未知。
+- 〔M3.4〕**tensor**：⟨extent, 元素, 元素毒值⟩。越界产生毒值而不是 UB（L24，D 级）；降低时对 extract/insert/dim/cast 插守卫，且须证明插守卫后的语义精化 core 语义（guards.plan），切片类与毒值下标判未知（values §13）。逐元素 arith 作用于 ranked 整数 tensor：形状不一致或任一元素 UB ⇒ UB（values §9.1–9.2）。浮点元素 tensor ⇒ 未知。
 - 〔M3.5〕**浮点**：f16/bf16/f32/f64 按 IEEE-754（z3 FP），NaN 不区分载荷与符号——前提是没有观察 NaN 位的 op：bitcast f→i、copysign 判未知。remf = fmod；fastmath 只建 nnan/ninf，其余判未知；maxnumf/minnumf、truncf roundingmode 判未知（values §10）。
 - 〔M3.6〕**math**：只登记降到正确舍入或精确 LLVM 内建的子集（absf、ceil/floor/trunc/round/roundeven、sqrt、fma、isnan、isfinite、absi、ctlz/cttz/ctpop）；超越函数、copysign、fpowi、isinf/isnormal 判未知（values §11）。
 - 〔M3.7〕**精化判据**：src 不 UB ⇒ tgt 不 UB；src 非毒值 ⇒ tgt 值相同且非毒值。改写、fold、降级都用这同一个判据；外部校准是 MLIR 自己的变换（canonicalize、int-range-optimizations、sccp）在模型下必须是精化，且该变换本身要有 JIT 对照（L52）。

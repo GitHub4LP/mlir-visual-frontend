@@ -45,7 +45,7 @@ def ztensor(t, x):
     val = lin if e == 'index' else z3.Int2BV(lin, W(e))
     return C.mkt(S_, [z3.IntVal(d) for d in ex], C.lam(iv, val), C.lam(iv, z3.BoolVal(False)))
 
-def model_run(S, ins, outs, xs, rng):
+def model_run(S, ins, outs, xs, rng, guarded=False):
     """返回 ('skip', 原因) 或 ('val', [每个结果：('s', 值) | ('t', extent, {下标: 值})])。"""
     import core as C
     pairs = []
@@ -61,7 +61,7 @@ def model_run(S, ins, outs, xs, rng):
         if r == z3.unknown: return None
         so2 = z3.Solver(); so2.set('timeout', 5000); so2.add(z3.Not(f)); r2 = so2.check()
         return None if r2 == z3.unknown or (r == z3.sat and r2 == z3.sat) else r == z3.sat
-    gs = [decide(f) for _, f in S.guards]
+    gs = [] if guarded else [decide(f) for _, f in S.guards]       # guarded：降低已插守卫（第 40 轮），core 语义在越界处给毒值，照常比较
     if None in gs: return 'skip', '未定'
     if not all(gs): return 'skip', '守卫'
     u = decide(S.ubf)
@@ -69,7 +69,9 @@ def model_run(S, ins, outs, xs, rng):
     if u: return 'skip', 'UB'
     res = []
     for (v, p), t in zip(S.outv, outs):
-        if not z3.is_false(sub(p)): return 'skip', '毒值'
+        if not z3.is_false(sub(p)):
+            if guarded: res.append(('x',)); continue                 # 第 40 轮：只跳过这个毒值结果，其余结果照常比较
+            return 'skip', '毒值'
         if t in ELEM:
             vv = sub(v)
             if not (z3.is_int_value(vv) or z3.is_bv_value(vv)): return 'skip', '未定'
@@ -187,12 +189,14 @@ def jit_forked(src, calls):
     if pr.is_alive(): pr.kill()
     return r
 
-def check_fn(S, ftxt, fname, ins, outs, rng, st, note, tag, extra=()):
+def check_fn(S, ftxt, fname, ins, outs, rng, st, note, tag, extra=(), guarded=False, inputs=None):
     """对一个函数做 4 组输入；返回 [(输入, 模型结果)] 供变异复用。"""
     runs = []
-    for _ in range(4):
-        xs = mk_inputs(rng, ins); r = model_run(S, ins, outs, xs, rng)
+    for k in range(len(inputs) if inputs else 4):
+        xs = inputs[k] if inputs else mk_inputs(rng, ins)            # 保持原来的随机序列（不给 inputs 时与第 32–34b 轮完全相同）
+        r = model_run(S, ins, outs, xs, rng, guarded)
         if r[0] == 'skip': st['跳过/' + r[1]] += 1; continue
+        if all(m[0] == 'x' for m in r[1]): st['跳过/毒值'] += 1; continue
         runs.append((xs, r[1]))
     if not runs: return []
     queries = []
@@ -205,6 +209,7 @@ def check_fn(S, ftxt, fname, ins, outs, rng, st, note, tag, extra=()):
     for ri, (xs, mres) in enumerate(runs):
         for (nm, j, kind, d) in queries:
             m = mres[j]
+            if m[0] == 'x': st['跳过/毒值结果'] += 1; continue
             if kind == 's': calls.append((nm, flat(ins, xs, [], nq))); keys.append((ri, j, 's', None, m[1]))
             elif kind == 'dim': calls.append((nm, flat(ins, xs, [], nq))); keys.append((ri, j, 'dim', d, m[1][d]))
             else:
