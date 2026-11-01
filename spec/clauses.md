@@ -54,9 +54,9 @@
 | M4.8 | 应用改写：定义期证明 + 前同余 | transform | transform_test:R5 L13/L14 JIT; transform_test:R2 局部 → 整体 | L13, L14 | B | 检验 | |
 | M4.9 | 预览常量：fold 由 Sem 派生 | transform | transform_test:R3 派生的 fold; values_test:V6 canonicalize | L15 | B | 检验 | |
 | M4.10 | 增量 ≡ 全量 | edit | edit_test:E1 增量 ≡ 全量 | L20′, L21 | C | 元理论 | E1 720/720、E2 168/168 |
-| M5.1 | 降级含管线，Sem(g) ⊑ Sem(pipeline(⟦g⟧)) | — | shape_test:S6 与 MLIR 执行; loop_test:W2 与 MLIR 执行 | L22 | B | 部分 | 只覆盖 bufferize 与 scf→cf 管线 |
+| M5.1 | 降级含管线，Sem(g) ⊑ Sem(pipeline(⟦g⟧)) | — | shape_test:S6 与 MLIR 执行; loop_test:W2 与 MLIR 执行; allocascope_test:K6 第 38 轮 | L22 | B | 部分 | 只覆盖 bufferize、scf→cf 与作用域降低（第 38 轮）三条管线 |
 | M5.2 | 三种落地；IRDL 是不透明身份 | irdl_export、composite | irdl_boundary_test:any_of | L48 | A | 检验 | |
-| M5.3 | 内联保持作用域：alloca_scope、逃逸、自由符号 | core.inline_all、needs_alloca_scope | allocascope_test:K2 A/B; allocascope_test:K3 逃逸; allocascope_test:K0 ODS 对账; core_test:自由符号 | L4 | B | 部分 | 第 37 轮：非作用域宿主 JIT 包/不包 A/B（不包崩溃、包正确）；scf.for 宿主经 canonicalize 包裹被消去后崩溃（MLIR 已知不一致，closure §8） |
+| M5.3 | 内联保持作用域：alloca_scope、逃逸、自由符号；降级落成 stacksave/restore | core.inline_all、needs_alloca_scope、lowering.lower_alloca_scopes | allocascope_test:K2 A/B; allocascope_test:K6 第 38 轮; allocascope_test:K8 生成器; allocascope_test:K9 D2; allocascope_test:K3 逃逸; allocascope_test:K0 ODS 对账; core_test:自由符号 | L4 | B | 检验 | JIT：3 宿主包/不包 A/B；包+canonicalize+降低 3/3 大迭代正确；K8 60 程序 120/120 值一致、大迭代 60/60 正确（原样崩溃 45）；语料 296 段降低后 verify 全过（仅 1 个循环被改，覆盖薄）；逃逸拒发 |
 | M5.4 | 诊断经 Location 回映 | oracle | oracle_test:O3 诊断归位 | L31 | B | 部分 | 同 M2.8 |
 
 ## 未引用的 A/B/C 定律
