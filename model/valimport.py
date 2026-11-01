@@ -14,6 +14,7 @@ TRANSLATED = {
     ('arith.constant', 'value'): '整数/index 字面量 → value + type；浮点等 ⇒ 未知',
     ('arith.cmpi', 'predicate'): '谓词编号 → predicate',
     ('arith.cmpf', 'predicate'): '谓词编号 → predicate（第 35 轮）',
+    ('scf.for', 'unsignedCmp'): '单元属性 → unsignedCmp（第 41 轮：界按无符号比较，core.loop 统一到数学整数域）',
     ('arith.truncf', 'roundingmode'): '⇒ 未知：JIT 中不生效（floatjit F3），文档语义与降低不一致（values §10.2）',
     **{(f'arith.{o}', 'fastmath'): '#arith.fastmath<…>：none/nnan/ninf → 参数；reassoc/nsz/arcp/contract/afn/fast 允许近似 ⇒ 未知（第 35 轮）'
        for o in ('addf', 'subf', 'mulf', 'divf', 'remf', 'negf', 'cmpf', 'maximumf', 'minimumf', 'extf', 'truncf')},
@@ -29,7 +30,7 @@ IRRELEVANT = {
     ('memref.store', 'nontemporal'): '同上',
 }
 STRUCTURAL = {'operandSegmentSizes', 'resultSegmentSizes'}
-# 未登记（⇒ 未知）：scf.for.unsignedCmp（无符号比较的循环界，core 的循环摘要只有有符号）、memref.*.alignment（未对齐 ⇒ UB，值层未建模）
+# 未登记（⇒ 未知）：memref.*.alignment（未对齐 ⇒ UB，值层未建模）
 
 class Unknown(Exception): pass
 
@@ -130,6 +131,7 @@ def to_core(blocks, flip=None):
                 elif f == 'nuw': p['nuw'] = True
                 elif f not in ('none', ''): raise Unknown(f'未知溢出标志 {f}')
         if 'isExact' in at: p['exact'] = True
+        if op == 'scf.for' and 'unsignedCmp' in at: p['unsignedCmp'] = True
         if 'fastmath' in at: p.update(_fastmath(at['fastmath']))
         if op == 'arith.truncf' and 'roundingmode' in at: raise Unknown('arith.truncf roundingmode：降到 LLVM 受约束内建，只是对动态舍入模式的假设（§10.2）')
         if op in ('tensor.extract_slice', 'tensor.insert_slice'):
