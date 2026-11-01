@@ -14,7 +14,7 @@ import z3
 CT = {'i1': ctypes.c_bool, 'i8': ctypes.c_int8, 'i16': ctypes.c_int16, 'i32': ctypes.c_int32, 'i64': ctypes.c_int64, 'index': ctypes.c_int64}
 PIPE = ('builtin.module(one-shot-bufferize{bufferize-function-boundaries},func.func(buffer-deallocation-simplification),'
         'convert-bufferization-to-memref,expand-strided-metadata,lower-affine,convert-scf-to-cf,finalize-memref-to-llvm,'
-        'convert-arith-to-llvm,convert-index-to-llvm,convert-ub-to-llvm,convert-func-to-llvm,convert-cf-to-llvm,reconcile-unrealized-casts)')
+        'convert-math-to-llvm,convert-arith-to-llvm,convert-index-to-llvm,convert-ub-to-llvm,convert-func-to-llvm,convert-cf-to-llvm,reconcile-unrealized-casts)')   # 第 41 轮：补 math（语料 math.ctlz）
 def W(t): return 64 if t == 'index' else int(t[1:])
 def consts(t):
     w = W(t)

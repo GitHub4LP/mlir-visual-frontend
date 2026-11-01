@@ -53,3 +53,4 @@
 - 第 38 轮（M5.3 → 检验）：lowering.lower_alloca_scopes（作用域 ⇒ stacksave/restore，在优化之后、方言降低之前）；修复 D1（scf.for trait 未被 scf-to-cf 尊重）与 D2（结构化区域内含控制流的 alloca_scope 在任何标准次序下都降不下去）。allocascope_test K6–K9。
 - 第 39 轮（M1.8 缺口 → 检验）：caps 对照 MLIR LICM（113 实例，宽松 0）；修 caps 忽略守卫、义务不随复合 op 调用传播两处缺陷；JIT 证实本提交 MLIR remui/remsi 标 Pure 导致 LICM+O3 误编译（上游 #188263 已修）。G3.1：缺口 0。
 - 第 40 轮（L24 落地）：guards.plan（refines(core, GUARD_LOWER) 逐程序证明）+ insert_guards；guards_test G0′/G1/G2：越界输入 344/344，未插守卫 16 程序崩溃。切片守卫与语料全输入回归待做。
+- 第 41 轮（M3.8 → 检验）：iN 界的 scf.for 补越界 UB（此前不可靠）、符号界 iN 摘要、unsignedCmp；loopjit_test JIT 211/211，UB 归因 5/6 与 LangRef 不同。guards_test G3 语料：41 候选中仅 3 个需守卫，越界输入下输出全为毒值，0 组可比（证据薄，如实记录）。

@@ -12,7 +12,7 @@
 | ID | 条款 | 实现 | 检验 | 律 | 级 | 状态 | 外部数据 / 缺口 |
 |---|---|---|---|---|---|---|---|
 | M0.1 | 前端合法 ⇒ verifier 接受；有拒绝权的层不误拒 | structure、odssig、attrsig、symtab、oracle | odssig_test:L1 差分; obligations_test:Z2 变异差分; symtab_test:Y1 误拒; modular_test:M3 单元级预言机; attrsig_test:A1 真实属性 | L29, L30, L34a/b, L36a/b, L39, L42 | A | 检验 | M3 19641 误拒 0；Z2 8858；Y1 2108 |
-| M0.2 | 导入语义不变，否则未知 | irimport、valimport | valimport_test:A2 一致; tensorjit_test:T 语料; floatjit_test:F2 语料 | L53 | A | 部分 | 1162/1162、1030/1030、1749/1749；分母缺口：tensor 签名 41/616、浮点 102/204 有事实 |
+| M0.2 | 导入语义不变，否则未知 | irimport、valimport | valimport_test:A2 一致; tensorjit_test:T 语料; floatjit_test:F2 语料 | L53 | A | 部分 | 1274/1274（第 41 轮）、1030/1030、1749/1749；分母缺口：tensor 签名 41/616、浮点 102/204 有事实 |
 | M0.3 | 前端证明的改写 ⇒ MLIR 精化 | transform、core | transform_test:R5 L13/L14 JIT; sem_test:V2 MLIR canonicalize; values_test:V6 canonicalize | L13, L14, L15 | B | 检验 | R5 21971/0 不符 |
 | M0.4 | 强于 MLIR 只在无对应物处，标 D | — | — | L23, L24, L26 | D | 元理论 | 设计选择；L24 的守卫义务另有 B（shape S6） |
 | M0.5 | 外部真值缺陷：按规范建模，A/B 隔断才可归因 | floatjit.barrier、values_test V8/V9 | floatjit_test:barrier(; values_test:V9 index 方言 cmp; values_test:V8 IW=32 | L50, L52 | A | 检验 | 归因 4 类；每类有隔断对照 |
@@ -42,7 +42,7 @@
 | M3.5 | 浮点语义 | core 浮点节 | floatjit_test:F1 浮点定向; floatjit_test:F3 truncf roundingmode | — | B | 检验 | F1 3521/3521+1 归因 |
 | M3.6 | math 精确子集 | core math 节 | floatjit_test:MUN = | — | B | 检验 | 混入 F1；isinf/isnormal 无降低 |
 | M3.7 | 精化判据；MLIR 变换作真值须有 JIT | core.refines | sem_test:V2 MLIR canonicalize; values_test:V7 scf + sccp; values_test:V9 index 方言 cmp | L52 | A | 检验 | |
-| M3.8 | 循环摘要、不变式、越界步进 UB | core 循环节 | loopsum_test:U0 复合 op 参数; loop_test:W6 L19 JIT; loop_test:W6 归纳变量越界 | L13, L18′, L19 | B | 部分 | scf.for unsignedCmp 判未知（语料 15） |
+| M3.8 | 循环摘要、不变式、越界步进 UB | core 循环节 | loopsum_test:U0 复合 op 参数; loop_test:W6 L19 JIT; loop_test:W6 归纳变量越界; loopjit_test:L1 生成器; loopjit_test:L3 trip_count | L13, L18′, L19 | B | 检验 | 第 41 轮：iN 界补越界 UB、unsignedCmp 开放；JIT 211/211（8 种类型×比较方式），trip_count 45/45 有事实 |
 | M3.9 | ADT 降级与接口定律 | defs、core | adtjit_test:A11 L11; l12jit_test:L12 接口定律方向 | L11, L12 | B | 部分 | 毒值层依赖 L6（C） |
 | M4.1 | 放置节点：connectable 补全 | odssig | odssig_test:L1 差分 | L29, L37 | A | 检验 | 精确性由 L36b/L29 推出 |
 | M4.2 | 连边/填洞 = 项代换（摘要体内重推导） | edit、core | edit_test:E2 L20 连接洞; names_test:N1c 洞在循环摘要内 | L20′ | C | 元理论 | 内部一致性：真值按定义是全量重推导 |

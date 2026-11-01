@@ -95,3 +95,21 @@
   - `unsignedCmp`：valimport 登记为未知；
   - iN 类型的 iv：core 的循环只接受 index，其余为未知。
   以后若支持其中之一，越界条件要按该类型的位宽和有无符号来写。
+
+## 9 第 41 轮：iN 界与 unsignedCmp（core.loop，loopjit_test.py）
+**审计发现**（M3.8 原只记“unsignedCmp 判未知”）：
+1. iN（BV）界的 scf.for **缺“归纳变量越界 ⇒ UB”规则**（第 29 轮只对 index 加了）⇒ 例如 i8 循环 lb=125、ub=126、st=5：LangRef 一趟，scf-to-cf 降级后 iv 回绕成负数仍 < ub、继续执行；core 却给出确定值——不可靠。
+2. 符号界的 iN 循环在摘要路径里 iv 是 Int、体是 BV ⇒ z3 sort 异常 ⇒ 判未知（安全，但覆盖缺口）。
+3. unsignedCmp 一律未知（trip_count.mlir 15 个函数）。
+
+**修复**：统一到数学整数域。M(x) 按比较方式解释界（有符号 / 无符号；index 的 w = IW，无符号时 x<0 ⇒ x+2^IW），R 为该方式的表示上界（2^(w−1) / 2^w）。
+- 步长按有符号必须 > 0（LangRef：“required to be positive”；语料 trip_count 把无符号循环的负步长视为 invalid）⇒ 否则 UB。
+- 越界：M(lb) < M(ub) ∧ M(lb) + ⌈(M(ub)−M(lb))/st⌉·st ≥ R ⇒ UB（index 有符号时与第 29 轮公式相同）。
+- 静态展开：iv = back(M(lb) + j·st)；摘要：siv 取体的类型（BV/Int），nonempty = M(lb) < M(ub)；比较方式进摘要名（L18′）。不变式只支持有符号 index 循环（其余给诊断后忽略）。
+- valimport 登记 unsignedCmp；attrsig 回发 unsignedCmp。
+
+**证据**（MLIR 9bae84b0 JIT；生成器只作补充）：
+- L3：trip_count.mlir 45/45 有事实（含 unsignedCmp 15 个）。
+- L1：40 个程序覆盖 i8/i16/i32/index × 有符号/无符号全部 8 种组合；界与步长取边界附近的值（跨 0、跨符号位、负步长、零步长）。每组输入把界常量化，由 core 精确展开，与原函数（界作参数）的 JIT 比较：211/211 一致，其中 106 组趟数 ≥ 1。符号界版本 40/40 有事实（此前 iN 符号界异常 ⇒ 未知）。
+- L2 UB 归因：core 判越界 UB 的 6 组里，5 组 JIT 结果与 LangRef 文字（不回绕、按趟数）不同 ⇒ “按 UB”是必要的；步长 ≤ 0 的 103 组中 30 组 JIT 不终止，73 组终止。两种情形下，core 判 UB 都是 MLIR 各种行为的共同精化。
+- 语料回归（valimport_test A2，同时补上 convert-math-to-llvm）：有事实 188→203，执行 157→173，比较 1162→1274，全部一致；JIT 不可用 1→0。

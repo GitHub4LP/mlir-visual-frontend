@@ -3,6 +3,8 @@
   G1 生成器（只作补充；真值是 JIT）：tensor 参数 + index 参数，extract/insert/dim/cast 用变量/算术下标；
      插守卫（guards.insert_guards，对全部 extract/insert/dim/cast）后的模块 vs core 语义，**包括越界输入**（此前一律“守卫”跳过）。
   G2 A/B：同一批输入跑**未插守卫**的原模块：越界输入上出现不一致/崩溃 ⇒ 守卫是必要的（否则 G1 的一致只是巧合）。
+  G3 语料（第 41 轮）：tensor 签名语料函数中需要守卫的（此前越界输入一律跳过），插守卫后用常规 + 越界输入对 JIT；
+     报：需守卫函数数、规划接受/拒绝（按原因）、比较数（其中越界输入）。
   G0′ 定向：nsw 溢出得到的毒值下标进守卫 ⇒ 必须拒绝；普通下标 ⇒ 必须接受。
 用法：PYTHONPATH=model python3 model/guards_test.py [G1 程序数] [语料文件数上限]
 """
@@ -113,6 +115,61 @@ def G1(N, seed=17):
         TJ.check_fn(S, txt, 'main', ins, outs, random.Random(t), ab, lambda k, v: note('A/B ' + k, v), f'g1_{t}', guarded=True, inputs=xs)
     return st, ab, ex
 
+def _g3_file(path, q, seed):
+    import mlir.ir as ir, irimport as I, core as C
+    from compcorpus_test import _walk, _funcs
+    from valimport_test import derive_imported
+    rng = random.Random(seed); st = collections.Counter(); ex = collections.defaultdict(list)
+    def note(k, v):
+        if len(ex[k]) < 3: ex[k].append(v)
+    src = open(path).read()
+    if 'allow-unregistered-dialect' in src: q.put((st, dict(ex))); return
+    covered = set(C.REG) | {'scf.for', 'scf.if', 'scf.yield'}
+    for ci, ch in enumerate(I.split_chunks(src)):
+        if not ch.strip() or I.expected(ch): continue
+        try: m = ir.Module.parse(ch, TJ.ctx1()); root = I.import_module(m)
+        except Exception: continue
+        for fi, fn in enumerate(_funcs(root)):
+            blocks = fn['regions'][0]; ft = fn['props']['_attrs'].get('function_type')
+            if len(blocks) != 1 or not ft or not re.search(r'tensor<', ft): continue
+            if any(x['op'] not in covered and x['op'] != 'func.return' for x in _walk(fn) if x is not fn): continue
+            ins = [t for _, t in blocks[0]['args']]
+            mm = re.fullmatch(r'\((.*)\) -> \(?([^()]*?)\)?', ft)
+            outs = [x.strip() for x in mm.group(2).split(',')] if mm and mm.group(2).strip() else []
+            if not all(TJ.ok_ty(t) for t in ins + outs): continue
+            S, why = derive_imported(f'g3{seed}_{ci}_{fi}', fn)
+            if S is None: continue
+            st['有事实（候选）'] += 1
+            if not C.guards(S): continue
+            st['需守卫的函数'] += 1
+            name = fn['props']['_attrs']['sym_name'].strip('"')
+            ftxt = next((str(o.operation) for o in m.body.operations if o.operation.name == 'func.func' and
+                         str(o.operation.attributes['sym_name']).strip('"') == name), None)
+            gtxt, why, _ = lower(ftxt, fn, f'g3{seed}_{ci}_{fi}')
+            if gtxt is None: st['规划拒绝/' + why[:28]] += 1; note('拒绝', f'{path}:{name} {why}'); continue
+            st['规划接受'] += 1
+            fname = name if re.fullmatch(r'[A-Za-z_][\w.$]*', name) else f'"{name}"'
+            xs = oob_inputs(rng, ins, 8)
+            xg = [x for x in xs if TJ.model_run(S, ins, outs, x, random.Random(0))[1] == '守卫']
+            xn = [x for x in xs if x not in xg]
+            st['输入中原先因守卫跳过'] += len(xg)
+            sg = collections.Counter()
+            if xn: TJ.check_fn(S, gtxt, fname, ins, outs, random.Random(seed), st, note, f'{path}:{name}', guarded=True, inputs=xn)
+            if xg: TJ.check_fn(S, gtxt, fname, ins, outs, random.Random(seed), sg, note, f'{path}:{name}', guarded=True, inputs=xg)
+            for k2, v2 in sg.items(): st[k2] += v2; st['越界输入/' + k2] += v2
+    q.put((st, dict(ex)))
+
+def G3(lim=10 ** 9):
+    import multiprocessing as mp
+    tot = collections.Counter(); exs = collections.defaultdict(list); ctxm = mp.get_context('fork')
+    for i, path in enumerate(sorted(glob.glob('corpus/*/*.mlir'))[:lim]):
+        q = ctxm.Queue(); pr = ctxm.Process(target=_g3_file, args=(path, q, i)); pr.start()
+        try: s, ex = q.get(timeout=600)
+        except Exception: pr.kill(); tot['文件超时/崩溃'] += 1; continue
+        pr.join(); tot.update(s)
+        for k, v in ex.items(): exs[k] += v[:2]
+    return tot, exs
+
 def G0():
     import mlir.ir as ir, irimport as I
     cases = {'nsw 毒值下标（须拒绝）': ('''func.func @main(%t: tensor<?xi8>, %i0: index, %i1: index, %s: i8) -> (i8) {
@@ -132,6 +189,11 @@ def G0():
 
 if __name__ == '__main__':
     N = int(sys.argv[1]) if len(sys.argv) > 1 else 120
+    if len(sys.argv) > 2:
+        t3, e3 = G3(int(sys.argv[2]))
+        print('── G3 语料（插守卫）:'); [print(f'   {k}: {v}') for k, v in sorted(t3.items())]
+        for k, v in e3.items(): print('──', k); [print('    ', x[:300]) for x in v[:10]]
+        if N == 0: sys.exit(0 if t3['不一致'] == 0 else 1)
     g0 = G0(); print('── G0′:', g0)
     st, ab, ex = G1(N)
     print('── G1 插守卫后 vs core（含越界输入）:'); [print(f'   {k}: {v}') for k, v in sorted(st.items())]
