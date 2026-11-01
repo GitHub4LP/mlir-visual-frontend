@@ -285,6 +285,8 @@ def from_core(n):
     if fm: own('fastmath'); out['fastmath'] = f"#arith.fastmath<{','.join(fm)}>"
     if 'exact' in p:
         if p.pop('exact') is True: own('isExact'); out['isExact'] = 'unit'
+    if 'unsignedCmp' in p:                                                   # 第 41 轮：scf.for 的无符号比较
+        if p.pop('unsignedCmp') is True: own('unsignedCmp'); out['unsignedCmp'] = 'unit'
     if p: raise NotMLIR(f'未登记的 core 参数 {sorted(p)}')
     return out
 
