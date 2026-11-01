@@ -44,7 +44,7 @@
 | 23 | Speculatable | caps 派生（含毒值输入） | E | ◐ | 第 21 轮降级：只有 X3 自证（C）；未与 MLIR 的 getSpeculatability 差分 |
 | 24 | MemoryEffects | compose_eff | S | ◐ | 第 21 轮降级：L7 只有自证（C）；llvm.ptr 的别名是 S |
 | 25 | Resource、Target 细分 | effect 三元组 | S | ◐ | 只有 Default |
-| 26 | AutomaticAllocationScope、alloca | 透明模式自动包 alloca_scope；memref 输出逃逸 ⇒ 不发射 | E | ◐ | 第 37 轮实现，closure §8：非作用域宿主 JIT 证据；scf.for 宿主经 canonicalize 后失效（MLIR trait/降低不一致） |
+| 26 | AutomaticAllocationScope、alloca | 透明模式自动包 alloca_scope；memref 输出逃逸 ⇒ 不发射 | E | ◐ | 第 37/38 轮：包裹 + 降级时落成 stacksave/restore（closure §8/§8.1），JIT A/B + 生成器 |
 | 27 | 下标、extent（slice、pad…） | extent 是 index 值（ℤ），静态维是投影（L22） | E | ◐ | shapes.md：9 个 tensor op 并入 core，bufferize 后 JIT 差分 1049/1049；pad、多维 stride、memref 形状未做；Presburger 显示层未接 |
 | 28 | 循环（scf.for、LoopLike、scf.while） | 静态展开 / 按结构命名的 UF 摘要（L18′：第 26 轮补体内参数为实参、语义开关进名字）/ 归纳检查过的不变式（L19） | E/S/D | ◐ | core 已有 scf.for，loops.md；while ✗；isl power 未并入 |
 | 29 | RegionBranchOpInterface | scf.if 守卫；R8 控制流边类型 | E | ◐ | 第 15 轮更正：R8 只覆盖 func/scf.if/scf.for/scf.execute_region（3949 实例），scf.while、scf.parallel、tensor.pad 等 914 实例的边类型是 C++（declared），交预言机；Z2 漏判 57 全在此（obligations.md） |

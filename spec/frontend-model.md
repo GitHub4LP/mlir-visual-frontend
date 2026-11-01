@@ -76,13 +76,13 @@
 - 表中“代价”列是本原型的测量，不是规范。
 
 ## 5 降级 ⟦·⟧ 与它的义务
-- 〔M5.1〕⟦·⟧ 包含 pass 管线，不只是 IR 翻译。判据是 Sem(g) ⊑ Sem(pipeline(⟦g⟧))。反例：LICM 提升 tensor.extract，bufferize 之后变成无条件的 load（difftest/）。
+- 〔M5.1〕⟦·⟧ 包含 pass 管线，不只是 IR 翻译。判据是 Sem(g) ⊑ Sem(pipeline(⟦g⟧))；资源性质（栈）也要经管线保持（M5.3）。反例：LICM 提升 tensor.extract，bufferize 之后变成无条件的 load（difftest/）。
 - 〔M5.2〕复合 op 有三种落地方式：内联（透明，默认）；func + call（不透明）；IRDL op（不透明，有 MLIR 身份）。IRDL 只能表达 any/is/相等，所以不透明模式下使用点仍由前端用 Φ 判定（L48）。
-- 〔M5.3〕内联要保持作用域：体内有自动作用域分配（ODS 导出的集合）时包一层 alloca_scope；有 memref 输出时判逃逸未建模、不发射；遇到自由符号时要判定两种模式下解析是否一致（L4）。scf.for 等作用域宿主经 MLIR canonicalize 后包裹被消去、降低不释放，栈资源无保证（closure §8）。
+- 〔M5.3〕内联要保持作用域：体内有自动作用域分配（ODS 导出的集合）时包一层 alloca_scope；有 memref 输出时判逃逸未建模、不发射；遇到自由符号时要判定两种模式下解析是否一致（L4）。降级管线在全部优化之后、方言降低之前把作用域语义落成 stacksave/stackrestore（lowering.lower_alloca_scopes），因为本提交 MLIR 的标准降低不尊重 scf.for 的作用域 trait，且降不下体内有控制流的结构化区域内 alloca_scope（closure §8.1）。
 - 〔M5.4〕后端诊断通过 Location（节点 id）回映到节点（L31）。
 
 ## 6 当前已知的不足（非规范；按 clauses.md 的“缺口/部分”行处理）
 - 值层复合摘要的毒值依赖（L6）仍是 C；caps（M1.8）没有外部真值。
-- M5.3：作用域宿主（scf.for 等）中含 alloca 的复合 op，降级后栈资源无保证（MLIR trait 与 scf-to-cf 降低不一致）；M5.1 只在 tensor/bufferize 与 scf→cf 管线上有差分。
+- M5.3：alloca 逃逸未建模（拒发）；多块循环体不处理（报原因）；M5.1 只在 tensor/bufferize、scf→cf 与作用域降低三条管线上有差分。
 - 值层未覆盖：浮点 tensor、memref 内容、cf 多块、scf.while、func.call、complex、超越函数（均判未知）。
 - 递归、方言注册与版本、transform 方言、DataFlow、bytecode、WASM：coverage 里是 ✗。

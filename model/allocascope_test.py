@@ -6,10 +6,18 @@
   K3 逃逸：体内 alloca 且有 memref 输出 ⇒ emit_core 返回 None 并记 WHY（不静默发射悬垂指针）。
   K5 包之后再跑 MLIR canonicalize：宿主为作用域 op（scf.for）时，alloca_scope 被内联/提升到 scf.for（依 trait 语义正确），
      而 scf-to-cf 不为每次迭代 stacksave/restore ⇒ 大迭代崩溃。这是 MLIR trait 与降低之间的已知不一致（只记录，不作模型缺陷）。
+  K6 第 38 轮：前端管线在优化之后、方言降低之前跑 lowering.lower_alloca_scopes（作用域 ⇒ stacksave/stackrestore）：
+     包+canonicalize+恢复、以及直接写在 scf.for 体内的 alloca（无复合 op），大迭代均应正确；值不变。
+  K9 D2：复合 op 体内有 scf.if + alloca（包成 alloca_scope 后体内有控制流），宿主 scf.while：标准管线降不下去（校验失败），
+     经 lower_alloca_scopes 后大迭代正确。
+  K7 语料安全性：对每个可解析、可校验的语料段跑恢复，恢复后仍须通过 MLIR verifier；报包裹数与未处理原因。
   K4 MLIR 自己的 inline pass（func.call → 内联）在同一宿主下的行为，作参照记录（不作为真值）。
 """
 import os, sys, re, collections, multiprocessing as mp
 HERE = os.path.dirname(os.path.abspath(__file__))
+def LWrun(m):
+    import lowering as LW
+    st, why = LW.lower_alloca_scopes(m); return sum(st.values()), why
 
 BODY = '''func.func @body(%x: i32) -> i32 {
   %m = memref.alloca() : memref<4096xi32>
@@ -125,6 +133,99 @@ def K0():
             if any(J.ref(t) == 'AutomaticAllocationScope' for t in d[n]['traits']): scope.add(opn)
     return alloc == C.SCOPE_ALLOC and scope == C.SCOPE_OPS, dict(alloc=sorted(alloc), scope=sorted(scope))
 
+def _k7_child(seg, q):
+    import mlir.ir as ir, lowering as LW
+    try:
+        with ir.Context() as ctx:
+            ctx.allow_unregistered_dialects = False
+            m = ir.Module.parse(seg)
+            if not m.operation.verify(): q.put(('skip', 0, [])); return
+            k, why = LWrun(m)
+            q.put(('ok' if m.operation.verify() else 'bad', k, why))
+    except Exception as e: q.put(('skip', 0, []))
+def K7(root=os.path.join(HERE, '..', 'corpus')):
+    st = collections.Counter(); ctx = mp.get_context('fork')
+    for dp, _, fs in os.walk(root):
+        for f in sorted(fs):
+            if not f.endswith('.mlir') or 'invalid' in f: continue
+            for seg in open(os.path.join(dp, f)).read().split('// -----'):
+                if 'scf.for' not in seg and 'scf.parallel' not in seg: continue
+                q = ctx.Queue(); p = ctx.Process(target=_k7_child, args=(seg, q)); p.start(); p.join(60)
+                if p.is_alive(): p.kill(); st['超时'] += 1; continue
+                if p.exitcode != 0: st['MLIR 崩溃（不计）'] += 1; continue
+                r, k, why = q.get()
+                st[{'ok': '恢复后 verify 通过', 'bad': '恢复后 verify 失败', 'skip': '原段不可解析/不可校验（不计）'}[r]] += 1
+                st['包裹的循环'] += k
+                for w in why: st['未处理：' + w] += 1
+    st.setdefault('恢复后 verify 失败', 0)
+    return st
+
+def gen(rng):
+    """K8 生成器（补充证据，不作真值；真值是 JIT 原样 vs 恢复）：嵌套 scf.for / scf.parallel / scf.if / scf.while，alloca 位置随机。"""
+    cnt = [0]
+    def v(): cnt[0] += 1; return f'%v{cnt[0]}'
+    def alloca_use(acc, ind):
+        m, a, b = v(), v(), v(); sz = rng.choice([4, 64, 1024])
+        return [f'{ind}{m} = memref.alloca() : memref<{sz}xi32>', f'{ind}memref.store {acc}, {m}[%c1] : memref<{sz}xi32>',
+                f'{ind}{a} = memref.load {m}[%c1] : memref<{sz}xi32>', f'{ind}{b} = arith.addi {a}, %one : i32'], b
+    def body(acc, ind, depth):
+        L = []; cur = acc
+        for _ in range(rng.randint(1, 3)):
+            k = rng.choice(['alloca', 'alloca', 'arith'] + (['for', 'if', 'while', 'par'] if depth < 2 else []))
+            if k == 'alloca': ls, cur = alloca_use(cur, ind); L += ls
+            elif k == 'arith': r = v(); L.append(f'{ind}{r} = arith.muli {cur}, %three : i32'); cur = r
+            elif k == 'for':
+                r, i, a = v(), v(), v(); n = rng.randint(1, 3)
+                inner, y = body(a, ind + '  ', depth + 1)
+                L += [f'{ind}{r} = scf.for {i} = %c0 to %c{n} step %c1 iter_args({a} = {cur}) -> (i32) {{'] + inner + [f'{ind}  scf.yield {y} : i32', f'{ind}}}']; cur = r
+            elif k == 'if':
+                r = v(); inner, y = body(cur, ind + '  ', depth + 1)
+                L += [f'{ind}{r} = scf.if %t -> (i32) {{'] + inner + [f'{ind}  scf.yield {y} : i32', f'{ind}}} else {{', f'{ind}  scf.yield {cur} : i32', f'{ind}}}']; cur = r
+            elif k == 'while':
+                r, i, a, i2, a2, c, i3 = v(), v(), v(), v(), v(), v(), v(); n = rng.randint(1, 3)
+                inner, y = body(a2, ind + '  ', depth + 1)
+                L += [f'{ind}{r}:2 = scf.while ({i} = %c0, {a} = {cur}) : (index, i32) -> (index, i32) {{',
+                      f'{ind}  {c} = arith.cmpi slt, {i}, %c{n} : index', f'{ind}  scf.condition({c}) {i}, {a} : index, i32',
+                      f'{ind}}} do {{', f'{ind}^bb0({i2}: index, {a2}: i32):'] + inner + [f'{ind}  {i3} = arith.addi {i2}, %c1 : index', f'{ind}  scf.yield {i3}, {y} : index, i32', f'{ind}}}']
+                cur = f'{r}#1'
+            else:                                                  # scf.parallel：每次迭代写自己的格子，之后求和（顺序降低下无竞争）
+                i, j, s0, r, a, b2 = v(), v(), v(), v(), v(), v(); n = rng.randint(1, 3)
+                inner, y = body(cur, ind + '  ', depth + 1)
+                L += [f'{ind}scf.parallel ({i}) = (%c0) to (%c{n}) step (%c1) {{'] + inner + [f'{ind}  {b2} = arith.index_cast {i} : index to i32', f'{ind}  {a} = arith.addi {y}, {b2} : i32',
+                      f'{ind}  memref.store {a}, %buf[{i}] : memref<4xi32>', f'{ind}  scf.reduce', f'{ind}}}']
+                L += [f'{ind}{r} = scf.for {j} = %c0 to %c{n} step %c1 iter_args({s0} = {cur}) -> (i32) {{']
+                ld, ad = v(), v()
+                L += [f'{ind}  {ld} = memref.load %buf[{j}] : memref<4xi32>', f'{ind}  {ad} = arith.addi {s0}, {ld} : i32', f'{ind}  scf.yield {ad} : i32', f'{ind}}}']; cur = r
+        return L, cur
+    inner, y = body('%acc', '    ', 0)
+    return '\n'.join(['func.func @main(%x: i32, %n: index) -> i32 {', '  %c0 = arith.constant 0 : index', '  %c1 = arith.constant 1 : index',
+        '  %c2 = arith.constant 2 : index', '  %c3 = arith.constant 3 : index', '  %one = arith.constant 1 : i32', '  %three = arith.constant 3 : i32',
+        '  %t = arith.constant true', '  %buf = memref.alloca() : memref<4xi32>',
+        '  %r = scf.for %i = %c0 to %n step %c1 iter_args(%acc = %x) -> (i32) {'] + inner + [f'    scf.yield {y} : i32', '  }', '  return %r : i32', '}'])
+
+def K8(N=60, seed=0):
+    import random, mlir.ir as ir, lowering as LW
+    from mlir.passmanager import PassManager
+    rng = random.Random(seed); st = collections.Counter()
+    for _ in range(N):
+        src = gen(rng)
+        with ir.Context():
+            try: m = ir.Module.parse(src)
+            except Exception as e: st['生成不合法（不计）'] += 1; continue
+            PassManager.parse('builtin.module(canonicalize)').run(m.operation); canon = str(m)
+            k, why = LWrun(m); ok = m.operation.verify(); rest = str(m)
+        st['程序'] += 1; st['恢复包裹的循环'] += k; st['恢复后 verify 失败'] += not ok
+        for w in why: st['未处理：' + w] += 1
+        for x, n in ((3, 4), (-5, 2)):
+            a, b = run(canon, x, n), run(rest, x, n)
+            st['值比较'] += 1
+            if a[0] != 'ok': st[f'原样 {a[0]}（不计）'] += 1; continue
+            st['一致' if a == b else '不一致'] += 1
+        big = run(rest, 1, 20000); st[f'恢复后 2 万次外层迭代 {big[0]}'] += 1
+        big0 = run(canon, 1, 20000); st[f'原样 2 万次外层迭代 {big0[0]}'] += 1
+        if big[0] == 'ok' and big0[0] == 'ok': st['大迭代值一致' if big == big0 else '大迭代值不一致'] += 1
+    return st
+
 def K4(host, x, n):
     """MLIR 参照：原样（func.call）与 MLIR inline pass 之后。"""
     import mlir.ir as ir
@@ -160,10 +261,54 @@ if __name__ == '__main__':
             m = ir.Module.parse(on); PassManager.parse('builtin.module(canonicalize)').run(m.operation); c = str(m)
         r = run(c, 7, BIG)
         st[f'K5 {h}/包+canonicalize：scope {"保留" if "alloca_scope" in c else "被消去"}，大迭代 {"正确" if r == ("ok", (7 + BIG) & 0xffffffff) else r[0]}'] += 1
+    import lowering as LW
+    def restored(txt, canon=True):
+        with ir.Context():
+            m = ir.Module.parse(txt)
+            if canon: PassManager.parse('builtin.module(canonicalize)').run(m.operation)
+            k, why = LWrun(m); ok = m.operation.verify(); return str(m), k, why, ok
+    for h, txt in HOSTS.items():
+        c, k, why, ok = restored(emit(txt, True))
+        for nn in (SMALL, BIG):
+            r = run(c, 7, nn)
+            st[f'K6 {h}/包+canonicalize+恢复 n={nn}：{"正确" if r == ("ok", (7 + nn) & 0xffffffff) else r[0]}，恢复包裹 {k}，verify={ok}'] += 1
+    direct = '''func.func @main(%x: i32, %n: index) -> i32 {
+  %c0 = arith.constant 0 : index
+  %c1 = arith.constant 1 : index
+  %r = scf.for %i = %c0 to %n step %c1 iter_args(%acc = %x) -> (i32) {
+    %m = memref.alloca() : memref<4096xi32>
+    memref.store %acc, %m[%c0] : memref<4096xi32>
+    %v = memref.load %m[%c0] : memref<4096xi32>
+    %one = arith.constant 1 : i32
+    %y = arith.addi %v, %one : i32
+    scf.yield %y : i32
+  }
+  return %r : i32
+}'''
+    for nm, t in (('原样', direct), ('恢复', restored(direct, False)[0])):
+        r = run(t, 7, BIG); st[f'K6 直接 scf.for 体内 alloca/{nm}：{"正确" if r == ("ok", (7 + BIG) & 0xffffffff) else r[0]}'] += 1
+    BODY_IF = BODY.replace('  %r = arith.addi %v, %w : i32\n  return %r : i32', '''  %t = arith.constant true
+  %r = scf.if %t -> (i32) {
+    %q = arith.addi %v, %w : i32
+    scf.yield %q : i32
+  } else {
+    scf.yield %v : i32
+  }
+  return %r : i32''')
+    assert BODY_IF != BODY
+    on = emit(HOSTS['while'], True, BODY_IF)
+    r0 = run(on, 7, SMALL); st[f'K9 体内 scf.if：标准管线 {r0[0]}'] += 1
+    c, k, why, ok = restored(on, False)
+    for nn in (SMALL, BIG):
+        r = run(c, 7, nn); st[f'K9 体内 scf.if：降低后 n={nn} {"正确" if r == ("ok", (7 + nn) & 0xffffffff) else r[0]}'] += 1
+    k7 = K7(); print('── K7 语料:', dict(k7))
+    k8 = K8(); print('── K8 生成器 原样 vs 恢复（JIT）:', dict(k8))
     O.WHY_NONE.clear()
     e = emit(HOSTS['for'].replace('%y = func.call @body(%acc) : (i32) -> i32', '%mm = func.call @body(%acc) : (i32) -> memref<4xi32>\n    %y = arith.addi %acc, %acc : i32'), True, ESC)
     st[f'K3 逃逸 ⇒ {"None" if e is None else "发射了"} {dict(O.WHY_NONE)}'] += 1
     for k in sorted(st): print('  ', k, st[k])
     for b in bad: print('  ', b)
+    must = [k for k in st if k.startswith('K6') and ('恢复' in k) and '正确' in k]
+    k6ok = len(must) == 2 * len(HOSTS) + 1 and st[f'K9 体内 scf.if：降低后 n={BIG} 正确'] and k7['恢复后 verify 失败'] == 0 and k8['不一致'] == 0 and k8['恢复后 verify 失败'] == 0 and k8['一致'] > 0 and k8['大迭代值不一致'] == 0 and k8['恢复后 2 万次外层迭代 ok'] == k8['程序']
     must = [f'K2 {h}/包 大迭代 正确' for h in HOSTS] + [f'K1 {h}/包 小迭代 正确' for h in HOSTS]
-    sys.exit(0 if ok0 and not bad and all(st[k] for k in must) and e is None else 1)
+    sys.exit(0 if ok0 and not bad and all(st[k] for k in must) and e is None and k6ok else 1)
