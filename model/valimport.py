@@ -13,6 +13,10 @@ KDYN = -9223372036854775808
 TRANSLATED = {
     ('arith.constant', 'value'): '整数/index 字面量 → value + type；浮点等 ⇒ 未知',
     ('arith.cmpi', 'predicate'): '谓词编号 → predicate',
+    ('arith.cmpf', 'predicate'): '谓词编号 → predicate（第 35 轮）',
+    ('arith.truncf', 'roundingmode'): '⇒ 未知：JIT 中不生效（floatjit F3），文档语义与降低不一致（values §10.2）',
+    **{(f'arith.{o}', 'fastmath'): '#arith.fastmath<…>：none/nnan/ninf → 参数；reassoc/nsz/arcp/contract/afn/fast 允许近似 ⇒ 未知（第 35 轮）'
+       for o in ('addf', 'subf', 'mulf', 'divf', 'remf', 'negf', 'cmpf', 'maximumf', 'minimumf', 'extf', 'truncf')},
     **{(f'arith.{o}', 'overflowFlags'): '#arith.overflow<…> → nsw/nuw' for o in ('addi', 'subi', 'muli', 'shli', 'trunci')},
     **{(f'arith.{o}', 'isExact'): 'isExact → exact' for o in ('divui', 'divsi', 'shrui', 'shrsi')},
     **{(f'tensor.{o}', a): 'static_* 与动态操作数合并为 core 的全动态记法（静态项物化为 index 常量）；步长须全为 1、不降秩'
@@ -40,6 +44,19 @@ def _int_lit(s):
     m = re.fullmatch(r'(-?\d+|true|false)\s*(?::\s*(\S+))?', s.strip())
     if not m: raise Unknown(f'非整数字面量 {s}')
     v = m.group(1); return (1 if v == 'true' else 0 if v == 'false' else int(v)), m.group(2) or 'i1'
+FP_TYPES = ('f16', 'bf16', 'f32', 'f64')
+def _fp_lit(s, ty):
+    """浮点字面量 `1.500000e+00 : f32` / `0x7FC00000 : f32` → 字符串（core.fpconst 解释）。"""
+    m = re.fullmatch(r'(-?(?:\d+\.?\d*(?:[eE][-+]?\d+)?|0x[0-9A-Fa-f]+))\s*:\s*(\S+)', s.strip())
+    if not m or m.group(2) != ty: raise Unknown(f'浮点字面量 {s[:40]}')
+    return m.group(1)
+def _fastmath(s):
+    m = re.fullmatch(r'#arith\.fastmath<([\w, ]*)>', s.strip())
+    if not m: raise Unknown(f'fastmath {s}')
+    fl = {f for f in m.group(1).replace(' ', '').split(',') if f and f != 'none'}
+    bad = fl - {'nnan', 'ninf'}
+    if bad: raise Unknown(f'fastmath {",".join(sorted(bad))}：允许近似/不定符号，值层未建模')
+    return {f: True for f in fl}
 def _dense(s, ty):
     """dense<…> : tensor<…> 的整数字面量（splat 或嵌套列表）→ 行优先展平表；十六进制/资源/浮点/复数 ⇒ Unknown。嵌套结构须与形状一致。"""
     m = re.fullmatch(r'dense<(.*)>\s*:\s*(\S+)', s.strip(), re.S)
@@ -94,11 +111,15 @@ def to_core(blocks, flip=None):
         p = m['props']
         if op == 'arith.constant' and n['outs'][0][1].startswith('tensor<'):
             p.update(value=0, dense=_dense(at['value'], n['outs'][0][1]))     # 第 33 轮
+        elif op == 'arith.constant' and n['outs'][0][1] in FP_TYPES:
+            p.update(value=_fp_lit(at['value'], n['outs'][0][1]), type=n['outs'][0][1])
         elif op == 'arith.constant':
             v, ty = _int_lit(at['value'])
             if ty != n['outs'][0][1] and not (ty == 'i1' and n['outs'][0][1] == 'i1'): raise Unknown(f'常量类型 {ty}')
             p.update(value=v, type=ty)
         elif op == 'arith.cmpi': p['predicate'] = _int_lit(at['predicate'])[0] ^ (1 if flip == 'pred' else 0)
+        elif op == 'arith.cmpf':                         # 变异：cmpf 取逻辑否定（异或 1 只在相等/NaN 时有差别，太弱）
+            k = _int_lit(at['predicate'])[0]; p['predicate'] = {0: 15, 15: 0, 1: 13, 13: 1, 2: 12, 12: 2, 3: 11, 11: 3, 4: 10, 10: 4, 5: 9, 9: 5, 6: 8, 8: 6, 7: 14, 14: 7}[k] if flip == 'pred' else k
         elif 'overflowFlags' in at:
             fl = re.fullmatch(r'#arith\.overflow<([\w, ]*)>', at['overflowFlags'].strip())
             if not fl: raise Unknown(f'溢出标志 {at["overflowFlags"]}')
@@ -108,6 +129,8 @@ def to_core(blocks, flip=None):
                 elif f == 'nuw': p['nuw'] = True
                 elif f not in ('none', ''): raise Unknown(f'未知溢出标志 {f}')
         if 'isExact' in at: p['exact'] = True
+        if 'fastmath' in at: p.update(_fastmath(at['fastmath']))
+        if op == 'arith.truncf' and 'roundingmode' in at: raise Unknown('arith.truncf roundingmode：降到 LLVM 受约束内建，只是对动态舍入模式的假设（§10.2）')
         if op in ('tensor.extract_slice', 'tensor.insert_slice'):
             ins = n['ins']; src_ty = n['props']['_types'][0]
             seg = _segs(at['operandSegmentSizes'])
