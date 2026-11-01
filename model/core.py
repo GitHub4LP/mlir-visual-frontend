@@ -301,6 +301,33 @@ def _fcast(kind):
 for k in ('extf', 'truncf', 'sitofp', 'uitofp', 'fptosi', 'fptoui', 'bitcast'):
     nat(f'arith.{k}', [('in', 'T')], [('r', 'T2')], _fcast(k), reads=('nnan', 'ninf') if k in ('extf', 'truncf') else ())
 
+# 第 35b 轮：math 方言的可精确子集（convert-math-to-llvm 降到正确舍入/精确的 LLVM 内建；floatjit F4）。
+# 超越函数（sin/exp/log/powf…）在 libm 中不保证正确舍入 ⇒ 不登记（未知）。copysign 读取 NaN 的符号位（不确定）⇒ 不登记。
+# isinf/isnormal：本提交 convert-math-to-llvm 不降低（无 JIT 证据）⇒ 不登记。fpowi 的乘法次序未规定 ⇒ 不登记。
+def _fun(f, test=False):
+    def g(p, a):
+        (x, px) = a[0]; r = f(*[v for v, _ in a])
+        if test: return [(z3.If(r, z3.BitVecVal(1, 1), z3.BitVecVal(0, 1)), z3.Or(px, _fpp(p, [x])))], F_
+        return [(r, z3.Or(*[q for _, q in a], _fpp(p, [v for v, _ in a] + [r])))], F_
+    return g
+for k, f in (('absf', z3.fpAbs), ('ceil', lambda x: z3.fpRoundToIntegral(z3.RTP(), x)), ('floor', lambda x: z3.fpRoundToIntegral(z3.RTN(), x)),
+             ('trunc', lambda x: z3.fpRoundToIntegral(z3.RTZ(), x)), ('round', lambda x: z3.fpRoundToIntegral(z3.RNA(), x)),
+             ('roundeven', lambda x: z3.fpRoundToIntegral(z3.RNE(), x)), ('sqrt', lambda x: z3.fpSqrt(z3.RNE(), x))):
+    nat(f'math.{k}', [('in', 'F')], [('r', 'F')], _fun(f), reads=('nnan', 'ninf'))
+nat('math.fma', [('a', 'F'), ('b', 'F'), ('c', 'F')], [('r', 'F')], _fun(lambda a, b, c: z3.fpFMA(z3.RNE(), a, b, c)), reads=('nnan', 'ninf'))
+nat('math.isnan', [('in', 'F')], [('r', 'i1')], _fun(z3.fpIsNaN, True), reads=('nnan', 'ninf'))
+nat('math.isfinite', [('in', 'F')], [('r', 'i1')], _fun(lambda x: z3.Not(z3.Or(z3.fpIsNaN(x), z3.fpIsInf(x))), True), reads=('nnan', 'ninf'))
+def _ctz(x, lead):
+    w = x.size(); r = z3.BitVecVal(w, w)
+    for i in (range(w) if lead else range(w - 1, -1, -1)):           # 由远到近覆盖：最终取最近的 1
+        r = z3.If(z3.Extract(i, i, x) == 1, z3.BitVecVal(w - 1 - i if lead else i, w), r)
+    return r
+def _ipure(f): return lambda p, a: ([(f(a[0][0]), a[0][1])], F_)
+nat('math.absi', [('in', I3)], [('r', I3)], _ipure(lambda x: z3.If(x < 0, -x, x)), reads=())     # INT_MIN ↦ INT_MIN（llvm.abs is_int_min_poison=false）
+nat('math.ctlz', [('in', I3)], [('r', I3)], _ipure(lambda x: _ctz(x, True)), reads=())        # 0 ↦ 位宽（is_zero_poison=false）
+nat('math.cttz', [('in', I3)], [('r', I3)], _ipure(lambda x: _ctz(x, False)), reads=())
+nat('math.ctpop', [('in', I3)], [('r', I3)], _ipure(lambda x: z3.Sum([z3.ZeroExt(x.size() - 1, z3.Extract(i, i, x)) for i in range(x.size())]) if x.size() > 1 else x), reads=())
+
 # ───────────────────────── 形状层（第 6 轮）
 # tensor 值 = ⟨extent ∈ ℤ^r，元素 Array(ℤ^r → E)，元素毒值 Array(ℤ^r → Bool)⟩，另有整体毒值标志。
 # L22 静态维是 extent 的投影：边上的静态维是声明，不符 ⇒ 该值为毒值，且立一条证明义务（诊断）。
