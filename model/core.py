@@ -967,6 +967,20 @@ def equivalent(a, b):
     return prove(z3.Implies(z3.And(a.ax, sb(b.ax)), z3.And(conds)))
 
 # ───────────────────────── 透明内联（全内联，作为“嵌套 ≡ 内联”的对照）
+# 第 37 轮（M5.3）：AutomaticAllocationScope。两个集合都取自 ODS（odsjson：结果装饰器带 MemAlloc<AutomaticAllocationScopeResource> 的 op；
+# 带 AutomaticAllocationScope trait 的 op），见 allocascope_test K0 对账。llvm 方言未导入（llvm.alloca 不在内）。
+ALLOCA_SCOPE = True                     # 只供 A/B 变异关闭
+SCOPE_ALLOC = {'memref.alloca'}
+SCOPE_OPS = {'affine.for', 'affine.parallel', 'func.func', 'gpu.func', 'gpu.launch', 'memref.alloca_scope', 'scf.for', 'scf.forall', 'scf.parallel', 'shape.func'}
+class AllocaEscape(Exception): pass
+def needs_alloca_scope(blocks):
+    """体（不进入内层作用域 op）里有在自动分配作用域上分配的 op。内层透明复合 op 不必看：它内联时自己包一层。"""
+    for b in blocks:
+        for n in b['ops']:
+            if n['op'] in SCOPE_ALLOC: return True
+            if n['op'] in SCOPE_OPS: continue
+            if any(needs_alloca_scope(r) for r in n['regions']): return True
+    return False
 def inline_all(blocks, env=None, pfx='', penv=None):
     env = dict(env or {}); out = []; penv = penv or {}
     sp = lambda pr: {k: penv.get(v[1:], v) if isinstance(v, str) and v.startswith('$') else v for k, v in pr.items()}
@@ -980,7 +994,17 @@ def inline_all(blocks, env=None, pfx='', penv=None):
                 inner = dict(zip([v for v, _ in sch.body[0]['args']], [env.get(v, v) for v in n['ins']]))
                 p2 = f"{pfx}{n['id']}."
                 ib = inline_all([dict(sch.body[0], args=[])], inner, p2, sp(n.get('props', {})))[0]
-                term = ib['ops'][-1]; ops += ib['ops'][:-1]
+                term = ib['ops'][-1]
+                if ALLOCA_SCOPE and needs_alloca_scope(sch.body):          # 第 37 轮（M5.3）：保持自动分配作用域
+                    if any(t.startswith('memref') for _, t in n['outs']):
+                        raise AllocaEscape(f"{n['op']}：体内 alloca 且有 memref 输出——包 alloca_scope 后可能悬垂，判定未建模 ⇒ 不发射")
+                    for o, t in n['outs']: env[o] = p2 + o
+                    sc = dict(id=p2 + 'alloca_scope', op='memref.alloca_scope', ins=[], outs=[(env[o], t) for o, t in n['outs']],
+                              regions=[[dict(name=p2 + 'scope', args=[], ops=ib['ops'][:-1] + [dict(id=p2 + 'scope_ret', op='memref.alloca_scope.return',
+                                       ins=list(term['ins']), outs=[], regions=[], succs=[], props={'_attrs': {}})])]],
+                              succs=[], props={'_attrs': {}})
+                    ops.append(sc); continue
+                ops += ib['ops'][:-1]
                 for (o, _), y in zip(n['outs'], term['ins']): env[o] = y
                 continue
             m = dict(n, id=pfx + n['id'], ins=[env.get(v, v) for v in n['ins']], props=sp(n.get('props', {})))
