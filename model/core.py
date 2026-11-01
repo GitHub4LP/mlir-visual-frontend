@@ -467,6 +467,16 @@ nat('tensor.insert_slice', [('s', 'tensor'), ('t', 'tensor'), ('offs', 'index*')
 nat('tensor.extract_slice.g', [('t', 'tensor'), ('offs', 'index*'), ('sizes', 'index*'), ('strides', 'index*')], [('r', 'tensor')], _extract_slice_g, reads=('drop',))
 nat('tensor.insert_slice.g', [('s', 'tensor'), ('t', 'tensor'), ('offs', 'index*'), ('sizes', 'index*'), ('strides', 'index*')], [('r', 'tensor')], _insert_slice_g, reads=('drop',))
 nat('tensor.cast', [('t', 'tensor')], [('r', 'tensor')], _tcast, reads=())
+def _occurs(v, e):
+    """第 39 轮：项 v 是否出现在公式 e 中（推测版守卫只把“良定义条件用到的操作数”的毒值算作违反：dim 的 tensor、splat 的标量不算）。"""
+    seen, st = set(), [e]
+    while st:
+        x = st.pop()
+        if x.get_id() in seen: continue
+        seen.add(x.get_id())
+        if x.eq(v): return True
+        st.extend(x.children())
+    return False
 # MLIR 中这些 op 的良定义条件（不满足即 UB）。降低到 MLIR 时，不能证明它成立的地方要插守卫（L24）。
 def _mlir_def(op, a, outs_ty, pr=None):
     if op == 'tensor.dim': return z3.And(a[1][0] >= 0, a[1][0] < rank(a[0][0]))
@@ -545,6 +555,7 @@ class Ctx:
         s.env, s.ub, s.eff, s.exact, s.params, s.ax, s.diag = {}, F_, [], True, params or {}, [], []
         s.owner, s.hole_sum = '', set()   # 第 27 轮：洞的项按（所属定义, hid）命名；被循环摘要吞掉的洞（L20 代换对它无效）
         s.wf, s.guards = [], []       # L22 静态维的证明义务、L24 降低到 MLIR 的守卫义务：[(节点, 公式)]
+        s.gspec = []                  # 第 39 轮：推测执行版守卫（输入可能是毒值：毒值操作数本身即违反 MLIR 良定义）
     def static_check(s, nid, v, pv, ty, g):
         """L22：边上的静态维不符 ⇒ 毒值；同时立义务“非毒值时成立”。返回新的毒值标志。"""
         if not is_t(v) or not tparse(ty) or all(k is None for k in tparse(ty)[0]): return pv
@@ -582,6 +593,10 @@ class Ctx:
                 if getattr(sch, 'sem', sem_tag()) != sem_tag():
                     raise ValueUnknown(f'{op}：摘要在语义开关 {sch.sem} 下推导，当前为 {sem_tag()}；须重推导（第 28 轮）')
                 outs, ub = instantiate(sch, pr, args); s.ax.append(inst_ax(sch, pr, args))
+                sb = _subst(sch, pr, args)               # 第 39 轮：摘要路径同样带出被调体的义务（项代换到调用点，以路径条件守卫）
+                s.wf += [(f"{n['id']}/{i}", z3.Implies(g, sb(f))) for i, f in getattr(sch, 'wf', ())]
+                s.guards += [(f"{n['id']}/{i}", z3.Implies(g, sb(f))) for i, f in getattr(sch, 'guards', ())]
+                s.gspec += [(f"{n['id']}/{i}", z3.Implies(g, sb(f))) for i, f in getattr(sch, 'gspec', ())]
                 for k, ((_, pty), (av, ap)) in enumerate(zip(sch.ins, args)): s.static_check(f"{n['id']}#{k}", av, ap, pty, g)   # 调用点义务
             else:
                 if getattr(sch, 'reads', None) is not None:
@@ -598,7 +613,9 @@ class Ctx:
                         raise ValueUnknown(f'{op}：结果类型值层未建模')
                 outs, ub = sch.fn(pr, args)
                 md = _mlir_def(op, args, pr['__out'], pr) if op.startswith('tensor.') else None
-                if md is not None: s.guards.append((n['id'], z3.Implies(z3.And(g, z3.Not(_anyp(args))), md)))
+                if md is not None:
+                    s.guards.append((n['id'], z3.Implies(z3.And(g, z3.Not(_anyp(args))), md)))
+                    s.gspec.append((n['id'], z3.Implies(g, z3.And(z3.Not(z3.Or(F_, *[p for v, p in args if v is not None and _occurs(v, md)])), md))))
             s.ub = z3.Or(s.ub, z3.And(g, ub))                           # 分支里的 UB 只在该路径上算数
             for (o, ty), r in zip(n['outs'], outs):
                 s.env[o] = (r[0], s.static_check(n['id'], r[0], r[1], ty, g)) if r[0] is not None else r
@@ -615,6 +632,10 @@ class Ctx:
         sub.owner = sch.name
         for (v, _), a in zip(sch.body[0]['args'], args): sub.env[v] = a
         ys = sub.walk(sch.body, T_, path)
+        # 第 39 轮：被调体的义务（L22 静态维、L24 守卫）此前在特化时丢失 ⇒ 宿主的 guards()/caps 漏掉复合 op 内部的 tensor 越界
+        s.wf += [(f"{path[-1][0]}/{i}", z3.Implies(g, f)) for i, f in sub.wf]
+        s.guards += [(f"{path[-1][0]}/{i}", z3.Implies(g, f)) for i, f in sub.guards]
+        s.gspec += [(f"{path[-1][0]}/{i}", z3.Implies(g, f)) for i, f in sub.gspec]
         s.ax += sub.ax; s.diag += sub.diag; s.exact &= sub.exact; s.hole_sum |= {(o, h) for o, h in sub.hole_sum}
         return ys, sub.ub
 
@@ -895,7 +916,7 @@ def derive(name, ins, outs, blocks, mode='transparent', params=()):
         sch.value_known, sch.exact = False, False; sch.value_why = str(e)[:60]      # 第 34b 轮：原因随结果带出（警告须可读，不只是“未知”）
         reg(sch); return sch
     sch.holes, sch.outv, sch.ubf = holes, [(z3.simplify(v) if v is not None else None, z3.simplify(p)) for v, p in ys], z3.simplify(c.ub)
-    sch.wf, sch.guards = c.wf, c.guards; sch.hole_sum = set(c.hole_sum)
+    sch.wf, sch.guards, sch.gspec = c.wf, c.guards, c.gspec; sch.hole_sum = set(c.hole_sum)
     sch.exact = c.exact; sch.ax = z3.simplify(z3.And(c.ax)) if c.ax else T_; sch.loop_diag = c.diag
     sch.env = {v: c.env[v] for v in _toplevel_vals(blocks) if v in c.env}     # 顶层值的项：补全查询用
     boundary = {v: p for (p, _), (v, _) in zip(ins, blocks[0]['args'])} | {v: p for (p, _), v in zip(outs, _term(blocks))}
@@ -936,8 +957,18 @@ def as_comp(s):
 def caps(s):
     s = as_comp(s)
     if not s.value_known: return {'Speculatable': None, 'Pure': None}
-    spec = prove(z3.Implies(s.ax, z3.Not(s.ubf)))   # 毒值输入也不得触发 UB（推测执行时输入可能是毒值）
-    return {'Speculatable': spec, 'Speculatable|非毒值输入': prove(z3.Implies(z3.And(s.ax, no_poison(s)), z3.Not(s.ubf))),
+    # 第 39 轮（caps_test）：可推测是对 **降低后的 MLIR** 而言的。core 的 tensor 层把越界等记作毒值（L24：比 MLIR 更有定义），
+    #   降低时须插守卫；emit_core 并不插。所以 caps 必须连同守卫义务（毒值操作数也算违反）与 L22 静态维义务一起证明，
+    #   否则 tensor.extract 变量下标被判可推测，前端外提后在 MLIR 中是 UB。core 语义下的旧判定保留为 'Speculatable|core 语义'。
+    #   入口的 L22 义务（参数的静态维）是调用方的责任 ⇒ 作假设（MLIR 中参数类型保证）；其余（体内、出口）是本体的义务。
+    wf = list(getattr(s, 'wf', ()))
+    hyp = [f for nid, f in wf if str(nid).startswith('入口')]
+    body_wf = [f for nid, f in wf if not str(nid).startswith('入口')]
+    ob = [f for _, f in getattr(s, 'gspec', ())] + body_wf
+    obn = [f for _, f in getattr(s, 'guards', ())] + body_wf
+    spec = prove(z3.Implies(z3.And(s.ax, *hyp), z3.And(z3.Not(s.ubf), *ob)))   # 毒值输入也不得触发 UB（推测执行时输入可能是毒值）
+    return {'Speculatable': spec, 'Speculatable|非毒值输入': prove(z3.Implies(z3.And(s.ax, no_poison(s), *hyp), z3.And(z3.Not(s.ubf), *obn))),
+            'Speculatable|core 语义': prove(z3.Implies(s.ax, z3.Not(s.ubf))),
             'Pure': spec and s.eff != TOP and not s.eff}
 
 def same_sem(*ss):

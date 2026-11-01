@@ -29,7 +29,7 @@
 | declared 义务 | C++ verify、开放接口、区域分支边 | 只有预言机能裁决（L43、L44） | 透明内联后交预言机 | A | M1.5 |
 | 值层 | Sem / UB / Poison | 人工覆盖层，经 JIT 差分审计（§3） | 推导（L6） | B（原生，§3 所列子集）/ C（复合摘要的毒值依赖） | M1.6 |
 | 效应 | MemoryEffects 三元组 | ODS | compose_eff（L7） | B | M1.7 |
-| caps | Speculatable、Pure 等 | 由上面各字段派生，不单独声明 | 同左 | C | M1.8 |
+| caps | Speculatable、Pure 等 | 由上面各字段派生，不单独声明；对降低后的 MLIR 而言（含守卫与 L22 义务） | 同左 | B | M1.8 |
 
 - 〔M1.9〕**复合 op 与原生 op 同构**：同一种 Schema、同一个 check。声明只能收窄，并且要经过检查（Φ_user ⊨ Φ_comp）。
 - 〔M1.10〕**名字即语义身份**：按名字共享或按键缓存的项（洞、循环摘要、端口占位、ADT、Workspace 键），名字须单射编码全部语义来源，含全局语义开关（L54、L18′）。
@@ -82,7 +82,7 @@
 - 〔M5.4〕后端诊断通过 Location（节点 id）回映到节点（L31）。
 
 ## 6 当前已知的不足（非规范；按 clauses.md 的“缺口/部分”行处理）
-- 值层复合摘要的毒值依赖（L6）仍是 C；caps（M1.8）没有外部真值。
+- 值层复合摘要的毒值依赖（L6）仍是 C；caps（M1.8）的外部参照是 MLIR LICM 判定 + 分歧处 JIT A/B（values §12），毒值 tensor 操作数处偏保守。
 - M5.3：alloca 逃逸未建模（拒发）；多块循环体不处理（报原因）；M5.1 只在 tensor/bufferize、scf→cf 与作用域降低三条管线上有差分。
 - 值层未覆盖：浮点 tensor、memref 内容、cf 多块、scf.while、func.call、complex、超越函数（均判未知）。
 - 递归、方言注册与版本、transform 方言、DataFlow、bytecode、WASM：coverage 里是 ✗。

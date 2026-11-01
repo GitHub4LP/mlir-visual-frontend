@@ -292,3 +292,18 @@ fastmath 与 arith 同：只建 nnan/ninf，其余 ⇒ 未知。math 只开放�
 - 现象：f16 65504 经 `fptosi → i32 → sitofp → f16` 得 32768（0x7800），−65504 得 −32768；49152 得 32768。i64 中间值无此现象（直接链路 i64 正确），fptoui/uitofp 正确（u16 可容纳 65535）。
 - 定位：MLIR 发出的 `llvm.fptosi`/`llvm.sitofp` 正确；单独 fptosi、单独 sitofp 均正确；两步之间插入不可内联的恒等调用后结果正确。与 AArch64 TableGen 模式 `(f16 (sint_to_fp (i32 (fp_to_sint f16))))` → `SCVTFv1i16 (FCVTZSv1f16 …)` 一致：中间值被缩成 16 位有符号饱和整数，i32 值域内的 32768..65504 被错误饱和。
 - 处理：模型按 LangRef（不跟随误编译）。floatjit 对含该模式且不一致的程序做 A/B 重跑（`barrier()` 插入 `@__id_iN`），同一输入在隔断版本上与模型一致才计入“已归因”，否则仍算不一致。属 LLVM 后端缺陷，非 MLIR；**未提 upstream issue**（需用户同意）。
+
+## 12 第 39 轮：caps 的外部对照（M1.8；model/caps_test.py）
+**真值的界定**：“可推测”= 对所有输入（含毒值）不触发 UB。UB 在 JIT 中通常不可直接观测，所以外部参照取 **MLIR 自己的判定**——loop-invariant-code-motion 只外提 isMemoryEffectFree ∧ isSpeculatable 的 op（含各 op 的 getSpeculatability 定制）；分歧再用 JIT A/B（LICM + LLVM O3 利用 UB）判谁对。
+**发现的 core 缺陷（已修）**：
+1. caps 只看 core 语义的 UB。core 的 tensor 层把越界记作毒值（L24：比 MLIR 更有定义，降低时须插守卫），但 emit_core 并不插守卫 ⇒ tensor.extract/insert/dim/cast/切片的变量下标被判可推测，前端据此外提，在 MLIR 中就是 UB（修复前 C1：96 例“core 宽松”，其中 tensor 类 15 例是真缺陷，其余是测试工具的计数错误）。
+   现在 caps['Speculatable'] = ax ∧ 入口 L22 假设 ⇒ ¬UB ∧ 推测版守卫（良定义条件用到的操作数为毒值也算违反）∧ 体内/出口 L22 义务；旧判定保留为 'Speculatable|core 语义'。
+2. 义务不随复合 op 调用传播：specialize（透明特化）与精确摘要两条路径都丢掉被调体的 L22/L24 义务 ⇒ 宿主的 guards() 与 caps 漏掉复合 op 内部的越界。修为以调用路径条件守卫后并入（摘要路径做项代换）。C3 变异：去掉传播 ⇒ 宿主 caps 判可推测（不可靠），测试失败。
+
+**结果**（MLIR 9bae84b0）：C1 113 个原生 op 实例：一致 98，core 保守 15，core 宽松 **0**；C2 复合 5 例：一致 3，保守 1，未知 1（arith.minui 未建模）。
+core 保守的 15 例归因：
+- arith.remui/remsi（变量除数、常量 0、常量被除数）6 例：**MLIR 错**。本提交两者标 Pure，文档却写除零 UB。C4 JIT A/B：b=0、n=0（循环不执行）时正确结果 111；LICM 外提后经 LLVM O3 得 222（LLVM 由“已执行 urem/srem”推出 b≠0），O0 与原样均为 111；divui/divsi（ConditionallySpeculatable）不外提，全部 111。上游 #188263（2026-03-24）已改为 ConditionallySpeculatable，晚于 9bae84b0 ⇒ 不提 issue。
+- tensor.extract/insert 变量或越界下标、动态切片、cast 动→静 5 例：MLIR 标 Pure，但越界/形状不符按其文档是 UB——与 M5.1 的 LICM+bufferize 反例同源，MLIR 自身不一致；core 对。
+- 静态下标的 extract/insert/切片 4 例：只因 tensor 操作数可能是毒值（从毒值 tensor 读 = 从毒值指针 load）而保守；'Speculatable|非毒值输入' 为真。
+
+**对前端的指导**：caps 可直接用于外提/改写的方向只有“一致”与“core 保守”；当前无宽松例。MLIR 的 Pure 不能作为前端可推测的依据（remui/remsi、tensor 越界两类反例）。

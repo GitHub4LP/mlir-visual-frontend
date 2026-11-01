@@ -23,7 +23,7 @@
 | M1.5 | declared 义务只由预言机裁决 | oracle、modular | modular_test:M2 体级预言机; modular_test:M3 单元级预言机 | L40, L43, L44 | A | 检验 | 残差 580 例全部归因 |
 | M1.6 | 值层 Sem/UB/Poison；复合摘要推导 | core、valimport | sem_test:V1 无标志程序; values_test:V5 JIT; loop_test:W2 与 MLIR 执行; adtjit_test:A11 L11 | L6, L17″, L49 | C | 部分 | 原生子集有 B/A；复合摘要的毒值依赖 L6 仍 C |
 | M1.7 | 效应 compose_eff | core | effects_test:X7 L7 效应组合 | L7 | B | 检验 | 48 例，不可靠 0 |
-| M1.8 | caps 由字段派生 | core.caps | defs_test:caps= | — | C | 缺口 | 无外部真值；Speculatable 用于外提时须先补 JIT 证据 |
+| M1.8 | caps 由字段派生（对降低后的 MLIR，含守卫与 L22 义务） | core.caps、gspec、义务传播 | caps_test:C1：原生 op; caps_test:C3：义务经复合 op 调用传播; caps_test:C4：MLIR 判 Pure; defs_test:caps= | — | B | 检验 | 第 39 轮：113 原生实例 一致 98/保守 15/宽松 0；保守中 remui/remsi 经 JIT A/B 证实 MLIR 错（上游已修）；C3 变异可抓 |
 | M1.9 | 复合与原生同构；声明只收窄且检查 | core、composite | compsig_test:C6 定义期可实例化; core_test:T2 跨层组合律 | L25, L46 | A | 检验 | |
 | M1.10 | 名字单射编码全部语义来源 | core、names | names_test:N1 编辑洞; names_test:N5 跨语义开关; names_test:N7 ADT 重定义; loopsum_test:U3 语义开关进名字 | L18′, L54 | B | 检验 | |
 | M2.1 | 结构层有拒绝权 | structure | obligations_test:Z2 变异差分; obligations_test:Z1 触发数 | L39 | A | 检验 | |
