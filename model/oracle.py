@@ -90,7 +90,7 @@ def emit_core(blocks, ftype, name='f', symbols=None, mod_attrs=None):
       · 模块属性（gpu.container_module 等）原样带上。"""
     import odssig as G, typesig as TSg, core as C
     try: blocks = C.inline_all(blocks)                     # 透明复合 op 内联；不透明的留下，在 op() 里被拒发
-    except Exception as e: _why('内联失败'); return None
+    except Exception as e: _why('内联失败：alloca 逃逸' if type(e).__name__ == 'AllocaEscape' else '内联失败'); return None
     tys, lines, cnt = {}, [], [0]
     refs = set()
     def val(v): return '%' + re.sub(r'[^\w]', '_', v)
