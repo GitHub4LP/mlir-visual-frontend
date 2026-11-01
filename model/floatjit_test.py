@@ -10,7 +10,8 @@
 """
 import sys, re, glob, random, ctypes, collections, multiprocessing as mp
 import z3
-from valimport_test import derive_imported, PIPE
+from valimport_test import derive_imported, PIPE as _P0
+PIPE = _P0.replace('convert-arith-to-llvm', 'convert-math-to-llvm,convert-arith-to-llvm')   # 第 35b 轮：math 方言
 
 FPT = {'f16': (5, 11), 'bf16': (8, 8), 'f32': (8, 24), 'f64': (11, 53)}
 def BW(t): return 64 if t == 'index' else sum(FPT[t]) if t in FPT else int(t[1:])
@@ -117,6 +118,8 @@ PRED = ['false', 'oeq', 'ogt', 'oge', 'olt', 'ole', 'one', 'ord', 'ueq', 'ugt', 
 LIT = {'f16': ['1.5', '-0.0', '0.1', '6.550400e+04', '0x7C00', '0xFE00', '5.960464e-08'], 'bf16': ['1.5', '-0.0', '0.1', '3.389531e+38', '0x7F80', '0xFFC1'],
        'f32': ['1.5', '-0.0', '0.1', '3.40282347E+38', '0x7F800000', '0xFFC00001', '1.401298e-45', '16777217.0'],
        'f64': ['1.5', '-0.0', '0.1', '1.7976931348623157E+308', '0x7FF0000000000000', '4.940656e-324', '9007199254740993.0']}
+MUN = ['absf', 'ceil', 'floor', 'trunc', 'round', 'roundeven', 'sqrt']
+MATH = True
 WIDER = {'f16': ['f32', 'f64'], 'bf16': ['f32', 'f64'], 'f32': ['f64'], 'f64': []}
 def gen(rng):
     t = rng.choice(list(FPT)); vs = ['%a', '%b', '%c']; L = []; k = [0]
@@ -130,7 +133,13 @@ def gen(rng):
         if r < 0.45: L.append(f'{o} = arith.{rng.choice(BIN)} {x}, {y}{fm()} : {t}')
         elif r < 0.6:
             c = nv(); L.append(f'{c} = arith.cmpf {rng.choice(PRED)}, {x}, {y}{fm()} : {t}'); L.append(f'{o} = arith.select {c}, {x}, {y} : {t}')
-        elif r < 0.67: L.append(f'{o} = arith.negf {x}{fm()} : {t}')
+        elif r < 0.67:
+            if rng.random() < 0.25: L.append(f'{o} = arith.negf {x}{fm()} : {t}')
+            else: L.append(f'{o} = math.{rng.choice(MUN)} {x}{fm()} : {t}')
+        elif r < 0.71 and MATH:
+            if rng.random() < 0.5: L.append(f'{o} = math.fma {x}, {y}, {rng.choice(vs)}{fm()} : {t}')
+            else:
+                c = nv(); L.append(f'{c} = math.{rng.choice(["isnan", "isfinite"])} {x} : {t}'); L.append(f'{o} = arith.select {c}, {x}, {y} : {t}')   # 汇编格式不带 fastmath
         elif r < 0.75:
             c = nv(); L.append(f'{c} = arith.constant {rng.choice(LIT[t])} : {t}'); L.append(f'{o} = arith.{rng.choice(BIN[:4])} {x}, {c} : {t}')
         elif r < 0.85 and WIDER[t]:
@@ -144,11 +153,22 @@ def gen(rng):
             it = rng.choice(['i8', 'i16', 'i32', 'i64']); s = rng.choice(['si', 'ui']); e = nv()
             L.append(f'{e} = arith.fpto{s} {x} : {t} to {it}')
             if rng.random() < 0.3: e2 = nv(); L.append(f'{e2} = arith.addi {e}, %i : {it}'.replace('%i', e)); e = e2
+            if MATH and rng.random() < 0.5: e2 = nv(); L.append(f'{e2} = math.{rng.choice(["absi", "ctlz", "cttz", "ctpop"])} {e} : {it}'); e = e2
             L.append(f'{o} = arith.{rng.choice(["si", "ui"])}tofp {e} : {it} to {t}')
         vs.append(o)
     body = '\n  '.join(L)
     return f'func.func @main(%a: {t}, %b: {t}, %c: {t}) -> {t} {{\n  {body}\n  return {vs[-1]} : {t}\n}}', [t] * 3, [t]
 
+# 第 35b 轮：LLVM AArch64 误编译（本提交）——`sitofp (fptosi f16 → i32/i64) → f16` 被模式 SCVTFv1i16∘FCVTZSv1f16 选成
+# 16 位有符号中间值（饱和于 ±32768）；MLIR 发出的 llvm.fptosi/llvm.sitofp 正确。归因 = A/B：插入不可内联的恒等调用隔断模式后
+# 同一输入的 JIT 结果与模型一致，才计入“已归因”，否则仍是不一致。
+F16PAT = re.compile(r'(%[\w#]+) = arith\.sitofp (%[\w#]+) : (i32|i64) to f16')
+def barrier(txt):
+    ws = set()
+    def rep(m):
+        ws.add(m.group(3)); return f'{m.group(2)}__o = func.call @__id_{m.group(3)}({m.group(2)}) : ({m.group(3)}) -> {m.group(3)}\n  {m.group(1)} = arith.sitofp {m.group(2)}__o : {m.group(3)} to f16'
+    t2 = F16PAT.sub(rep, txt)
+    return t2 + ''.join(f'\nfunc.func private @__id_{w}(%x: {w}) -> {w} attributes {{no_inline}} {{\n  return %x : {w}\n}}' for w in ws)
 def run_prog(S, txt, name, ins, outs, rng, st, note, tag, S2=None, ninp=10):
     inputs = [[rand_in(rng, t) for t in ins] for _ in range(ninp)]
     ev = [model_eval(S, ins, xs, outs) for xs in inputs]
@@ -159,9 +179,15 @@ def run_prog(S, txt, name, ins, outs, rng, st, note, tag, S2=None, ninp=10):
     jr = jit(wrap(txt, name, ins, outs), ins, outs, [xs for xs, _ in run])
     if jr[0] != 'ok': st['JIT 不可用/' + jr[0]] += 1; note('JIT 不可用', f'{tag} {jr[1]}'); return
     st['函数（已执行）'] += 1
-    for (xs, mv), jv in zip(run, jr[1]):
-        for t, a, b in zip(outs, mv, jv):
-            st['比较'] += 1; ok = agree(t, a, b); st['一致' if ok else '不一致'] += 1
+    jb = None
+    if F16PAT.search(txt) and any(not all(agree(t, a, b) for t, a, b in zip(outs, mv, jv)) for (_, mv), jv in zip(run, jr[1])):
+        rb = jit(wrap(barrier(txt), name, ins, outs), ins, outs, [xs for xs, _ in run]); jb = rb[1] if rb[0] == 'ok' else None
+    for k, ((xs, mv), jv) in enumerate(zip(run, jr[1])):
+        for j, (t, a, b) in enumerate(zip(outs, mv, jv)):
+            st['比较'] += 1; ok = agree(t, a, b)
+            if not ok and jb is not None and agree(t, a, jb[k][j]):
+                st['不一致·已归因 LLVM AArch64 f16 fptosi→sitofp 误编译（A/B 隔断后一致）'] += 1; continue
+            st['一致' if ok else '不一致'] += 1
             if a[0] == 'nan': st['其中 NaN 结果'] += 1
             if not ok: note('不一致', f'{tag} 输入 {[hex(x % (1 << BW(u))) for x, u in zip(xs, ins)]} 模型 {a if a[0] == "nan" else hex(a[1])} JIT {hex(b % (1 << BW(t)))}')
     if S2 is not None:
