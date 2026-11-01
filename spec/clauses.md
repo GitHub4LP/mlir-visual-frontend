@@ -56,7 +56,7 @@
 | M4.10 | 增量 ≡ 全量 | edit | edit_test:E1 增量 ≡ 全量 | L20′, L21 | C | 元理论 | E1 720/720、E2 168/168 |
 | M5.1 | 降级含管线，Sem(g) ⊑ Sem(pipeline(⟦g⟧)) | — | shape_test:S6 与 MLIR 执行; loop_test:W2 与 MLIR 执行 | L22 | B | 部分 | 只覆盖 bufferize 与 scf→cf 管线 |
 | M5.2 | 三种落地；IRDL 是不透明身份 | irdl_export、composite | irdl_boundary_test:any_of | L48 | A | 检验 | |
-| M5.3 | 内联保持作用域：alloca_scope、自由符号 | core | core_test:自由符号 | L4 | B | 部分 | 自由符号有回归；**alloca_scope 包裹无回归**（缺口） |
+| M5.3 | 内联保持作用域：alloca_scope、逃逸、自由符号 | core.inline_all、needs_alloca_scope | allocascope_test:K2 A/B; allocascope_test:K3 逃逸; allocascope_test:K0 ODS 对账; core_test:自由符号 | L4 | B | 部分 | 第 37 轮：非作用域宿主 JIT 包/不包 A/B（不包崩溃、包正确）；scf.for 宿主经 canonicalize 包裹被消去后崩溃（MLIR 已知不一致，closure §8） |
 | M5.4 | 诊断经 Location 回映 | oracle | oracle_test:O3 诊断归位 | L31 | B | 部分 | 同 M2.8 |
 
 ## 未引用的 A/B/C 定律
