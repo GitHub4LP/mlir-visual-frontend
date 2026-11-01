@@ -37,14 +37,27 @@ class ValueUnknown(Exception): pass
 
 def W(t): return int(t[1:]) if is_int(t) else None
 SORTS = {}                            # 用户类型 → z3 sort（由 defs.py 的类型定义登记）
+FPT = {'f16': (5, 11), 'bf16': (8, 8), 'f32': (8, 24), 'f64': (11, 53)}    # 第 35 轮：IEEE 二进制浮点（指数位, 有效位含隐含位）
+def is_fp(t): return t in FPT
 def zsort(t):
     if is_int(t): return z3.BitVecSort(W(t))
+    if is_fp(t): return z3.FPSort(*FPT[t])
     if t == 'index': return z3.IntSort()
     tp = tparse(t)
     if tp is not None: return tsort(len(tp[0]), tp[1])
     return SORTS.get(t)
 def zb(x): return z3.BoolVal(x) if isinstance(x, bool) else x               # 参数可以是具体值或符号（复合 op 的参数）
+def fpconst(x, t):
+    """浮点字面量（MLIR 打印形式）：十六进制 = 位模式（NaN 载荷在本片段不可观察，见 values §10）；十进制 = 精确有理数按 RNE 舍入（APFloat::convertFromString）。"""
+    so = z3.FPSort(*FPT[t]); s_ = str(x).strip()
+    if s_.lower().startswith('0x'): return z3.simplify(z3.fpBVToFP(z3.BitVecVal(int(s_, 16), sum(FPT[t])), so))
+    from fractions import Fraction
+    from decimal import Decimal
+    q = Fraction(Decimal(s_)); neg = s_.startswith('-')
+    if q == 0: return z3.fpMinusZero(so) if neg else z3.fpPlusZero(so)
+    return z3.simplify(z3.fpRealToFP(z3.RNE(), z3.RealVal(f'{q.numerator}/{q.denominator}'), so))
 def zbv(x, t='i3'):
+    if is_fp(t): return fpconst(x, t)
     if t == 'index': return z3.IntVal(sx(x % (1 << IW), IW)) if isinstance(x, int) else x
     if isinstance(x, int): return z3.BitVecVal(x, W(t))
     return x if z3.is_bv(x) and x.size() == W(t) else z3.Int2BV(x, W(t))
@@ -220,6 +233,74 @@ for k in ('trunci', 'extui', 'extsi', 'index_cast', 'index_castui'):
     nat(f'arith.{k}', [('in', 'T')], [('r', 'T2')], _cast(k), reads=('nsw', 'nuw') if k == 'trunci' else ())
 ORIG = {}
 
+# ───────────────────────── 第 35 轮：浮点值层（spec/values.md §10）
+# 值 = z3 FP 项（只有一个 NaN）：值层的相等是“NaN 不分载荷/符号”的相等。这与 LLVM 一致的前提是本片段中没有能观察 NaN 位的 op：
+# bitcast f→i、copysign、math.* 等一律不登记或判未知（NaN 载荷不确定性的“观察口”被堵住）。
+# fastmath：nnan/ninf 有精确的毒值语义（LangRef：操作数或结果为 NaN/Inf ⇒ 毒值）；reassoc/contract/afn/arcp/nsz 允许近似 ⇒ valimport 判未知。
+def _fpp(p, xs):
+    c = []
+    if zb(p.get('nnan', False)) is not F_: c.append(z3.And(zb(p.get('nnan', False)), z3.Or([z3.fpIsNaN(x) for x in xs])))
+    if zb(p.get('ninf', False)) is not F_: c.append(z3.And(zb(p.get('ninf', False)), z3.Or([z3.fpIsInf(x) for x in xs])))
+    return z3.Or(c) if c else F_
+def _fmod(x, y):
+    """arith.remf 降到 llvm.frem = C fmod（结果与 x 同号，|r| < |y|），不是 IEEE remainder（z3 fpRem）。
+    由 IEEE remainder r 修正：r 与 x 异号且 r ≠ 0 ⇒ r + copysign(|y|, x)（数学结果可精确表示，RNE 不改变它）。"""
+    r = z3.fpRem(x, y); ay = z3.fpAbs(y); sy = z3.If(z3.fpIsNegative(x), z3.fpNeg(ay), ay)
+    fix = z3.And(z3.Not(z3.fpIsZero(r)), z3.fpIsNegative(r) != z3.fpIsNegative(x))
+    r2 = z3.If(fix, z3.fpAdd(z3.RNE(), r, sy), r)
+    return z3.If(z3.fpIsZero(r2), z3.If(z3.fpIsNegative(x), z3.fpMinusZero(x.sort()), z3.fpPlusZero(x.sort())), r2)
+def _fbin(f):
+    def g(p, a):
+        (x, px), (y, py) = a; r = f(x, y)
+        return [(r, z3.Or(px, py, _fpp(p, [x, y, r])))], F_
+    return g
+def _fmax(is_max):
+    def f(x, y):                                  # maximumf/minimumf（IEEE 754-2019 maximum）：任一 NaN ⇒ NaN；−0 < +0
+        lt = z3.Or(z3.fpLT(x, y), z3.And(z3.fpIsZero(x), z3.fpIsZero(y), z3.fpIsNegative(x), z3.Not(z3.fpIsNegative(y))))
+        pick = z3.If(lt, y, x) if is_max else z3.If(lt, x, y)
+        return z3.If(z3.Or(z3.fpIsNaN(x), z3.fpIsNaN(y)), z3.fpNaN(x.sort()), pick)
+    return f
+for k, f in (('addf', lambda x, y: z3.fpAdd(z3.RNE(), x, y)), ('subf', lambda x, y: z3.fpSub(z3.RNE(), x, y)),
+             ('mulf', lambda x, y: z3.fpMul(z3.RNE(), x, y)), ('divf', lambda x, y: z3.fpDiv(z3.RNE(), x, y)),
+             ('remf', _fmod), ('maximumf', _fmax(True)), ('minimumf', _fmax(False))):
+    nat(f'arith.{k}', [('lhs', 'F'), ('rhs', 'F')], [('r', 'F')], _fbin(f), reads=('nnan', 'ninf'))
+nat('arith.negf', [('in', 'F')], [('r', 'F')], lambda p, a: ([(z3.fpNeg(a[0][0]), z3.Or(a[0][1], _fpp(p, [a[0][0]])))], F_), reads=('nnan', 'ninf'))
+def _cmpf(p, a):
+    (x, px), (y, py) = a; k = p['predicate']; un = z3.Or(z3.fpIsNaN(x), z3.fpIsNaN(y))
+    o = {1: z3.fpEQ(x, y), 2: z3.fpGT(x, y), 3: z3.fpGEQ(x, y), 4: z3.fpLT(x, y), 5: z3.fpLEQ(x, y), 6: z3.Or(z3.fpLT(x, y), z3.fpGT(x, y))}
+    if k == 0: c = F_
+    elif k == 15: c = T_
+    elif k == 7: c = z3.Not(un)
+    elif k == 14: c = un
+    elif 1 <= k <= 6: c = o[k]                                         # 有序：NaN ⇒ 假（fpEQ 等对 NaN 本就为假）
+    elif 8 <= k <= 13: c = z3.Or(un, {8: z3.fpEQ(x, y), 9: z3.fpGT(x, y), 10: z3.fpGEQ(x, y), 11: z3.fpLT(x, y), 12: z3.fpLEQ(x, y), 13: z3.Not(z3.fpEQ(x, y))}[k])
+    else: raise ValueUnknown(f'cmpf 谓词 {k}')
+    return [(z3.If(c, z3.BitVecVal(1, 1), z3.BitVecVal(0, 1)), z3.Or(px, py, _fpp(p, [x, y])))], F_
+nat('arith.cmpf', [('lhs', 'F'), ('rhs', 'F')], [('r', 'i1')], _cmpf, reads=('predicate', 'nnan', 'ninf'))
+def _fcast(kind):
+    def g(p, a):
+        (x, px), t = a[0], outty(p)
+        if kind in ('extf', 'truncf'):                                     # extf 精确；truncf RNE（roundingmode 由 valimport 判未知，见 §10.2）
+            r = z3.fpFPToFP(z3.RNE(), x, zsort(t)); return [(r, z3.Or(px, _fpp(p, [x, r])))], F_
+        if kind in ('sitofp', 'uitofp'):
+            r = (z3.fpSignedToFP if kind == 'sitofp' else z3.fpUnsignedToFP)(z3.RNE(), x, zsort(t)); return [(r, px)], F_
+        if kind == 'bitcast':
+            if not z3.is_bv(x): raise ValueUnknown('arith.bitcast：浮点 → 整数会观察 NaN 载荷，值层未建模')
+            if not is_fp(t): raise ValueUnknown('arith.bitcast：整数 → 整数')
+            return [(z3.fpBVToFP(x, zsort(t)), px)], F_
+        w = W(t); sg = kind == 'fptosi'                                  # fptosi/fptoui：截断取整；NaN、Inf 或越界 ⇒ 毒值（LangRef）
+        tz = z3.fpRoundToIntegral(z3.RTZ(), x)
+        lo = -(1 << (w - 1)) if sg else 0; hi_ = (1 << (w - 1)) - 1 if sg else (1 << w) - 1
+        so = x.sort()
+        bad = z3.Or(z3.fpIsNaN(x), z3.fpIsInf(x), z3.fpLT(tz, z3.fpRealToFP(z3.RNE(), z3.RealVal(lo), so)) if lo else z3.fpLT(tz, z3.fpMinusZero(so)),
+                    z3.fpGT(tz, z3.fpRealToFP(z3.RTZ(), z3.RealVal(hi_), so)) if True else F_)
+        # 上界：hi_ 在 so 中可能不可精确表示；RTZ 得到 ≤ hi_ 的最大可表示值 m，tz > m 的整数值一定 > hi_（tz 也可表示），故 tz ≤ m ⇔ tz ≤ hi_
+        r = (z3.fpToSBV if sg else z3.fpToUBV)(z3.RTZ(), x, z3.BitVecSort(w))
+        return [(r, z3.Or(px, bad))], F_
+    return g
+for k in ('extf', 'truncf', 'sitofp', 'uitofp', 'fptosi', 'fptoui', 'bitcast'):
+    nat(f'arith.{k}', [('in', 'T')], [('r', 'T2')], _fcast(k), reads=('nnan', 'ninf') if k in ('extf', 'truncf') else ())
+
 # ───────────────────────── 形状层（第 6 轮）
 # tensor 值 = ⟨extent ∈ ℤ^r，元素 Array(ℤ^r → E)，元素毒值 Array(ℤ^r → Bool)⟩，另有整体毒值标志。
 # L22 静态维是 extent 的投影：边上的静态维是声明，不符 ⇒ 该值为毒值，且立一条证明义务（诊断）。
@@ -275,7 +356,7 @@ def vref(vs, ps, vt, pt):
     return z3.Implies(z3.Not(ps), z3.And(z3.Not(pt), *[x == y for x, y in zip(ext(vs), ext(vt))],
         forall(iv, z3.Implies(z3.And(inb(iv, ext(vs)), z3.Not(sel(tpz(vs), I))), z3.And(z3.Not(sel(tpz(vt), I)), sel(dat(vt), I) == sel(dat(vs), I))))))
 def _anyp(xs): return z3.Or([p for _, p in xs]) if xs else F_
-def _zero(e): return z3.BitVecVal(0, W(e)) if is_int(e) else z3.IntVal(0)
+def _zero(e): return z3.BitVecVal(0, W(e)) if is_int(e) else z3.fpPlusZero(zsort(e)) if is_fp(e) else z3.IntVal(0)
 def _dyn_ext(ty, dyn):
     tp = tparse(ty); it = iter(dyn)
     return [z3.IntVal(k) if k is not None else next(it)[0] for k in tp[0]], tp
@@ -762,7 +843,7 @@ def derive(name, ins, outs, blocks, mode='transparent', params=()):
     if dup or (old is not None and not is_comp(old)):
         sch.struct_diag, sch.summary, sch.type_diag = [], None, []
         sch.name_diag = [f'端口/参数重名 {sorted(set(dup))}'] if dup else [f'复合 op 名 {name} 与原生 op 冲突']
-        sch.value_known, sch.exact = False, False
+        sch.value_known, sch.exact = False, False; sch.value_why = sch.name_diag[0][:60]
         return sch
     # 结构层：把体包成 func 检查 R1–R8，并求结构摘要
     ft = '(' + ', '.join(t for _, t in ins) + ') -> (' + ', '.join(t for _, t in outs) + ')'
@@ -770,7 +851,7 @@ def derive(name, ins, outs, blocks, mode='transparent', params=()):
     sch.summary = ST.derive_struct(blocks)
     sch.type_diag = typecheck(blocks, ft)
     if sch.type_diag:
-        sch.value_known, sch.exact = False, False
+        sch.value_known, sch.exact = False, False; sch.value_why = '类型诊断 ' + str(sch.type_diag[0])[:50]
         reg(sch); return sch
     c = Ctx(sch.pconsts); c.owner = name
     holes = []
