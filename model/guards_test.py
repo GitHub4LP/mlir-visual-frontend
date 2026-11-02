@@ -294,8 +294,10 @@ if __name__ == '__main__':
         r4 = G4(); print('── G4 S3 改写规则（左 core、右插守卫 JIT）：(有效?, 一致, 不一致, 左边毒值跳过)')
         for k, v in r4.items(): print(f'   {k}: {v}')
         s5, a5 = G5(); print('── G5 全形式切片（越界输入）:', dict(sorted(s5.items()))); print('   A/B 未插守卫:', dict(sorted(a5.items())))
-        ok4 = s5.get('执行（越界输入）/运行崩溃或异常', 0) == 0 and all(v[0] != '未知' and ((v[0] and v[2] == 0 and v[1] > 0) or (not v[0] and v[2] > 0)) for v in r4.values())
-        sys.exit(0 if ok4 else 1)
+        import verdict as V
+        V.check('G4 S3 改写规则外部化', all(v[0] != '未知' and ((v[0] and v[2] == 0 and v[1] > 0) or (not v[0] and v[2] > 0)) for v in r4.values()), '有效规则 0 不一致、错误规则有反例')
+        V.check('G5 全形式切片', s5.get('执行（越界输入）/运行崩溃或异常', 0) == 0 and s5.get('执行（越界输入）/正常结束', 0) > 0, f"正常 {s5.get('执行（越界输入）/正常结束', 0)}，运行崩溃 {s5.get('执行（越界输入）/运行崩溃或异常', 0)}")
+        V.finish()
     if len(sys.argv) > 2:
         t3, e3 = G3(int(sys.argv[2]))
         print('── G3 语料（插守卫）:'); [print(f'   {k}: {v}') for k, v in sorted(t3.items())]
@@ -306,5 +308,8 @@ if __name__ == '__main__':
     print('── G1 插守卫后 vs core（含越界输入）:'); [print(f'   {k}: {v}') for k, v in sorted(st.items())]
     print('── G2 A/B 未插守卫（同一批输入）:'); [print(f'   {k}: {v}') for k, v in sorted(ab.items())]
     for k, v in ex.items(): print('──', k); [print('    ', x[:600]) for x in v]
-    ok = all(g0.values()) and st['越界输入/一致'] > 0 and st['不一致'] == 0 and st['一致'] > 0 and st['程序'] > 0 and (ab['不一致'] > 0 or any('JIT 不可用' in k for k in ab))
-    sys.exit(0 if ok else 1)
+    import verdict as V
+    V.check('G0′ 定向', all(g0.values()), str(g0))
+    V.check('G1 生成器', st['越界输入/一致'] > 0 and st['不一致'] == 0 and st['一致'] > 0 and st['程序'] > 0 and (ab['不一致'] > 0 or any('JIT 不可用' in k for k in ab)),
+            f"一致 {st['一致']}，越界一致 {st['越界输入/一致']}，不一致 {st['不一致']}")
+    V.finish()
