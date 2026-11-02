@@ -50,9 +50,7 @@ def check_table():
             if mk and mk not in src_: bad.append(f'K2 {cid} 标记不存在：{f}:{mk}')
             # K7（第 44 轮）：该检验是否有机器判定（verdict.check('标记', …)，失败 ⇒ 退出码 1）。此前多数测试只打印统计、退出码恒 0。
             if mk and re.search(r"check\(\s*'" + re.escape(mk), src_): st['K7 检验引用有机器判定'] += 1
-            elif 'sys.exit' in src_: st['K7 仅文件级退出码判定'] += 1
-            elif status == '检验': st['K7 检验条款的引用无机器判定'] += 1
-            else: st['K7 部分条款的引用无机器判定'] += 1
+            else: bad.append(f'K7 {cid} 引用无逐标记判定：{f}:{mk}')      # 第 47 轮：118/118 已逐标记，此后一律视为错误（文件级退出码不算）
         for L in law_ids(laws):
             cited.add(L); st['定律引用'] += 1
             if L not in grades: bad.append(f'K3 {cid} 定律不在账本：{L}'); continue
@@ -109,4 +107,7 @@ if __name__ == '__main__':
     g, n = k6(); print(f'── K6 核对器自检：注入错误 {g}/{n} 被抓出'); bad += [] if g == n else ['K6 自检未全抓']
     ok, r = m27()
     print('── M2.7 值层无拒绝权:', r, 'OK' if ok else 'FAIL')
-    sys.exit(1 if bad or not ok else 0)
+    import verdict as V
+    V.check('K1–K6 对照表一致', not bad, f'问题 {len(bad)}')
+    V.check('M2.7 值层无拒绝权', ok, str(r))
+    V.finish()
