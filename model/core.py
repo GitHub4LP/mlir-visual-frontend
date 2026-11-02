@@ -1101,30 +1101,66 @@ def inline_all(blocks, env=None, pfx='', penv=None):
     return out
 
 # ───────────────────────── 编辑操作：提取为复合 op（带契约的图变换）
-def extract(name, block, lo, hi_, types, mode='transparent'):
-    """把 block['ops'][lo:hi_] 提取为复合 op。捕获的值提升为输入端口（L3），后面还会用到的值成为输出端口。
-    契约：提取前后，宿主的 Pre 与 MayPoison 相等（core_test.py 用 z3 判定等价）。"""
+def _vals_in(n):
+    """op 读取的值：操作数 + 后继操作数（第 44 轮：此前只看 ins，cf 后继实参里的捕获会被漏掉）。"""
+    return list(n['ins']) + [x for _, sa in (n.get('succs') or []) for x in sa]
+class NotExtractable(Exception): pass
+def extract_ports(block, lo, hi_, rest=()):
+    """L3 端口：block['ops'][lo:hi_] 提取后的 (捕获 = 输入端口, 输出端口)。
+    第 44 轮（capture_test，以 MLIR 为真值）修正三处：
+      · rest = 同一区域里的其它块：段内定义的值可以被这些块使用，只扫本块后续 op 会漏掉输出；
+      · 名字按词法作用域解析：导入的 IR 沿用 MLIR 文本名，兄弟区域可以重用同一个名字（%1、%arg1…）。
+        嵌套区域里定义的名字只在该区域内可见；此前把它们并入全段的“已定义”，段顶层对同名外部值的使用会被当成内部定义 ⇒ 漏掉捕获；
+      · 段内“先用后定义”（只在不可达块或 Graph 区域里合法）⇒ 提取进 SSACFG 函数会改变支配要求 ⇒ NotExtractable。
+    后继实参也算使用。"""
     seg = block['ops'][lo:hi_]
-    defined, used = {}, []
-    def scan(ops):
-        for n in ops:
-            for v in n['ins']:
-                if v not in defined and v not in used: used.append(v)
-            for v, t in n['outs']: defined[v] = t
+    used, top = [], {}
+    def scan(ops, scope, at_top):
+        local = {}
+        if at_top: local = top
+        for k, n in enumerate(ops):
+            for v in _vals_in(n):
+                if v in local or any(v in sc for sc in scope): continue
+                if any(v == o for m in ops[k:] for o, _ in m['outs']):
+                    raise NotExtractable(f'{v} 在段内先用后定义（不可达块或 Graph 区域）')
+                if v not in used: used.append(v)
             for r in n['regions']:
                 for b in r:
-                    for v, t in b['args']: defined[v] = t
-                    scan(b['ops'])
-    scan(seg)
-    later = set()
-    def uses(ops):
+                    inner = {x: t for x, t in b['args']}
+                    for m in b['ops']:
+                        for x, t in m['outs']: inner[x] = t          # 区域内整块可见（支配由 MLIR 另行检查）
+                    scan2(b['ops'], scope + [local, inner])
+            for v, t in n['outs']: local[v] = t
+    def scan2(ops, scope):
         for n in ops:
-            later.update(n['ins'])
+            for v in _vals_in(n):
+                if any(v in sc for sc in scope): continue
+                if v not in used: used.append(v)
             for r in n['regions']:
-                for b in r: uses(b['ops'])
-    uses(block['ops'][hi_:])
-    caps_ = [v for v in used if v not in defined]
-    outs = [v for v in defined if v in later and any(v == o for n in seg for o, _ in n['outs'])]
+                for b in r:
+                    inner = {x: t for x, t in b['args']}
+                    for m in b['ops']:
+                        for x, t in m['outs']: inner[x] = t
+                    scan2(b['ops'], scope + [inner])
+    scan(seg, [], True)
+    later = set()
+    def uses(ops, shadow):
+        for n in ops:
+            later.update(v for v in _vals_in(n) if v not in shadow)
+            for r in n['regions']:
+                for b in r:
+                    inner = set(x for x, _ in b['args']) | {x for m in b['ops'] for x, _ in m['outs']}
+                    uses(b['ops'], shadow | inner)
+    uses(block['ops'][hi_:], frozenset())
+    for b in rest: uses(b['ops'], frozenset())
+    caps_ = list(used)
+    outs = [v for v in top if v in later]
+    return caps_, outs
+def extract(name, block, lo, hi_, types, mode='transparent', rest=()):
+    """把 block['ops'][lo:hi_] 提取为复合 op。捕获的值提升为输入端口（L3），后面还会用到的值成为输出端口。
+    契约：提取前后，宿主的 Pre 与 MayPoison 相等（core_test.py 用 z3 判定等价）。端口由 extract_ports 给出（capture_test 以 MLIR 为真值）。"""
+    seg = block['ops'][lo:hi_]
+    caps_, outs = extract_ports(block, lo, hi_, rest)
     pm = {v: f'{name}_in{i}' for i, v in enumerate(caps_)}
     body_ops = [ren(n, pm) for n in seg] + [node(f'{name}_ret', 'func.return', ins=[pm.get(v, v) for v in outs])]
     body = [blk('entry', body_ops, args=[(pm[v], types[v]) for v in caps_])]
@@ -1132,7 +1168,7 @@ def extract(name, block, lo, hi_, types, mode='transparent'):
     call = node(f'{name}_call', name, ins=caps_, outs=[(v, types[v]) for v in outs])
     return s, dict(block, ops=block['ops'][:lo] + [call] + block['ops'][hi_:])
 def ren(n, pm):
-    return dict(n, ins=[pm.get(v, v) for v in n['ins']],
+    return dict(n, ins=[pm.get(v, v) for v in n['ins']], succs=[(b, [pm.get(x, x) for x in sa]) for b, sa in (n.get('succs') or [])],
                 regions=[[dict(b, ops=[ren(x, pm) for x in b['ops']]) for b in r] for r in n['regions']])
 
 # ───────────────────────── 小工具
