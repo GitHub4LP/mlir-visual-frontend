@@ -199,7 +199,13 @@ if __name__ == '__main__':
     n = int(sys.argv[1]) if len(sys.argv) > 1 else 200
     seeds = [int(sys.argv[2])] if len(sys.argv) > 2 else [0, 1, 2]
     print('── T1 随机复合 op：嵌套 ≡ 内联，推导 ⊑ 预言机')
-    for sd in seeds: print(f'  种子 {sd}:', T1(n, sd))
-    print('── T2 跨层组合律')
+    import verdict as V
+    t1 = [T1(n, sd) for sd in seeds]
+    for sd, r in zip(seeds, t1): print(f'  种子 {sd}:', r)
+    V.check('T1 随机复合 op', all(r['不可靠'] == 0 and r['闭包'] == r['n'] for r in t1), f'{sum(r["n"] for r in t1)} 例，不可靠 {sum(r["不可靠"] for r in t1)}')
+    print('── T2 跨层组合律'); oks = {}
     for f in (X1, X2, X3, X4, X5, X6):
-        ok, msg = f(); print(f'  {"✓" if ok else "✗"} {f.__name__}: {f.__doc__.strip().splitlines()[0]}\n      {msg}')
+        ok, msg = f(); oks[f.__name__] = ok; print(f'  {"✓" if ok else "✗"} {f.__name__}: {f.__doc__.strip().splitlines()[0]}\n      {msg}')
+    V.check('T2 跨层组合律', all(oks.values()), str(oks))
+    V.check('自由符号', oks['X6'], 'X6 透明模式自由符号')
+    V.finish()
