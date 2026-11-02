@@ -19,7 +19,7 @@ A/B 级的“0 分歧”必须同时报告**触发数**（L38）和**送达率**
 |---|---|---|---|---|
 | L1 | Sem 是全关系（UB 处任意输出） | frontend-model §5 | C | isl：嵌套 ≡ 内联；属于元理论，需要的是证明，不是测试 |
 | L2 | 复合摘要不能限制到 Pre 上 | 同上 | C | 同上 |
-| L3 | 捕获提升为端口；IsolatedFromAbove 由推导得到 | structure §5 | B | structure_fuzz 与 MLIR 不可靠 0；X2 |
+| L3 | 捕获提升为端口；IsolatedFromAbove 由推导得到 | structure §5、§6.1 | B | 真实 IR 提取 4435 段 MLIR 端口错误 0（第 43 轮算法 8，消融，capture_test）；structure_fuzz 不可靠 0；X2 |
 | L4 | 透明/不透明模式下，自由符号在不同的表里解析 | structure §5 | B（+A） | 解析规则有 Y1 语料作证（symbols.md）；“两种模式语义不同”只有 X6 自证 |
 | L5 | needs_ssacfg 的体不能内联进 Graph 区域 | structure §5 | B | X5 + R7 差分 |
 | L6 | 复合摘要的 UB 和毒值必须依赖输入毒值 | core-v4 §4 | C | 穷举解释器 900/900。MLIR 没有可执行的毒值语义；外部真值只能用 V2/V3 的方法间接得到（§3） |

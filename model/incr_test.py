@@ -138,5 +138,6 @@ def main(cap=8):
 
 if __name__ == '__main__':
     st = main(int(sys.argv[1]) if len(sys.argv) > 1 else 8)
-    assert not st['I1 违例'] and not st['I2 不一致'] and not st['I4 单元层增量不一致'], st
-    print('通过')
+    import verdict as V
+    V.check('I 增量重验', not st['I1 违例'] and not st['I2 不一致'] and not st['I4 单元层增量不一致'], str({k: st[k] for k in ('I1 违例', 'I2 不一致', 'I4 单元层增量不一致')}))
+    V.finish()

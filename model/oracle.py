@@ -90,7 +90,7 @@ def _refs_in(v):
     if v.startswith('"') and v.endswith('"') and _STR.fullmatch(v): return []          # 纯字符串属性
     return [(m.group(1).strip('"'), bool(m.group(2))) for m in _REF.finditer(v)]
 
-def emit_core(blocks, ftype, name='f', symbols=None, mod_attrs=None):
+def emit_core(blocks, ftype, name='f', symbols=None, mod_attrs=None, types=None):
     """core 函数体 → MLIR 模块文本（交预言机）。
     第 16 轮（modular.md）：
       · 导入节点（props 带 _attrs）逐字发射（属性原样、类型取当前值类型），不再经 ODS 守卫：MLIR 自己认识的方言（linalg、affine…）都可送检；
@@ -102,6 +102,8 @@ def emit_core(blocks, ftype, name='f', symbols=None, mod_attrs=None):
     except Exception as e: _why('内联失败：alloca 逃逸' if type(e).__name__ == 'AllocaEscape' else '内联失败'); return None
     tys, lines, cnt = {}, [], [0]
     refs = set()
+    def val(v): return '%' + re.sub(r'[^\w]', '_', v)
+    for v, t in (types or {}).items(): tys[v] = t; tys[val(v)] = t   # 第 44 轮：预置类型（capture_test：未定义的值照样发射，由 MLIR 判“未声明的 SSA 值”）
     def val(v): return '%' + re.sub(r'[^\w]', '_', v)
     def bname(b): return '^' + re.sub(r'[^\w]', '_', b)
     def fresh(): cnt[0] += 1; return f'%_o{cnt[0]}'

@@ -46,7 +46,13 @@ def check_table():
             f, _, mk = t.partition(':'); p = os.path.join(HERE, f + '.py')
             st['检验引用'] += 1
             if not os.path.exists(p): bad.append(f'K2 {cid} 文件不存在：{f}'); continue
-            if mk and mk not in open(p, encoding='utf-8').read(): bad.append(f'K2 {cid} 标记不存在：{f}:{mk}')
+            src_ = open(p, encoding='utf-8').read()
+            if mk and mk not in src_: bad.append(f'K2 {cid} 标记不存在：{f}:{mk}')
+            # K7（第 44 轮）：该检验是否有机器判定（verdict.check('标记', …)，失败 ⇒ 退出码 1）。此前多数测试只打印统计、退出码恒 0。
+            if mk and re.search(r"check\(\s*'" + re.escape(mk), src_): st['K7 检验引用有机器判定'] += 1
+            elif 'sys.exit' in src_: st['K7 仅文件级退出码判定'] += 1
+            elif status == '检验': st['K7 检验条款的引用无机器判定'] += 1
+            else: st['K7 部分条款的引用无机器判定'] += 1
         for L in law_ids(laws):
             cited.add(L); st['定律引用'] += 1
             if L not in grades: bad.append(f'K3 {cid} 定律不在账本：{L}'); continue

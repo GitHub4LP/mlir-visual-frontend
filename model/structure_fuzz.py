@@ -108,3 +108,6 @@ if __name__ == '__main__':
     print(dict(stat)); print('触发的义务：', dict(obl))
     for src, m in unsound[:2]: print('── 不可靠反例\n', src, '\n', m)
     for d in cons[:3]: print('── 保守', d[:2])
+    import verdict as V
+    V.check('structure_fuzz 不可靠', stat['不可靠'] == 0 and stat['都接受'] > 0 and stat['都拒绝'] > 0, dict(stat))
+    V.finish()

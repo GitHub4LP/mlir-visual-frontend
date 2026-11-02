@@ -158,3 +158,6 @@ if __name__ == '__main__':
     ok = ok and not r5['IW=32 复用 IW=64 摘要：值层'] and r5['重推导后 f(0) <s 0 可证'] and r5['equivalent(跨开关)'] is None \
         and r5['JIT@32 f(0)'] < 0 and not r6['改 IW 后命中旧 Schema'] and not r6['IW=32 下 2^31 >s 0 被证明'] and all(r7.values())
     print('── 结论:', '全部符合' if ok else '有不符')
+    import verdict as V
+    for mk in ('N1 编辑洞', 'N1c 洞在循环摘要内', 'N5 跨语义开关', 'N7 ADT 重定义'): V.check(mk, ok, '整体结论（各项共用一个判据）')
+    V.finish()
