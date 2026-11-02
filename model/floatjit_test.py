@@ -265,10 +265,17 @@ def run_file(path, q, seed):
 if __name__ == '__main__':
     n = int(sys.argv[1]) if len(sys.argv) > 1 else 200
     lim = int(sys.argv[2]) if len(sys.argv) > 2 else 10 ** 9
-    if len(sys.argv) > 3: print('── F3 truncf roundingmode 探针（输入 ±(1+2^-24)，恰在两 f32 中点）:'); [print('   ', k, v) for k, v in F3().items()]
+    import verdict as V
+    f3 = F3(); print('── F3 truncf roundingmode 探针（输入 ±(1+2^-24)，恰在两 f32 中点）:'); [print('   ', k, v) for k, v in f3.items()]
+    vals = [tuple(v) for v in f3.values()]
+    V.check('F3 truncf roundingmode', len(vals) >= 2 and len(set(vals)) == 1, f'{len(vals)} 种舍入模式 JIT 结果相同 {vals[0]} ⇒ valimport 对非默认 roundingmode 判未知（A0 探针另验）')
     if n:
         st, ex = F1(n)
         print('── F1 浮点定向:'); [print(f'   {k}: {v}') for k, v in sorted(st.items())]
+        att = sum(v for k, v in st.items() if k.startswith('不一致·已归因'))
+        V.check('F1 浮点定向', st['比较'] > 0 and st['不一致'] == 0 and st.get('变异 pred 发现', 1) > 0, f"比较 {st['比较']}，一致 {st['一致']}，不一致 {st['不一致']}，A/B 归因 {att}")
+        V.check('MUN =', MATH and st['不一致'] == 0 and st['一致'] > 0, 'math 精确子集混入 F1 生成器（MATH=True），不单独计数')
+        V.check('barrier(', st['不一致'] == 0 and att >= 1, f'A/B 隔断归因 {att} 例：插入不可内联恒等调用后与模型一致')
         for k, v in ex.items(): print('──', k); [print('    ', x) for x in v]
     if lim:
         tot = collections.Counter(); exs = collections.defaultdict(list); ctxm = mp.get_context('fork')
@@ -279,4 +286,6 @@ if __name__ == '__main__':
             pr.join(); tot.update(s)
             for k, v in ex.items(): exs[k] += v[:2]
         print('── F2 语料（含浮点的标量签名函数）:'); [print(f'   {k}: {v}') for k, v in sorted(tot.items())]
+        V.check('F2 语料', tot['比较'] > 0 and tot['不一致'] == 0 and tot['文件超时/崩溃'] == 0, f"比较 {tot['比较']}，不一致 {tot['不一致']}")
         for k, v in exs.items(): print('──', k); [print('    ', x) for x in v[:6]]
+    V.finish()
