@@ -395,23 +395,31 @@ def T3(n, seed=13):
     return st, ex
 
 if __name__ == '__main__':
-    if len(sys.argv) > 4 and sys.argv[4] != '0':
-        st, ex = T3(int(sys.argv[4]))
-        print('── T3 全形式切片定向:'); [print(f'   {k}: {v}') for k, v in sorted(st.items())]
-        for k, v in ex.items(): print('──', k); [print('    ', x) for x in v]
-        sys.exit()
-    if len(sys.argv) > 2 and sys.argv[2] != '0':
-        st, ex = T2(int(sys.argv[2]))
-        print('── T2 逐元素定向:'); [print(f'   {k}: {v}') for k, v in sorted(st.items())]
-        for k, v in ex.items(): print('──', k); [print('    ', x) for x in v]
-        if len(sys.argv) > 3: sys.exit()
-    lim = int(sys.argv[1]) if len(sys.argv) > 1 else 10 ** 9
-    tot = collections.Counter(); exs = collections.defaultdict(list); ctxm = mp.get_context('fork')
-    for i, path in enumerate(sorted(glob.glob('corpus/*/*.mlir'))[:lim]):
-        q = ctxm.Queue(); pr = ctxm.Process(target=run_file, args=(path, q, i)); pr.start()
-        try: s, ex = q.get(timeout=600)
-        except Exception: pr.kill(); tot['文件超时/崩溃'] += 1; print('  ! 超时/崩溃', path, flush=True); continue
-        pr.join(); tot.update(s)
-        for k, v in ex.items(): exs[k] += v[:2]
-    print('── T 语料 tensor 签名函数 值层 vs JIT'); [print(f'   {k}: {v}') for k, v in sorted(tot.items())]
-    for k, v in exs.items(): print('──', k); [print('    ', x) for x in v[:12]]
+    # 第 47 轮：参数 = [语料文件数上限] [T2 程序数] [兼容旧位，忽略] [T3 程序数]；0 表示跳过该部分。每部分逐标记判定。
+    import verdict as V
+    a = sys.argv[1:] + [None] * 4
+    lim = int(a[0]) if a[0] is not None else 10 ** 9
+    n2 = int(a[1]) if a[1] is not None else 0
+    n3 = int(a[3]) if a[3] is not None else 0
+    def show(title, st, ex):
+        print(title); [print(f'   {k}: {v}') for k, v in sorted(st.items())]
+        for k, v in ex.items(): print('──', k); [print('    ', x) for x in v[:12]]
+    if n3:
+        st, ex = T3(n3); show('── T3 全形式切片定向:', st, ex)
+        V.check('T3 全形式切片', st['程序'] > 0 and st['一致'] > 0 and st['不一致'] == 0 and st['变异 static_zero 发现'] > 0,
+                f"程序 {st['程序']}，一致 {st['一致']}，不一致 {st['不一致']}，错误翻译 static_zero 被发现 {st['变异 static_zero 发现']}")
+    if n2:
+        st, ex = T2(n2); show('── T2 逐元素定向:', st, ex)
+        V.check('T2 逐元素定向', st['程序'] > 0 and st['一致'] > 0 and st['不一致'] == 0 and st['变异 pred 发现'] > 0,
+                f"程序 {st['程序']}，一致 {st['一致']}，不一致 {st['不一致']}，错误翻译 pred 被发现 {st['变异 pred 发现']}")
+    if lim:
+        tot = collections.Counter(); exs = collections.defaultdict(list); ctxm = mp.get_context('fork')
+        for i, path in enumerate(sorted(glob.glob('corpus/*/*.mlir'))[:lim]):
+            q = ctxm.Queue(); pr = ctxm.Process(target=run_file, args=(path, q, i)); pr.start()
+            try: s_, ex = q.get(timeout=600)
+            except Exception: pr.kill(); tot['文件超时/崩溃'] += 1; print('  ! 超时/崩溃', path, flush=True); continue
+            pr.join(); tot.update(s_)
+            for k, v in ex.items(): exs[k] += v[:2]
+        show('── T 语料 tensor 签名函数 值层 vs JIT', tot, exs)
+        V.check('T 语料', tot['一致'] > 0 and tot['不一致'] == 0 and tot['文件超时/崩溃'] == 0, f"一致 {tot['一致']}，不一致 {tot['不一致']}（分母缺口见 M0.2）")
+    V.finish()
