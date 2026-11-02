@@ -145,9 +145,13 @@ if __name__ == '__main__':
     ns = int(sys.argv[1]) if len(sys.argv) > 1 else 40
     ne = int(sys.argv[2]) if len(sys.argv) > 2 else 12
     rng = random.Random(3)
-    print('── E1 增量 ≡ 全量（语法截断）:', E1(ns, ne, rng, False))
-    print('── E1 增量 ≡ 全量（语义截断）:', E1(ns // 2, ne, rng, True))
-    print('── E2 L20 连接洞 = 项代换；补全:', E2(ns, rng))
+    import verdict as V
+    e1a = E1(ns, ne, rng, False); print('── E1 增量 ≡ 全量（语法截断）:', e1a)
+    e1b = E1(ns // 2, ne, rng, True); print('── E1 增量 ≡ 全量（语义截断）:', e1b)
+    V.check('E1 增量 ≡ 全量', all(e['编辑'] > 0 and e['不一致'] == 0 for e in (e1a, e1b)), f"编辑 {e1a['编辑']}+{e1b['编辑']}，不一致 {e1a['不一致']}+{e1b['不一致']}（内部一致性，元理论）")
+    e2 = E2(ns, rng); print('── E2 L20 连接洞 = 项代换；补全:', e2)
+    V.check('E2 L20 连接洞', e2['候选'] > 0 and e2['代换等价'] == e2['候选'] and e2['分类一致'] == e2['候选'], f"候选 {e2['候选']}，代换等价 {e2['代换等价']}，分类一致 {e2['分类一致']}（内部一致性，元理论）")
     print('── E3 代价:', E3(rng))
     print('── E4 早截断:', E4())
     print('── 求解器 unknown:', C.STATS['unknown'])
+    V.finish()
