@@ -102,6 +102,11 @@ def main(cap=40):
                     st['Y2 MLIR 以符号诊断拒、我们收（漏判）'] += 1; note('Y2 漏判', f'{why}: {msg[:160]}')
                 else: st['Y2 MLIR 以其它理由拒'] += 1; note('Y2 其它', f'{why}: {msg[:140]}')
     print('── 合计', dict(st)); print('   预言机', orc.stats)
+    import verdict as V
+    V.check('Y0 导入账', bool(SY.ledger()), '')
+    V.check('Y1 误拒', st['Y1 误拒'] == 0 and st['Y1 被检查的符号使用'] > 0, f"模块 {st['Y1 模块']}，符号使用 {st['Y1 被检查的符号使用']}，误拒 {st['Y1 误拒']}")
+    V.check('Y2 变异差分', st['Y2 我们拒、MLIR 收（误拒）'] == 0 and st['Y2 MLIR 以符号诊断拒、我们收（漏判）'] == 0 and st['Y2 两者都拒'] > 0,
+            f"变异 {st['Y2 变异']}，误拒 {st['Y2 我们拒、MLIR 收（误拒）']}，符号漏判 {st['Y2 MLIR 以符号诊断拒、我们收（漏判）']}")
     print('   按变异种类（我们/MLIR）'); [print('     ', k, v) for k, v in sorted(byk.items())]
     for k, v in ex.items():
         print('──', k); [print('    ', x) for x in v]
@@ -109,3 +114,4 @@ def main(cap=40):
 
 if __name__ == '__main__':
     main(int(sys.argv[1]) if len(sys.argv) > 1 else 40)
+    import verdict as V; V.finish()
