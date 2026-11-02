@@ -84,6 +84,10 @@ def main(per_op=3):
                     else:
                         s2['MLIR 以 C++ verify 拒（declared，不要求）'] += 1; note('A2 C++ verify', f'{op}.{e["name"]} = {val}: {msg[:120]}')
     print('── A2 变异差分', dict(s2), '预言机', orc.stats, '求值', A.STATS)
+    import verdict as V
+    V.check('A1 真实属性', st['A1 op 实例'] > 0 and st['A1 误拒'] == 0, f"op 实例 {st['A1 op 实例']}，误拒 {st['A1 误拒']}")
+    V.check('A2 变异差分', s2['变异'] > 0 and s2['我们拒、MLIR 收（误拒）'] == 0 and s2['两者都拒'] > 0,
+            f"变异 {s2['变异']}，误拒 {s2['我们拒、MLIR 收（误拒）']}，ODS 属性层漏判 {s2['MLIR 以 ODS 属性层拒、我们收（漏判）']}")
     print('   漏判最多的属性参数', gaps.most_common(12))
     print('   漏判的 MLIR 诊断模板'); [print('     ', v, k) for k, v in tmpl.most_common(25)]
     print('   关系谓词'); [print('     ', v, k) for k, v in tmpl2.most_common(12)]
@@ -93,3 +97,4 @@ def main(per_op=3):
 
 if __name__ == '__main__':
     main(int(sys.argv[1]) if len(sys.argv) > 1 else 3)
+    import verdict as V; V.finish()

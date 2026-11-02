@@ -164,9 +164,15 @@ def U3():
 
 if __name__ == '__main__':
     n = int(sys.argv[1]) if len(sys.argv) > 1 else 400
-    print('── U0 复合 op 参数（回归）:', U0())
-    print('── U3 语义开关进名字:', U3())
+    import verdict as V
+    u0 = U0(); print('── U0 复合 op 参数（回归）:', u0)
+    jd = u0['JIT 内联：n=0..3 时 addk<1>−addk<2>']
+    V.check('U0 复合 op 参数', all(not u0[f'{m} addk<1> ≡ addk<2> 被证明'] and u0[f'{m} addk<1> ≡ addk<1> 被证明'] for m in ('transparent', 'opaque')) and any(x != 0 for x in jd),
+            f'参数不同不被证明相等、相同可证；JIT 差值 {jd[:3]}… 见证不等')
+    u3 = U3(); print('── U3 语义开关进名字:', u3)
+    V.check('U3 语义开关进名字', u3['不相交'] and u3['IW=64 摘要名'] and u3['IW=32 摘要名'], f"{u3['IW=64 摘要名']} vs {u3['IW=32 摘要名']}")
     st, bad = U1(n)
     print('── U1/U2 证伪审计与完备性:'); [print(f'   {k}: {v}') for k, v in sorted(st.items())]
     for b in bad: print('  ✗', b[0], b[1], '\n', b[2])
     print('── 求解器 unknown:', C.STATS['unknown'])
+    V.finish()

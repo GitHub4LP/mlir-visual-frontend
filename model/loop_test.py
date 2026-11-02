@@ -337,9 +337,15 @@ if __name__ == '__main__':
     n = int(sys.argv[1]) if len(sys.argv) > 1 else 150
     rng = random.Random(1)
     print('── W1 pattern 逐位宽证明:', W1())
-    print('── W2 与 MLIR 执行的差分:', W2(n, rng))
+    import verdict as V
+    w2 = W2(n, rng); print('── W2 与 MLIR 执行的差分:', w2)
+    V.check('W2 与 MLIR 执行', w2['程序'] > 0 and w2['含循环'] > 0 and w2['一致'] > 0 and w2['不一致'] == 0, f"程序 {w2['程序']}（含循环 {w2['含循环']}），输入一致 {w2['一致']}，不一致 {w2['不一致']}")
     print('── W3 循环摘要:'); [print('     ', k, v) for k, v in W3().items()]
     print('── W4 不变式:'); [print('     ', k, v) for k, v in W4(rng).items()]
-    print('── W6 L19 JIT 外部化:', W6(random.Random(29), 120)); print('── W6 归纳变量越界探针:', W6_overflow())
+    w6 = W6(random.Random(29), 120); print('── W6 L19 JIT 外部化:', w6)
+    V.check('W6 L19 JIT', w6['检查输入'] > 0 and w6['公理不成立'] == 0 and w6['公理在JIT输出上成立'] > 0, f"检查输入 {w6['检查输入']}，公理不成立 {w6['公理不成立']}，拒绝且 JIT 见证为假 {w6['拒绝且JIT见证为假']}")
+    wo = W6_overflow(); print('── W6 归纳变量越界探针:', wo)
+    V.check('W6 归纳变量越界', wo['模型判 UB'] is True, f"模型判 UB；JIT {str(wo['JIT'])[:60]}（与 LangRef 1 趟不一致 ⇒ UB 是共同精化）")
     print('── W5 index 溢出:'); [print('     ', k, v) for k, v in W5().items()]
     print('── 求解器 unknown/超时次数（按“未证明”处理）:', C.STATS['unknown'])
+    V.finish()

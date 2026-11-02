@@ -37,4 +37,6 @@ if __name__ == '__main__':
         print(f'  {"✓" if ok else "✗"} {name}: 实测 {r}，期望 {want}')
     V.close()
     print(f'── {len(CASES)} 例，不符 {bad}；分布 {got}')
-    raise SystemExit(bad)
+    import verdict as VV
+    VV.check('any_of', bad == 0 and got.get('crash', 0) >= 1, f'{len(CASES)} 例不符 {bad}（含 any_of(base,base) MLIR UNREACHABLE 的隔离）')
+    VV.finish()

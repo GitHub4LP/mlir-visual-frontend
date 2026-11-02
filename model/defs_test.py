@@ -217,7 +217,15 @@ def D5():
 if __name__ == '__main__':
     n = int(sys.argv[1]) if len(sys.argv) > 1 else 300
     rng = random.Random(0)
+    import verdict as V
     st, msg = D1(n, rng); print('── D1 attribute 项 vs MLIR 解析器:', st, '\n     ', msg)
-    print('── D2 op 参数与元数据 vs MLIR verifier:', D2(n, rng), '\n      保守类别:', D.CONSERVATIVE)
+    V.check('D1 attribute', st['n'] > 0 and st['一致'] == st['n'] and st['不一致'] == 0, f"{st['一致']}/{st['n']}")
+    d2 = D2(n, rng); print('── D2 op 参数与元数据 vs MLIR verifier:', d2, '\n      保守类别:', D.CONSERVATIVE)
+    V.check('D2 op 参数', d2['不可靠'] == 0 and d2['一致'] > 0, f"一致 {d2['一致']}，保守 {d2['保守']}，不可靠 {d2['不可靠']}")
+    res = []
     for f in (D3, lambda: D4(max(n // 3, 20), rng), D5):
-        ok, msg = f(); print(f'── {"✓" if ok else "✗"} {msg}')
+        ok, msg = f(); print(f'── {"✓" if ok else "✗"} {msg}'); res.append((ok, msg.split('；')[0][:80]))
+    V.check('D3', res[0][0], res[0][1])          # 标记须为字面量，clauses_test K7 按字面量匹配
+    V.check('D4', res[1][0], res[1][1])
+    V.check('caps=', res[2][0], 'D5：生成的 ADT op 派生 caps（Pure、option 非毒值可推测）与定律方向符合期望')
+    V.finish()

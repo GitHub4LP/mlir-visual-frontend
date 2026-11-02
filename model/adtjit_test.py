@@ -125,6 +125,9 @@ def run(n, seed=30, mutate=False):
 
 if __name__ == '__main__':
     n = int(sys.argv[1]) if len(sys.argv) > 1 else 100
-    print('── A11 L11 抽象语义 + 降级 vs JIT:', run(n))
+    import verdict as V
+    r = run(n); print('── A11 L11 抽象语义 + 降级 vs JIT:', r)
     m = run(n, mutate=True)
     print('── A11 变异（is_some 降级判 tag==0）不符输入:', m['不符'], '/', m['抽象有定义'])
+    V.check('A11 L11', r['抽象有定义'] > 0 and r['不符'] == 0 and m['不符'] > 0, f"有定义输入 {r['抽象有定义']}，不符 {r['不符']}；变异降级被发现 {m['不符']}/{m['抽象有定义']}（毒值层不由 JIT 外部化，仍 C）")
+    V.finish()
