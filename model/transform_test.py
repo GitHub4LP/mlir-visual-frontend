@@ -260,7 +260,15 @@ if __name__ == '__main__':
     rng = random.Random(0)
     ok, rows = R1(); print(f'── R1 {"✓" if ok else "✗"} 定义期检查（规则, 精化, 度量下降）')
     for r in rows: print('     ', r)
-    print('── R2 局部 → 整体:', R2(n, rng))
-    print('── R3 派生的 fold:', R3())
-    print('── R4 MLIR canonicalize 的翻译确认:', R4(n, rng))
-    print('── R5 L13/L14 JIT 外部化:', R5(n, random.Random(29)))
+    import verdict as V
+    r2 = R2(n, rng); print('── R2 局部 → 整体:', r2)
+    V.check('R2 局部 → 整体', r2['应用'] > 0 and r2['整体精化'] == r2['应用'] and r2['不动点精化'] == r2['不动点'] == r2['度量逐步下降'] and r2['错误被整体抓到'] > 0
+            and r2['规范形不唯一（仅 PATTERNS）'] == 0, f"应用 {r2['应用']} 全部整体精化；错误规则被整体抓到 {r2['错误被整体抓到']}/{r2['错误规则应用']}")
+    r3 = R3(); print('── R3 派生的 fold:', r3)
+    V.check('R3 派生的 fold', r3 == {'divui(6,2)': 3, 'divui(1,0)': None, 'addi nuw(5,3)': 'poison', 'addi(5,3)': 0, '复合 f(6,2)=6/2+nuw 6': 'poison', '复合 f(2,1)=2/1+nuw 2': 4},
+            'i3 上的定向期望值（UB=None）')
+    r4 = R4(n, rng); print('── R4 MLIR canonicalize 的翻译确认:', r4)
+    r5 = R5(n, random.Random(29)); print('── R5 L13/L14 JIT 外部化:', r5)
+    V.check('R5 L13/L14 JIT', r5['翻译不符'] == 0 and r5['单点JIT不符'] == 0 and r5['不动点JIT不符'] == 0 and r5['单点模型精化'] == r5['单点改写'] > 0
+            and r5['不动点模型精化'] == r5['不动点'] and r5['值错JIT抓到'] > 0, f"定义输入 {r5['定义输入']}，翻译/单点/不动点 JIT 不符 0；值错规则 JIT 抓到 {r5['值错JIT抓到']}")
+    V.finish()
