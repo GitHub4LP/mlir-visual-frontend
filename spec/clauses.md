@@ -41,7 +41,7 @@
 | M3.3 | 未读参数/未翻译属性 ⇒ 未知 | core、valimport | values_test:S0 语义属性账; valimport_test:A0 属性账 | L51, L53 | A | 检验 | |
 | M3.4 | tensor：越界毒值、守卫；逐元素 | core | shape_test:S6 与 MLIR 执行; tensorjit_test:T2 逐元素定向; tensorjit_test:T3 全形式切片; valimport_test:A3 切片定向; guards_test:G1 生成器; guards_test:G0′ 定向; guards_test:G4 S3 改写规则外部化; guards_test:G5 全形式切片 | L22, L24 | D | 检验 | 越界=毒值是 D；守卫落地（第 40 轮越界 344/344；第 43 轮切片守卫，越界执行 52/52 安全、未插守卫 22 崩溃）；S3 规则外部化：有效 6 条 0 不一致，错误 2 条找到反例；降秩 insert_slice 守卫未实现（判未知） |
 | M3.5 | 浮点语义 | core 浮点节 | floatjit_test:F1 浮点定向; floatjit_test:F3 truncf roundingmode | — | B | 检验 | F1 默认 n=200：1737/1738 一致 + 1 例 A/B 归因（第 46 轮；旧记 3521 来自更大 n）；F3 五种舍入模式 JIT 结果相同 |
-| M3.6 | math 精确子集 | core math 节 | floatjit_test:MUN = | — | B | 检验 | 混入 F1（verdict 只确认 MATH 开启且 F1 无不一致，未单独计 math 例数，判据偏弱）；isinf/isnormal 无降低 |
+| M3.6 | math 精确子集 | core math 节 | floatjit_test:MUN = | — | B | 检验 | 混入 F1（第 47 轮：verdict 要求含 math 的已执行函数 > 0，默认 n=200 为 81/197，且 F1 不一致 0；math 例仍与 F1 共用逐输出比较，不单独分 op 计）；isinf/isnormal 无降低 |
 | M3.7 | 精化判据；MLIR 变换作真值须有 JIT | core.refines | sem_test:V2 MLIR canonicalize; values_test:V7 scf + sccp; values_test:V9 index 方言 cmp | L52 | A | 检验 | |
 | M3.8 | 循环摘要、不变式、越界步进 UB | core 循环节 | loopsum_test:U0 复合 op 参数; loop_test:W6 L19 JIT; loop_test:W6 归纳变量越界; loopjit_test:L1 生成器; loopjit_test:L3 trip_count | L13, L18′, L19 | B | 检验 | 第 41 轮：iN 界补越界 UB、unsignedCmp 开放；JIT 211/211（8 种类型×比较方式），trip_count 45/45 有事实 |
 | M3.9 | ADT 降级与接口定律 | defs、core | adtjit_test:A11 L11; l12jit_test:L12 接口定律方向 | L11, L12 | B | 部分 | 毒值层依赖 L6（C） |
