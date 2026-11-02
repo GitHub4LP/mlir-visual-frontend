@@ -221,5 +221,12 @@ if __name__ == '__main__':
     bad = [r for r in rows if r[2].startswith('core 宽松') and r[1] not in ALLOWED_PERMISSIVE]
     for r in bad: print('  未归因的宽松：', r[1])
     c4ok = all(not [r for r in rows if r[1] == f'arith.{o}'][0][3]['Pure'] for o in wrong)   # 被观测到误编译的 op，core 必须判不可推测
-    sys.exit(0 if not bad and ok3 and c4ok else 1)
+    import verdict as V
+    c1 = [r for r in rows if r[0] == 'C1']
+    V.check('C1：原生 op', c1 and not [r for r in c1 if r[2].startswith('core 宽松') and r[1] not in ALLOWED_PERMISSIVE],
+            f"原生实例 {len(c1)}：" + str({k: v for k, v in st.items() if k.startswith('C1')}))
+    V.check('C2 复合', not [r for r in rows if r[0] == 'C2' and r[2].startswith('core 宽松') and r[1] not in ALLOWED_PERMISSIVE], str({k: v for k, v in st.items() if k.startswith('C2')}))
+    V.check('C3：义务经复合 op 调用传播', ok3, str(r3)[:120])
+    V.check('C4：MLIR 判 Pure', bool(wrong) and c4ok, f'LICM+O3 误编译的 op {sorted(wrong)}，core 均判不可推测')
+    V.finish()
 
