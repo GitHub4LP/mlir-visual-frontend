@@ -133,7 +133,13 @@ if __name__ == '__main__':
     n1 = int(sys.argv[1]) if len(sys.argv) > 1 else 300
     n2 = int(sys.argv[2]) if len(sys.argv) > 2 else 600
     print(f'── 语义：index 溢出 = {C.IXOVF}，nsw = {"建模" if getattr(C, "NSW", False) else "未建模"}')
-    if not v3: print('── V1 无标志程序 vs MLIR 执行:', V1(n1, random.Random(7)))
-    print('── V3 定向（溢出标志 + 常量比较）的翻译确认:', V2(n2, random.Random(9), gen3))
-    if v3: sys.exit()
-    print('── V2 MLIR canonicalize + int-range-optimizations 的翻译确认:', V2(n2, random.Random(8)))
+    import verdict as V
+    if not v3:
+        v1 = V1(n1, random.Random(7)); print('── V1 无标志程序 vs MLIR 执行:', v1)
+        V.check('V1 无标志程序', v1['程序'] > 0 and v1['一致'] > 0 and v1['值不一致'] == 0, str(v1))
+    r3 = V2(n2, random.Random(9), gen3); print('── V3 定向（溢出标志 + 常量比较）的翻译确认:', r3)
+    V.check('V3 定向', r3['精化'] > 0 and r3['反例'] == 0, str(r3))
+    if not v3:
+        r2 = V2(n2, random.Random(8)); print('── V2 MLIR canonicalize + int-range-optimizations 的翻译确认:', r2)
+        V.check('V2 MLIR canonicalize', r2['精化'] > 0 and r2['反例'] == 0, str(r2))
+    V.finish()
