@@ -94,7 +94,8 @@ def main(cap=16):
                     MISS[(op, lk[0] if lk else ('未导入方言' if op.split('.')[0] not in O.DIALECTS else '未知 op'))] += 1
                     if lk and lk[0] == 'auto': note('符号层漏判落在 auto op', f"{kind} {par} → {op}: {full[0][1][1][:160]}")
     print('── M3 单元级预言机 vs 整模块 verifier' if UNIT else '── M2 体级预言机 vs 整模块 verifier', dict(st));
-    V.check('M3 单元级预言机' if UNIT else 'M2 体级预言机', st['误拒'] == 0 and st['底本误拒'] == 0 and st['两者都拒'] > 0 and (st['无预言机漏判'] == st['其中体级预言机抓住'] if UNIT else st['漏判'] == st['漏判：不在 func.func 体内（体级预言机不覆盖）']),
+    (lambda c, d: V.check('M3 单元级预言机', c, d) if UNIT else V.check('M2 体级预言机', c, d))(   # 两个字面量标记（K7 按字面量匹配）
+        st['误拒'] == 0 and st['底本误拒'] == 0 and st['两者都拒'] > 0 and (st['无预言机漏判'] == st['其中体级预言机抓住'] if UNIT else st['漏判'] == st['漏判：不在 func.func 体内（体级预言机不覆盖）']),
             f"变异 {st['变异']}，误拒 {st['误拒']}，底本误拒 {st['底本误拒']}，漏判 {st['漏判']}（不在 func 体内 {st['漏判：不在 func.func 体内（体级预言机不覆盖）']}），符号层漏判 {st['无预言机漏判']} 全由预言机抓住 {st['其中体级预言机抓住']}"); print('   单元', dict(C.MOD_STATS)); print('   预言机（真值）', orc.stats); print('   发射', dict(sorted(OR.WHY_NONE.items(), key=lambda x: -x[1])[:12]))
     for kk, v in sorted(byk.items(), key=lambda x: (x[0][0], -x[1])):
         if '漏判父' not in kk[0] or v >= 3: print('     ', kk, v)
