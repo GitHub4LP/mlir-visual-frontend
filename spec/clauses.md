@@ -13,7 +13,7 @@
 | ID | 条款 | 实现 | 检验 | 律 | 级 | 状态 | 外部数据 / 缺口 |
 |---|---|---|---|---|---|---|---|
 | M0.1 | 前端合法 ⇒ verifier 接受；有拒绝权的层不误拒 | structure、odssig、attrsig、symtab、oracle | odssig_test:L1 差分; obligations_test:Z2 变异差分; symtab_test:Y1 误拒; modular_test:M3 单元级预言机; attrsig_test:A1 真实属性 | L29, L30, L34a/b, L36a/b, L39, L42 | A | 检验 | M3 19641 误拒 0；Z2 8858；Y1 2108 |
-| M0.2 | 导入语义不变，否则未知 | irimport、valimport | valimport_test:A2 一致; tensorjit_test:T 语料; floatjit_test:F2 语料 | L53 | A | 部分 | 1274/1274（第 41 轮）、1030/1030、1749/1749；分母缺口：tensor 签名 41/616、浮点 102/204 有事实 |
+| M0.2 | 导入语义不变，否则未知 | irimport、valimport | valimport_test:A2 一致; tensorjit_test:T 语料; floatjit_test:F2 语料 | L53 | A | 部分 | 1274/1274（第 46 轮复跑）、1030/1030、F2 1781/1781（第 46 轮）；分母缺口：tensor 签名 41/616、浮点 102/204 有事实 |
 | M0.3 | 前端证明的改写 ⇒ MLIR 精化 | transform、core | transform_test:R5 L13/L14 JIT; sem_test:V2 MLIR canonicalize; values_test:V6 canonicalize | L13, L14, L15 | B | 检验 | R5 21971/0 不符 |
 | M0.4 | 强于 MLIR 只在无对应物处，标 D | — | — | L23, L24, L26 | D | 元理论 | 设计选择；L24 的守卫义务另有 B（shape S6） |
 | M0.5 | 外部真值缺陷：按规范建模，A/B 隔断才可归因 | floatjit.barrier、values_test V8/V9 | floatjit_test:barrier(; values_test:V9 index 方言 cmp; values_test:V8 IW=32 | L50, L52 | A | 检验 | 归因 4 类；每类有隔断对照 |
@@ -29,7 +29,7 @@
 | M1.10 | 名字单射编码全部语义来源 | core、names | names_test:N1 编辑洞; names_test:N5 跨语义开关; names_test:N7 ADT 重定义; loopsum_test:U3 语义开关进名字 | L18′, L54 | B | 检验 | |
 | M2.1 | 结构层有拒绝权 | structure | obligations_test:Z2 变异差分; obligations_test:Z1 触发数 | L39 | A | 检验 | |
 | M2.2 | 自动签名有拒绝权 | odssig | odssig_test:L1 按账目 | L29 | A | 检验 | |
-| M2.3 | 属性层有拒绝权 | attrsig | attrsig_test:A1 真实属性 | L34a/b | A | 检验 | A1 14065、A2 18145 |
+| M2.3 | 属性层有拒绝权 | attrsig | attrsig_test:A1 真实属性 | L34a/b | A | 检验 | A1 14984 实例误拒 0；A2 变异 25395 误拒 0、ODS 属性层漏判 465（第 46 轮） |
 | M2.4 | 符号层有拒绝权 | symtab | symtab_test:Y1 误拒 | L36a/b | A | 检验 | |
 | M2.5 | 预言机是最终权威 | oracle | modular_test:M3 单元级预言机; oracle_test:O1/O2 判定与分工 | L42 | A | 检验 | |
 | M2.6 | typesig 无拒绝权，只警告 | typesig | typesig_test:T4 接入 core | L33 | D | 检验 | 元规则，由 A 级数据支撑 |
@@ -40,8 +40,8 @@
 | M3.2 | index IW 回绕；IW≠64 先降 iIW | core.set_iw | values_test:V5 JIT; values_test:V8 IW=32 | L17″, L49, L50 | A | 检验 | |
 | M3.3 | 未读参数/未翻译属性 ⇒ 未知 | core、valimport | values_test:S0 语义属性账; valimport_test:A0 属性账 | L51, L53 | A | 检验 | |
 | M3.4 | tensor：越界毒值、守卫；逐元素 | core | shape_test:S6 与 MLIR 执行; tensorjit_test:T2 逐元素定向; tensorjit_test:T3 全形式切片; valimport_test:A3 切片定向; guards_test:G1 生成器; guards_test:G0′ 定向; guards_test:G4 S3 改写规则外部化; guards_test:G5 全形式切片 | L22, L24 | D | 检验 | 越界=毒值是 D；守卫落地（第 40 轮越界 344/344；第 43 轮切片守卫，越界执行 52/52 安全、未插守卫 22 崩溃）；S3 规则外部化：有效 6 条 0 不一致，错误 2 条找到反例；降秩 insert_slice 守卫未实现（判未知） |
-| M3.5 | 浮点语义 | core 浮点节 | floatjit_test:F1 浮点定向; floatjit_test:F3 truncf roundingmode | — | B | 检验 | F1 3521/3521+1 归因 |
-| M3.6 | math 精确子集 | core math 节 | floatjit_test:MUN = | — | B | 检验 | 混入 F1；isinf/isnormal 无降低 |
+| M3.5 | 浮点语义 | core 浮点节 | floatjit_test:F1 浮点定向; floatjit_test:F3 truncf roundingmode | — | B | 检验 | F1 默认 n=200：1737/1738 一致 + 1 例 A/B 归因（第 46 轮；旧记 3521 来自更大 n）；F3 五种舍入模式 JIT 结果相同 |
+| M3.6 | math 精确子集 | core math 节 | floatjit_test:MUN = | — | B | 检验 | 混入 F1（verdict 只确认 MATH 开启且 F1 无不一致，未单独计 math 例数，判据偏弱）；isinf/isnormal 无降低 |
 | M3.7 | 精化判据；MLIR 变换作真值须有 JIT | core.refines | sem_test:V2 MLIR canonicalize; values_test:V7 scf + sccp; values_test:V9 index 方言 cmp | L52 | A | 检验 | |
 | M3.8 | 循环摘要、不变式、越界步进 UB | core 循环节 | loopsum_test:U0 复合 op 参数; loop_test:W6 L19 JIT; loop_test:W6 归纳变量越界; loopjit_test:L1 生成器; loopjit_test:L3 trip_count | L13, L18′, L19 | B | 检验 | 第 41 轮：iN 界补越界 UB、unsignedCmp 开放；JIT 211/211（8 种类型×比较方式），trip_count 45/45 有事实 |
 | M3.9 | ADT 降级与接口定律 | defs、core | adtjit_test:A11 L11; l12jit_test:L12 接口定律方向 | L11, L12 | B | 部分 | 毒值层依赖 L6（C） |
