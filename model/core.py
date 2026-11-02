@@ -30,9 +30,10 @@ def set_iw(w):
     IW, LO, HI = w, -(1 << (w - 1)), 1 << (w - 1)
 NSW = True                            # nsw 标志的毒值条件（第 21 轮前漏建模：nsw 被忽略，模型比 MLIR 更“有定义”，不可靠）
 KUNROLL = 64                          # 静态循环精确展开的上限
-KTUNROLL = 8                          # 第 47 轮：携带 tensor 的循环，展开后 tensor 产生 op 总数上限。每次展开把上一趟的 tensor 项嵌进新的 Lambda，
+KTUNROLL = 512                          # 第 47 轮：携带 tensor 的循环，展开后 tensor 产生 op 总数上限。每次展开把上一趟的 tensor 项嵌进新的 Lambda，
                                       #   z3 抽象绑定变量时按嵌套深度重复遍历共享子项 ⇒ 指数增长（语料 for-loop-canonicalization：10 趟×2 个 insert_slice
                                       #   推导 > 20 分钟，6 趟 2.8 s，约 ×3.5/趟）。超限改走摘要路径（与 trip > KUNROLL 同一条可靠路径），不静默挂起。
+                                      #   第 48 轮：根因已在项层修掉（_proj/_sel 的 β/投影化简，链长多项式），上限从 8 放宽到 512，只作安全网。
 def _tensor_ops(blocks):
     k = 0
     for b in blocks:
@@ -361,9 +362,8 @@ def tsort(r, e):
     return _TS[(r, e)]
 def is_t(v): return v is not None and v.sort().name() in _TM
 def rank(v): return _TM[v.sort().name()][0]
-def ext(v): S_ = v.sort(); return [S_.accessor(0, i)(v) for i in range(rank(v))]
-def dat(v): S_ = v.sort(); return S_.accessor(0, rank(v))(v)
-def tpz(v): S_ = v.sort(); return S_.accessor(0, rank(v) + 1)(v)
+
+
 def mkt(S_, es, d, pz): return S_.constructor(0)(*es, d, pz)
 def wf(h, ty):
     """值的良构公理（对所有产生者都成立）：非毒值的 index 在范围内；非毒值 tensor 的 extent 非负且在范围内。静态维不在这里（L22）。"""
@@ -373,7 +373,33 @@ def wf(h, ty):
 def static_ok(v, ty):
     tp = tparse(ty)
     return z3.And([e == k for e, k in zip(ext(v), tp[0]) if k is not None]) if tp and is_t(v) else T_
-def sel(a, I): return a[tuple(I)] if len(I) else a[z3.IntVal(0)]          # 第 34 轮：统一的取元素/建数组/量化，0 维走哑下标
+# 第 48 轮：项层的 β/投影化简（纯重写，语义不变）。此前 dat(mk(…)) 留作“访问器(构造器)”、sel(Lambda, I) 留作 Select(Lambda, I)，
+#   每个 tensor op 把上一个 tensor 的整项嵌进新 Lambda；z3 抽象绑定变量时按嵌套深度重复遍历共享子项 ⇒ 链长指数（直线 12 个 insert_slice 13 s，
+#   14 个 > 25 s；循环展开同理，见第 47 轮 KTUNROLL）。现在：构造器上的投影直接取参数，If 上的投影/取元素推进两支（带记忆），
+#   Lambda 上的取元素做 β 代换。结果每个 tensor 的元素项只有一层 Lambda，链长 N 的推导为多项式。
+_PC = {}
+def _memo(key, keep, f):
+    if len(_PC) > 200000: _PC.clear()
+    hit = _PC.get(key)
+    if hit is not None: return hit[1]
+    r = f(); _PC[key] = (keep, r); return r
+def _proj(v, k):
+    S_ = v.sort()
+    if z3.is_app(v) and v.decl().eq(S_.constructor(0)): return v.arg(k)
+    if z3.is_app_of(v, z3.Z3_OP_ITE):
+        return _memo(('p', v.get_id(), k), v, lambda: z3.If(v.arg(0), _proj(v.arg(1), k), _proj(v.arg(2), k)))
+    return S_.accessor(0, k)(v)
+def ext(v): return [_proj(v, i) for i in range(rank(v))]
+def dat(v): return _proj(v, rank(v))
+def tpz(v): return _proj(v, rank(v) + 1)
+def _sel(a, I):
+    if z3.is_quantifier(a) and a.is_lambda() and a.num_vars() == len(I): return z3.substitute_vars(a.body(), *reversed(I))
+    if z3.is_app_of(a, z3.Z3_OP_CONST_ARRAY) and len(I) == 1: return a.arg(0)
+    if z3.is_app_of(a, z3.Z3_OP_ITE):
+        return _memo(('s', a.get_id()) + tuple(i.get_id() for i in I), (a, I), lambda: z3.If(a.arg(0), _sel(a.arg(1), I), _sel(a.arg(2), I)))
+    return a[tuple(I)] if len(I) > 1 else a[I[0]]
+def sel(a, I):                                                           # 第 34 轮：统一的取元素/建数组/量化，0 维走哑下标
+    return _sel(a, tuple(I) if len(I) else (z3.IntVal(0),))
 def lam(iv, body): return z3.Lambda(list(iv), body) if len(iv) else z3.K(z3.IntSort(), body)
 def store(a, I, v): return z3.Store(a, *I, v) if len(I) else z3.Store(a, z3.IntVal(0), v)
 def forall(iv, body): return z3.ForAll(list(iv), body) if len(iv) else body
