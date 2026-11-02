@@ -72,4 +72,7 @@ if __name__ == '__main__':
     print('── X7 L7 效应组合 vs MLIR canonicalize:', dict(st))
     for k, v in ex.items():
         print('    ', k, len(v)); [print('        ', x) for x in v[:6]]
-    print('── X7 变异（丢掉参数上的 Free）抓出:', mutation())
+    mu = mutation(); print('── X7 变异（丢掉参数上的 Free）抓出:', mu)
+    import verdict as V
+    V.check('X7 L7 效应组合', st['用例'] > 0 and st.get('不可靠：模型纯、MLIR 保留', 0) == 0 and mu > 0, f"用例 {st['用例']}，不可靠 {st.get('不可靠：模型纯、MLIR 保留', 0)}，变异抓出 {mu}")
+    V.finish()
