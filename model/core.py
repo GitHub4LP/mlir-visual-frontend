@@ -30,6 +30,16 @@ def set_iw(w):
     IW, LO, HI = w, -(1 << (w - 1)), 1 << (w - 1)
 NSW = True                            # nsw 标志的毒值条件（第 21 轮前漏建模：nsw 被忽略，模型比 MLIR 更“有定义”，不可靠）
 KUNROLL = 64                          # 静态循环精确展开的上限
+KTUNROLL = 8                          # 第 47 轮：携带 tensor 的循环，展开后 tensor 产生 op 总数上限。每次展开把上一趟的 tensor 项嵌进新的 Lambda，
+                                      #   z3 抽象绑定变量时按嵌套深度重复遍历共享子项 ⇒ 指数增长（语料 for-loop-canonicalization：10 趟×2 个 insert_slice
+                                      #   推导 > 20 分钟，6 趟 2.8 s，约 ×3.5/趟）。超限改走摘要路径（与 trip > KUNROLL 同一条可靠路径），不静默挂起。
+def _tensor_ops(blocks):
+    k = 0
+    for b in blocks:
+        for n in b['ops']:
+            k += n['op'].startswith('tensor.') and any(isinstance(t, str) and t.startswith('tensor<') for _, t in n['outs'])
+            for r in n['regions']: k += _tensor_ops(r)
+    return k
 def is_int(t): return isinstance(t, str) and re.fullmatch(r'i\d+', t) is not None
 def hi(t): return (1 << W(t)) - 1
 
@@ -710,7 +720,7 @@ class Ctx:
         L, Ub, St = (z3.simplify(x) for x in (mL, mU, Sst))
         if all(z3.is_int_value(x) for x in (L, Ub, St)) and St.as_long() > 0:
             l, u, k = L.as_long(), Ub.as_long(), St.as_long(); trip = max(0, -(-(u - l) // k))
-            if trip <= KUNROLL:
+            if trip <= KUNROLL and (trip * _tensor_ops(body) <= KTUNROLL or not any(is_t(v) for v, _ in inits if v is not None)):
                 cur = inits
                 for j in range(trip):
                     s.env[iv] = (z3.simplify(back(z3.IntVal(l + j * k))), F_)
