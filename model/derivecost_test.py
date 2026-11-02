@@ -6,6 +6,8 @@
   D1 直线链：N = 8、40 个 insert_slice，在限时内推导出事实；
   D2 循环展开：语料 tensor_dim_of_iter_arg_insertslice 的同构循环，展开 10 / 64 趟（关闭 KTUNROLL），在限时内推导出事实；
   D3 If 合流：scf.if 两支各自产生 tensor 后再 insert_slice，推导出事实。
+  D4 第 49 轮全局预算：三层 64 趟嵌套标量循环（精确展开约 64³ 体），旧实现逐层精确展开不终止；现在估算超出 DBUDGET ⇒ 改走摘要，限时内得事实。
+  D5 预算耗尽 ⇒ 未知：临时把 DBUDGET 降到 50，直线 100 个 addi ⇒ ValueUnknown，原因可读（含“资源预算”）；恢复后同一函数得事实。
 语义不变性由 tensorjit（T/T2/T3）与 valimport（A2/A3）的 JIT 对照负责。
 """
 import sys, z3
@@ -62,12 +64,35 @@ IFSRC = '''func.func @h(%t: tensor<?x?xi32>, %s: tensor<2x2xi32>, %c: i1) -> ten
   return %z : tensor<?x?xi32>
 }'''
 
-def timed(src, tag, kt=None, limit=90):
+def nest3(T=64):
+    return f'''func.func @n(%x: i32) -> i32 {{
+  %c0 = arith.constant 0 : index
+  %c1 = arith.constant 1 : index
+  %cT = arith.constant {T} : index
+  %r = scf.for %i = %c0 to %cT step %c1 iter_args(%a = %x) -> (i32) {{
+    %s = scf.for %j = %c0 to %cT step %c1 iter_args(%b = %a) -> (i32) {{
+      %t = scf.for %k = %c0 to %cT step %c1 iter_args(%c = %b) -> (i32) {{
+        %d = arith.addi %c, %x : i32
+        scf.yield %d : i32
+      }}
+      scf.yield %t : i32
+    }}
+    scf.yield %s : i32
+  }}
+  return %r : i32
+}}'''
+
+def straight(N):
+    body = [f'  %v{k} = arith.addi %v{k - 1}, %x : i32' if k else '  %v0 = arith.addi %x, %x : i32' for k in range(N)]
+    return 'func.func @s(%x: i32) -> i32 {\n' + '\n'.join(body) + f'\n  return %v{N - 1} : i32\n}}'
+
+def timed(src, tag, kt=None, limit=90, budget=None):
     """在 fork 子进程里推导，返回 (秒, 结果) 或 ('超时', None)。限时只是为了不挂起；判据是“链长 40 / 64 趟能在限时内完成”，
     旧实现（第 47 轮前）直线 14 个 insert_slice 已 > 25 s，10 趟循环 > 20 分钟，指数与多项式之间相差若干数量级，计时判据稳健。"""
     import multiprocessing as mp, time
     def child(q):
         if kt is not None: C.KTUNROLL = kt
+        if budget is not None: C.DBUDGET = budget
         t = time.time(); S, why = derive_src(src, tag); q.put((round(time.time() - t, 2), '事实' if S is not None else why[:60]))
     ctx = mp.get_context('fork'); q = ctx.Queue(); p = ctx.Process(target=child, args=(q,)); p.start()
     try: r = q.get(timeout=limit)
@@ -84,4 +109,9 @@ if __name__ == '__main__':
     V.check('D2 循环展开', all(r[1] == '事实' for r in o2.values()), str(o2))
     o3 = timed(IFSRC, 'dc_if'); print('── D3 If 合流:', o3)
     V.check('D3 If 合流', o3[1] == '事实', str(o3))
+    o4 = timed(nest3(), 'dc_nest3'); print('── D4 三层嵌套循环:', o4)
+    V.check('D4 全局预算回退摘要', o4[1] == '事实', str(o4))
+    o5a = timed(straight(100), 'dc_s100a', budget=50); o5b = timed(straight(100), 'dc_s100b')
+    print('── D5 预算耗尽:', o5a, '恢复:', o5b)
+    V.check('D5 预算耗尽判未知', isinstance(o5a[1], str) and '资源预算' in o5a[1] and o5b[1] == '事实', f'{o5a} / {o5b}')
     V.finish()
