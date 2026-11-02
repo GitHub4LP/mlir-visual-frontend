@@ -178,7 +178,7 @@ def run_prog(S, txt, name, ins, outs, rng, st, note, tag, S2=None, ninp=10):
     if not run: return
     jr = jit(wrap(txt, name, ins, outs), ins, outs, [xs for xs, _ in run])
     if jr[0] != 'ok': st['JIT 不可用/' + jr[0]] += 1; note('JIT 不可用', f'{tag} {jr[1]}'); return
-    st['函数（已执行）'] += 1
+    st['函数（已执行）'] += 1; st['函数（已执行）/含 math'] += 'math.' in txt
     jb = None
     if F16PAT.search(txt) and any(not all(agree(t, a, b) for t, a, b in zip(outs, mv, jv)) for (_, mv), jv in zip(run, jr[1])):
         rb = jit(wrap(barrier(txt), name, ins, outs), ins, outs, [xs for xs, _ in run]); jb = rb[1] if rb[0] == 'ok' else None
@@ -274,7 +274,7 @@ if __name__ == '__main__':
         print('── F1 浮点定向:'); [print(f'   {k}: {v}') for k, v in sorted(st.items())]
         att = sum(v for k, v in st.items() if k.startswith('不一致·已归因'))
         V.check('F1 浮点定向', st['比较'] > 0 and st['不一致'] == 0 and st.get('变异 pred 发现', 1) > 0, f"比较 {st['比较']}，一致 {st['一致']}，不一致 {st['不一致']}，A/B 归因 {att}")
-        V.check('MUN =', MATH and st['不一致'] == 0 and st['一致'] > 0, 'math 精确子集混入 F1 生成器（MATH=True），不单独计数')
+        V.check('MUN =', MATH and st['不一致'] == 0 and st['函数（已执行）/含 math'] > 0, f"含 math 的已执行函数 {st['函数（已执行）/含 math']}/{st['函数（已执行）']}，F1 不一致 0（math 例不单独比较，与 F1 共用逐输出比较）")
         V.check('barrier(', st['不一致'] == 0 and att >= 1, f'A/B 隔断归因 {att} 例：插入不可内联恒等调用后与模型一致')
         for k, v in ex.items(): print('──', k); [print('    ', x) for x in v]
     if lim:
