@@ -38,7 +38,7 @@
 | M3.1 | iN 语义 | core | sem_test:V1 无标志程序; sem_test:V3 定向 | L15 | B | 检验 | |
 | M3.2 | index IW 回绕；IW≠64 先降 iIW | core.set_iw | values_test:V5 JIT; values_test:V8 IW=32 | L17″, L49, L50 | A | 检验 | |
 | M3.3 | 未读参数/未翻译属性 ⇒ 未知 | core、valimport | values_test:S0 语义属性账; valimport_test:A0 属性账 | L51, L53 | A | 检验 | |
-| M3.4 | tensor：越界毒值、守卫；逐元素 | core | shape_test:S6 与 MLIR 执行; tensorjit_test:T2 逐元素定向; tensorjit_test:T3 全形式切片; valimport_test:A3 切片定向; guards_test:G1 生成器; guards_test:G0′ 定向 | L22, L24 | D | 部分 | 越界=毒值是 D，第 40 轮守卫落地（越界输入 JIT 344/344）；切片守卫未实现；S3 两条组合律未修 |
+| M3.4 | tensor：越界毒值、守卫；逐元素 | core | shape_test:S6 与 MLIR 执行; tensorjit_test:T2 逐元素定向; tensorjit_test:T3 全形式切片; valimport_test:A3 切片定向; guards_test:G1 生成器; guards_test:G0′ 定向; guards_test:G4 S3 改写规则外部化; guards_test:G5 全形式切片 | L22, L24 | D | 检验 | 越界=毒值是 D；守卫落地（第 40 轮越界 344/344；第 43 轮切片守卫，越界执行 52/52 安全、未插守卫 22 崩溃）；S3 规则外部化：有效 6 条 0 不一致，错误 2 条找到反例；降秩 insert_slice 守卫未实现（判未知） |
 | M3.5 | 浮点语义 | core 浮点节 | floatjit_test:F1 浮点定向; floatjit_test:F3 truncf roundingmode | — | B | 检验 | F1 3521/3521+1 归因 |
 | M3.6 | math 精确子集 | core math 节 | floatjit_test:MUN = | — | B | 检验 | 混入 F1；isinf/isnormal 无降低 |
 | M3.7 | 精化判据；MLIR 变换作真值须有 JIT | core.refines | sem_test:V2 MLIR canonicalize; values_test:V7 scf + sccp; values_test:V9 index 方言 cmp | L52 | A | 检验 | |

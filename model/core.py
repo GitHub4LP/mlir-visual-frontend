@@ -458,6 +458,10 @@ def _extract_slice_g(p, a):
     if S_ is None or rank(z3.FreshConst(S_)) != len(keep): raise ValueUnknown('extract_slice：结果秩与 drop 不符')
     res = mkt(S_, [szs[k] for k in keep], lam(iv, sel(dat(t), src)), lam(iv, sel(tpz(t), src)))
     ok = z3.And(_slice_ok(offs, szs, sts, ext(t)), *[szs[k] == 1 for k in drop])
+    if GUARD_LOWER:                                  # 第 43 轮：替身 = tensor.empty(尺寸夹到 ≥ 0)，元素毒值
+        bad = z3.Or(pt, _anyp(ops_))
+        fb = mkt(S_, [z3.If(szs[k] >= 0, szs[k], 0) for k in keep], lam(iv, sel(dat(t), src)), lam(iv, z3.BoolVal(True)))
+        return [(z3.If(ok, res, fb), bad)], bad
     return [(res, z3.Or(pt, _anyp(ops_), z3.Not(ok)))], F_
 def _insert_slice_g(p, a):
     (s_, ps), (t, pt) = a[0], a[1]; r = rank(t); offs, szs, sts, ops_ = _gsplit(a[2:], r)
@@ -468,6 +472,9 @@ def _insert_slice_g(p, a):
     J = tuple(D[k] / sts[k] for k in keep)
     res = mkt(t.sort(), ext(t), lam(iv, z3.If(win, sel(dat(s_), J), sel(dat(t), tuple(iv)))), lam(iv, z3.If(win, sel(tpz(s_), J), sel(tpz(t), tuple(iv)))))
     ok = z3.And(_slice_ok(offs, szs, sts, ext(t)), *[szs[k] == 1 for k in drop], *[e == szs[k] for e, k in zip(ext(s_), keep)])
+    if GUARD_LOWER:                                  # 第 43 轮：替身 = 原 tensor
+        bad = z3.Or(ps, pt, _anyp(ops_))
+        return [(z3.If(ok, res, t), bad)], bad
     return [(res, z3.Or(ps, pt, _anyp(ops_), z3.Not(ok)))], F_
 def _tcast(p, a):
     (t, pt), ty = a[0], outty(p)
@@ -634,7 +641,7 @@ class Ctx:
                         raise ValueUnknown(f'{op}：结果类型值层未建模')
                 outs, ub = sch.fn(pr, args)
                 md = _mlir_def(op, args, pr['__out'], pr) if op.startswith('tensor.') else None
-                if md is not None and GUARD_LOWER and op in ('tensor.extract', 'tensor.insert', 'tensor.dim', 'tensor.cast'): md = None   # 已插守卫：无义务
+                if md is not None and GUARD_LOWER and op in ('tensor.extract', 'tensor.insert', 'tensor.dim', 'tensor.cast', 'tensor.extract_slice.g', 'tensor.insert_slice.g'): md = None   # 已插守卫：无义务
                 if md is not None:
                     s.guards.append((n['id'], z3.Implies(z3.And(g, z3.Not(_anyp(args))), md)))
                     relp = z3.Or(F_, *[p for v, p in args if v is not None and _occurs(v, md)])
