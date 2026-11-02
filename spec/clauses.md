@@ -5,6 +5,7 @@
 2. “检验”列的每个 `文件:标记` 都存在（文件在 model/，标记是该文件里的字面子串）；
 3. “律”列的每条定律都在 laws.md 中，且条款声称 A/B 时，所引定律没有 C/✗（D 级是定义而非经验命题，允许，但计数报告）；
 4. laws.md 中每条 A/B/C 级定律至少被一条条款引用（反向完备），否则列入文末“未引用”并说明理由；
+6. K7（第 44 轮）：统计“检验”列引用中有机器判定（`verdict.check('标记', …)`，失败 ⇒ 退出码 1）的比例；此前多数测试只打印统计、退出码恒为 0，“通过”靠人读输出。
 5. 状态只能是：检验（有外部真值的回归）、部分（有回归但覆盖不全，缺口写明）、元理论（定义/证明义务，不靠测试）、缺口（无回归）。
 
 “外部数据”列的数字是最近一次运行的结果，会过时；以测试输出为准。
@@ -17,7 +18,7 @@
 | M0.4 | 强于 MLIR 只在无对应物处，标 D | — | — | L23, L24, L26 | D | 元理论 | 设计选择；L24 的守卫义务另有 B（shape S6） |
 | M0.5 | 外部真值缺陷：按规范建模，A/B 隔断才可归因 | floatjit.barrier、values_test V8/V9 | floatjit_test:barrier(; values_test:V9 index 方言 cmp; values_test:V8 IW=32 | L50, L52 | A | 检验 | 归因 4 类；每类有隔断对照 |
 | M1.1 | Op=⟨Schema,Impl⟩；嵌套 ≡ 内联 | core | core_test:T1 随机复合 op; compsig_test:C2 嵌套 ≡ 展开 | L25 | A | 检验 | |
-| M1.2 | 结构字段：原生取 ODS，复合推导 captures/free_syms/needs_ssacfg | structure、symtab、core | oracle_test:O5 区域/后继/多块; symtab_test:Y0 导入账 | L3, L4, L5 | B | 部分 | L3/L5 的差分（structure_fuzz、X2/X5）不在 model/ 回归中 |
+| M1.2 | 结构字段：原生取 ODS，复合推导 captures/free_syms/needs_ssacfg | structure、symtab、core | oracle_test:O5 区域/后继/多块; symtab_test:Y0 导入账; capture_test:P 端口 vs MLIR; structure_fuzz:structure_fuzz 不可靠 | L3, L4, L5 | B | 部分 | L3：真实 IR 提取端口 4435 段 MLIR 接受 4421、端口错误 0（旧算法 8，消融）；structure_fuzz 1000 例不可靠 0。缺口：L5 只有定向 X5；提取的上下文约束（父 op、区域体纯度）14/14 结构层未预先指出 |
 | M1.3 | 类型签名：自动签名；复合由有拒绝权的层判定 | odssig、composite | odssig_test:L1 差分; odsdiff_test:T1 odssig vs; compsig_test:C1 Φ ≡ 体 ≡ MLIR; compsig_test:C3 端口投影 | L25, L27, L28, L29, L46, L47 | A | 检验 | |
 | M1.4 | 属性：ODS 值域；复合参数约束 = 使用点合取 | attrsig、defs | attrsig_test:A2 变异差分; defs_test:D1 attribute; defs_test:D3 | L8, L9, L10, L34a/b, L35 | B | 部分 | L10 只有 D3 16/16，样本小 |
 | M1.5 | declared 义务只由预言机裁决 | oracle、modular | modular_test:M2 体级预言机; modular_test:M3 单元级预言机 | L40, L43, L44 | A | 检验 | 残差 580 例全部归因 |
