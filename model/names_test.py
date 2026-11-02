@@ -158,6 +158,14 @@ if __name__ == '__main__':
     ok = ok and not r5['IW=32 复用 IW=64 摘要：值层'] and r5['重推导后 f(0) <s 0 可证'] and r5['equivalent(跨开关)'] is None \
         and r5['JIT@32 f(0)'] < 0 and not r6['改 IW 后命中旧 Schema'] and not r6['IW=32 下 2^31 >s 0 被证明'] and all(r7.values())
     print('── 结论:', '全部符合' if ok else '有不符')
-    import verdict as V
-    for mk in ('N1 编辑洞', 'N1c 洞在循环摘要内', 'N5 跨语义开关', 'N7 ADT 重定义'): V.check(mk, ok, '整体结论（各项共用一个判据）')
+    import verdict as V            # 第 46 轮：拆成逐标记判据
+    V.check('N1 编辑洞', not any(v for k, v in r1.items() if '被证明' in k) and all(v for k, v in r1.items() if '可证' in k) and r1['JIT（填 h:=x 后）main(1,2)'] == [0, 1],
+            '洞两侧不被证明相等（transparent/opaque），自反可证，JIT 见证 [0,1]')
+    V.check('N1c 洞在循环摘要内', r1c['洞被循环摘要吞掉'] and not r1c['真填：fill(1) ≡ fill(0) 被证明'] and r1c['subst_fill 默认拒绝'], 'L20 代换看不进摘要 ⇒ 默认拒绝')
+    V.check('N2 端口重名', not r2['值层'] and not r2['已登记'] and bool(r2['诊断']), str(r2['诊断']))
+    V.check('N3 与原生同名', r3['原生保持'] and bool(r3['诊断']), str(r3['诊断']))
+    V.check('N4 占位项名单射', not r4['占位项同名'], '')
+    V.check('N5 跨语义开关', not r5['IW=32 复用 IW=64 摘要：值层'] and r5['重推导后 f(0) <s 0 可证'] and r5['equivalent(跨开关)'] is None and r5['JIT@32 f(0)'] < 0
+            and not r6['改 IW 后命中旧 Schema'] and not r6['IW=32 下 2^31 >s 0 被证明'], f"JIT@32 f(0)={r5['JIT@32 f(0)']}；含 N6 Workspace 键")
+    V.check('N7 ADT 重定义', all(r7.values()), str(r7))
     V.finish()
