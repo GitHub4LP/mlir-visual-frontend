@@ -163,9 +163,13 @@ def main(cap=12):
     print('   带区域 op 实例', dict(agg))
     print('   R8 未覆盖的 op（实例数前 15）', sorted(((v, op) for (c, op), v in byop.items() if c.startswith('R8 未')), reverse=True)[:15])
     print('── Z2 变异差分', dict(st)); print('   预言机', orc.stats)
+    import verdict as V
+    V.check('Z1 触发数', z1['误拒'] == 0 and all(z1[k] > 0 for k in ('R1', 'R2', 'R3', 'R4', 'R5', 'R6', 'R8', 'S1', 'S2', 'S4', 'S5')), f"模块 {z1['模块']}，误拒 {z1['误拒']}，各义务均被触发")
+    V.check('Z2 变异差分', st['误拒'] == 0 and st['我们异常'] == 0 and st['两者都拒'] > 0, f"变异 {st['变异']}，误拒 {st['误拒']}，漏判 {st['漏判']}")
     for kk, v in sorted(byk.items(), key=lambda x: (x[0][0], -x[1])): print('     ', kk, v)
     for kk, v in ex.items(): print('──', kk); [print('    ', x) for x in v]
     orc.close()
 
 if __name__ == '__main__':
     main(int(sys.argv[1]) if len(sys.argv) > 1 else 12)
+    import verdict as V; V.finish()
