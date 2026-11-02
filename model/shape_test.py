@@ -247,6 +247,9 @@ if __name__ == '__main__':
     n = int(sys.argv[1]) if len(sys.argv) > 1 else 100
     for nm, f in [('S1 Pre 与 MayPoison', S1), ('S2 L22 静态维', S2), ('S3 改写规则（L23）', S3), ('S4 可推测性', S4), ('S5 降低守卫（L24）', S5)]:
         print('──', nm); [print('     ', k, '→', v) for k, v in f().items()]
-    print('── S6 与 MLIR 执行的差分:', S6(n, random.Random(2)))
+    s6 = S6(n, random.Random(2)); print('── S6 与 MLIR 执行的差分:', s6)
+    import verdict as V
+    V.check('S6 与 MLIR 执行', s6['不一致'] == 0 and s6['一致'] > 0, f"一致 {s6['一致']}，不一致 {s6['不一致']}")
     print('── S7 变异灵敏度:', S7(150))
     print('── 求解器 unknown:', C.STATS['unknown'])
+    V.finish()
