@@ -225,6 +225,10 @@ T2 的覆盖面：13 种二元 op（含可能 UB 的除法/取余/移位）、ns
 
 几乎全部是“操作数或结果的元素类型未建模”（f32 等）。切片的结构缺口已经关闭；G1.4 剩下的主要缺口是浮点值层（G1.5），属于另一类工作。
 
+### 9.x 第 47 轮：展开资源上限（KTUNROLL）
+
+静态趟数 ≤ KUNROLL 的循环原本一律精确展开。携带 tensor 的循环每展开一趟，上一趟的 tensor 项就被嵌进新的 z3 Lambda（insert_slice/extract_slice 的数据与毒值都是 Lambda）；z3 抽象绑定变量时按嵌套深度重复遍历共享子项，开销约 ×3.5/趟（语料 tensor_dim_of_iter_arg_insertslice：6 趟 2.8 s，10 趟超过 20 分钟）。这是推导不终止，不是语义问题。规则：展开后 tensor 产生 op 总数（趟数 × 体内 tensor 产生 op 数）> KTUNROLL = 8 时，改走摘要路径。摘要路径与 trip > KUNROLL 相同，可靠性不变，只是可能更不精确或判未知。T 语料修复前后一致数相同（1030），只是那个文件不再超时。
+
 ## 10 第 35 轮：浮点值层（G1.5；model/core.py 浮点节、valimport、floatjit_test.py）
 
 ### 10.1 语义（逐条对 LLVM LangRef，经 arith-to-llvm 降低）
