@@ -10,7 +10,7 @@ scf.for：静态小循环精确展开；其余用“按结构命名的未解释�
 可用声明的不变式收窄，不变式在定义期做归纳检查，通过后作为公理进入摘要（L19）。见 spec/loops.md。
 运行：PYTHONPATH=model python3 model/core.py
 """
-import re, itertools, z3
+import os, re, itertools, z3
 from dataclasses import dataclass, field
 import structure as ST
 from structure import blk, node
@@ -45,6 +45,14 @@ def is_int(t): return isinstance(t, str) and re.fullmatch(r'i\d+', t) is not Non
 def hi(t): return (1 << W(t)) - 1
 
 class ValueUnknown(Exception): pass
+# 第 49 轮：推导的全局确定性资源预算（L53：无法在资源内推导 ⇒ 未知并警告，不静默挂起，也不用计时）。
+#   计量 = 一次 derive 内（含透明特化的子推导）walk 处理的 op 节点数。精确展开前先估算 趟数 × 体的展开代价（Ctx.cost：内层静态循环按其
+#   趟数相乘——界在当前环境里是常量就取实际趟数，否则按 KUNROLL 上界——超过 KUNROLL 的按摘要只算一遍），超出剩余预算 ⇒ 改走摘要
+#   （可靠路径，精度可能下降）；摘要路径本身也超预算 ⇒ ValueUnknown。STEPS 记录每次 derive 的用量（回归与预算标定用）。
+DBUDGET = 20000                         # 标定：现有全部测试与语料单次 derive 用量最大 925（第 49 轮 STEPS_LOG）；200000 约 45 s
+STEPS = []
+def _nops(blocks):
+    return sum(1 + sum(_nops(r) for r in n['regions']) for b in blocks for n in b['ops'])
 
 def W(t): return int(t[1:]) if is_int(t) else None
 SORTS = {}                            # 用户类型 → z3 sort（由 defs.py 的类型定义登记）
@@ -619,6 +627,7 @@ class Ctx:
         s.env, s.ub, s.eff, s.exact, s.params, s.ax, s.diag = {}, F_, [], True, params or {}, [], []
         s.owner, s.hole_sum = '', set()   # 第 27 轮：洞的项按（所属定义, hid）命名；被循环摘要吞掉的洞（L20 代换对它无效）
         s.wf, s.guards = [], []       # L22 静态维的证明义务、L24 降低到 MLIR 的守卫义务：[(节点, 公式)]
+        s.steps = [0]                 # 第 49 轮：资源计量（与特化子推导共享）
         s.gspec, s.gpoison = [], []   # 第 39/40 轮：推测执行版守卫（输入可能是毒值：毒值操作数本身即违反 MLIR 良定义）
     def static_check(s, nid, v, pv, ty, g):
         """L22：边上的静态维不符 ⇒ 毒值；同时立义务“非毒值时成立”。返回新的毒值标志。"""
@@ -633,6 +642,8 @@ class Ctx:
         if len(blocks) != 1: raise ValueUnknown('多块 CFG 的值层尚未建模')
         for n in blocks[0]['ops']:
             op = n['op']
+            s.steps[0] += 1
+            if s.steps[0] > DBUDGET: raise ValueUnknown(f'推导超出资源预算 DBUDGET={DBUDGET}（L53）')
             if '_attrs' in (n.get('props') or {}):              # 第 25 轮：导入的节点须先经 valimport 翻译；原样属性 ⇒ 无事实（此前 tensor 切片在此崩溃）
                 raise ValueUnknown(f'{op}：导入节点未经 valimport 翻译')
             if op in ('scf.yield', 'func.return'): return [s.env[v] for v in n['ins']]
@@ -697,7 +708,7 @@ class Ctx:
         """在调用点按实参重新推导体（独立的 Ctx：体内命名不会与宿主冲突）。UB 只在本路径上算数，由调用方以 g 守卫。"""
         sub = Ctx({nm: (z3.IntVal(pr[nm]) if isinstance(pr.get(nm), int) and not isinstance(pr.get(nm), bool) else zb(pr[nm])) if nm in pr else sch.pconsts[nm]
                    for nm, _ in sch.params})
-        sub.owner = sch.name
+        sub.owner = sch.name; sub.steps = s.steps
         for (v, _), a in zip(sch.body[0]['args'], args): sub.env[v] = a
         ys = sub.walk(sch.body, T_, path)
         # 第 39 轮：被调体的义务（L22 静态维、L24 守卫）此前在特化时丢失 ⇒ 宿主的 guards()/caps 漏掉复合 op 内部的 tensor 越界
@@ -719,6 +730,25 @@ class Ctx:
         val = z3.Function(nm, *[x.sort() for x in ctx], so)(*ctx) if ctx else z3.Const(nm, so)
         poi = z3.Function(nm + '.Z', *[x.sort() for x in ctx], z3.BoolSort())(*ctx) if ctx else z3.Bool(nm + '.Z')
         s.env[n['outs'][0][0]] = (val, poi)
+    def cost(s, blocks):
+        """第 49 轮：展开代价的保守估计（op 节点数）。只用于“精确展开还是摘要”的选择，估计偏大只损失精度，不损失可靠性。"""
+        k = 0
+        for b in blocks:
+            for n in b['ops']:
+                k += 1
+                if n['op'] == 'scf.for' and n['regions']:
+                    t = KUNROLL
+                    try:
+                        L, U, St = (z3.simplify(s.env[v][0]) for v in n['ins'][:3])
+                        if all(z3.is_int_value(x) for x in (L, U, St)) and St.as_long() > 0:
+                            t = max(0, -(-(U.as_long() - L.as_long()) // St.as_long()))
+                        elif all(z3.is_bv_value(x) for x in (L, U, St)) and St.as_signed_long() > 0:
+                            t = max(0, -(-(U.as_signed_long() - L.as_signed_long()) // St.as_signed_long()))
+                    except (KeyError, TypeError, AttributeError, z3.Z3Exception): pass
+                    k += (t if t <= KUNROLL else 1) * s.cost(n['regions'][0])
+                else:
+                    k += sum(s.cost(r) for r in n['regions'])
+        return k
     def loop(s, n, g, path):
         """scf.for。步长 ≤ 0 或边界是毒值 ⇒ UB。静态且趟数 ≤ KUNROLL ⇒ 精确展开；否则摘要（L18、L19）。"""
         (lb, plb), (ub, pub), (st, pst) = [s.env[v] for v in n['ins'][:3]]
@@ -746,7 +776,7 @@ class Ctx:
         L, Ub, St = (z3.simplify(x) for x in (mL, mU, Sst))
         if all(z3.is_int_value(x) for x in (L, Ub, St)) and St.as_long() > 0:
             l, u, k = L.as_long(), Ub.as_long(), St.as_long(); trip = max(0, -(-(u - l) // k))
-            if trip <= KUNROLL and (trip * _tensor_ops(body) <= KTUNROLL or not any(is_t(v) for v, _ in inits if v is not None)):
+            if trip <= KUNROLL and s.steps[0] + trip * s.cost(body) <= DBUDGET and (trip * _tensor_ops(body) <= KTUNROLL or not any(is_t(v) for v, _ in inits if v is not None)):
                 cur = inits
                 for j in range(trip):
                     s.env[iv] = (z3.simplify(back(z3.IntVal(l + j * k))), F_)
@@ -994,7 +1024,11 @@ def derive(name, ins, outs, blocks, mode='transparent', params=()):
         c.ax.append(wf(h, ty))
         if h[0] is not None: c.env[v] = (h[0], c.static_check(f'入口.{p}', h[0], h[1], ty, T_))
     try:
-        ys = c.walk(blocks, T_, ())
+        try: ys = c.walk(blocks, T_, ())
+        finally:
+            STEPS.append((name, c.steps[0]))
+            if os.environ.get('STEPS_LOG'):
+                with open(os.environ['STEPS_LOG'], 'a') as f_: f_.write(f'{c.steps[0]}\t{name}\n')
         ys = [(v, c.static_check(f'出口.{p}', v, pv, ty, T_)) if v is not None else (v, pv) for (p, ty), (v, pv) in zip(outs, ys)]
     except ValueUnknown as e:
         sch.value_known, sch.exact = False, False; sch.value_why = str(e)[:60]      # 第 34b 轮：原因随结果带出（警告须可读，不只是“未知”）
