@@ -111,7 +111,8 @@ def nat(name, ins, outs, fn, eff=frozenset(), reads=None):
     s.reads = None if reads is None else frozenset(reads)
     return s
 GENERIC_PROPS = {'__out', 'type', '_types', '_succ_opaque'}
-ATTR_MAP = {'overflowFlags': ('nsw', 'nuw'), 'isExact': ('exact',), 'predicate': ('predicate',), 'value': ('value',)}   # MLIR 属性 → core 参数
+ATTR_MAP = {'overflowFlags': ('nsw', 'nuw'), 'isExact': ('exact',), 'predicate': ('predicate',), 'value': ('value', 'dense'),
+            'fastmath': ('nnan', 'ninf')}   # 第 45 轮：fastmath 译名补登（valimport._fastmath 第 35 轮已实现；其余标志 ⇒ 未知）   # MLIR 属性 → core 参数
 I3 = 'i3'
 def _ixub(r, px, py): return z3.And(z3.Not(px), z3.Not(py), ovf(r)) if IXOVF == 'ub' else F_
 def _ixp(r): return ovf(r) if IXOVF == 'poison' else F_                      # 对照：index 溢出 ⇒ 毒值（L17′）
