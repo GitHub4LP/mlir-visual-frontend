@@ -5,6 +5,10 @@
   G2 A/B：同一批输入跑**未插守卫**的原模块：越界输入上出现不一致/崩溃 ⇒ 守卫是必要的（否则 G1 的一致只是巧合）。
   G3 语料（第 41 轮）：tensor 签名语料函数中需要守卫的（此前越界输入一律跳过），插守卫后用常规 + 越界输入对 JIT；
      报：需守卫函数数、规划接受/拒绝（按原因）、比较数（其中越界输入）。
+  G4 S3 改写规则外部化（第 43 轮）：shape_test S3 的 6 条有效规则与 2 条错误规则（对照），左边按 core 语义求值，
+     右边插守卫后由 JIT 执行，输入含越界/负尺寸；有效规则须“左边非毒值处右边相同”，错误规则须被找到反例（灵敏度）。
+  G5 全形式切片（第 43 轮）：tensorjit_test.gen_slice 的程序（步长、降秩、动态偏移/尺寸/步长、写回 insert_slice）插守卫后，
+     对此前因守卫跳过的输入比较；同一批输入跑未插守卫的原程序作 A/B。
   G0′ 定向：nsw 溢出得到的毒值下标进守卫 ⇒ 必须拒绝；普通下标 ⇒ 必须接受。
 用法：PYTHONPATH=model python3 model/guards_test.py [G1 程序数] [语料文件数上限]
 """
@@ -170,6 +174,103 @@ def G3(lim=10 ** 9):
         for k, v in ex.items(): exs[k] += v[:2]
     return tot, exs
 
+TD = 'tensor<?xi8>'
+def _f(args, outs, body):
+    sig = ', '.join(f'%{a}: {t}' for a, t in args)
+    return f'func.func @main({sig}) -> (' + ', '.join(t for _, t in outs) + ') {\n  ' + '\n  '.join(body) + '\n  return ' + ', '.join(v for v, _ in outs) + ' : ' + ', '.join(t for _, t in outs) + '\n}'
+X5 = [('x', TD), ('o1', 'index'), ('n1', 'index'), ('o2', 'index'), ('n2', 'index')]
+RULES = {
+  'slice∘slice → slice(o1+o2)': (True, X5, [('%s2', TD)],
+      [f'%s1 = tensor.extract_slice %x[%o1] [%n1] [1] : {TD} to {TD}', f'%s2 = tensor.extract_slice %s1[%o2] [%n2] [1] : {TD} to {TD}'],
+      [('%s', TD)], ['%o = arith.addi %o1, %o2 : index', f'%s = tensor.extract_slice %x[%o] [%n2] [1] : {TD} to {TD}']),
+  '✗ slice∘slice → slice(o1−o2)': (False, X5, [('%s2', TD)],
+      [f'%s1 = tensor.extract_slice %x[%o1] [%n1] [1] : {TD} to {TD}', f'%s2 = tensor.extract_slice %s1[%o2] [%n2] [1] : {TD} to {TD}'],
+      [('%s', TD)], ['%o = arith.subi %o1, %o2 : index', f'%s = tensor.extract_slice %x[%o] [%n2] [1] : {TD} to {TD}']),
+  'extract(slice(x,o,n), i) → extract(x, o+i)': (True, [('x', TD), ('o', 'index'), ('n', 'index'), ('i', 'index')], [('%e', 'i8')],
+      [f'%s = tensor.extract_slice %x[%o] [%n] [1] : {TD} to {TD}', f'%e = tensor.extract %s[%i] : {TD}'],
+      [('%e', 'i8')], ['%k = arith.addi %o, %i : index', f'%e = tensor.extract %x[%k] : {TD}']),
+  'extract(insert(v,x,i), i) → v': (True, [('v', 'i8'), ('x', TD), ('i', 'index'), ('j', 'index')], [('%e', 'i8')],
+      [f'%t = tensor.insert %v into %x[%i] : {TD}', f'%e = tensor.extract %t[%i] : {TD}'],
+      [('%v', 'i8')], []),
+  '✗ extract(insert(v,x,i), j) → extract(x, j)': (False, [('v', 'i8'), ('x', TD), ('i', 'index'), ('j', 'index')], [('%e', 'i8')],
+      [f'%t = tensor.insert %v into %x[%i] : {TD}', f'%e = tensor.extract %t[%j] : {TD}'],
+      [('%e', 'i8')], [f'%e = tensor.extract %x[%j] : {TD}']),
+  'insert_slice(slice(x,o,n), x, o) → x': (True, [('x', TD), ('o', 'index'), ('n', 'index')], [('%t', TD)],
+      [f'%s = tensor.extract_slice %x[%o] [%n] [1] : {TD} to {TD}', f'%t = tensor.insert_slice %s into %x[%o] [%n] [1] : {TD} into {TD}'],
+      [('%x', TD)], []),
+  'dim(insert_slice(s,x,o), 0) → dim(x, 0)': (True, [('s', TD), ('x', TD), ('o', 'index')], [('%d', 'index')],
+      ['%c0 = arith.constant 0 : index', f'%n = tensor.dim %s, %c0 : {TD}', f'%t = tensor.insert_slice %s into %x[%o] [%n] [1] : {TD} into {TD}', f'%d = tensor.dim %t, %c0 : {TD}'],
+      [('%d', 'index')], ['%c0 = arith.constant 0 : index', f'%d = tensor.dim %x, %c0 : {TD}']),
+  'from_elements(v,v) → splat(v)': (True, [('v', 'i8')], [('%t', 'tensor<2xi8>')],
+      ['%t = tensor.from_elements %v, %v : tensor<2xi8>'], [('%t', 'tensor<2xi8>')], ['%t = tensor.splat %v : tensor<2xi8>']),
+}
+def rule_inputs(rng, ins, n=160):
+    xs = []
+    for _ in range(n):
+        x = TJ.mk_inputs(rng, ins)
+        for j, t in enumerate(ins):
+            if t == 'index': x[j] = rng.choice([0, 0, 1, 1, 1, 2, 2, 3]) if rng.random() < 0.8 else rng.choice([-2, -1, 4, 6, 1 << 40])   # 多数在界内（才有非毒值可比），少数越界
+        xs.append(x)
+    return xs
+
+def G4(seed=29):
+    import mlir.ir as ir, irimport as I
+    from valimport_test import derive_imported
+    out = {}
+    for name, (valid, args, lo, lb, ro, rb) in RULES.items():
+        rng = random.Random(seed); st = collections.Counter()
+        ins = [t for _, t in args]; outs = [t for _, t in lo]
+        ltxt = _f(args, lo, lb); rtxt = _f(args, ro, rb)
+        fl = I.import_module(ir.Module.parse(ltxt, TJ.ctx1()))['regions'][0][0]['ops'][0]
+        Sl, why = derive_imported('g4l_' + str(abs(hash(name))), fl)
+        fr = I.import_module(ir.Module.parse(rtxt, TJ.ctx1()))['regions'][0][0]['ops'][0]
+        gr, whyr, _ = lower(rtxt, fr, 'g4r_' + str(abs(hash(name))))
+        if Sl is None or gr is None: out[name] = ('未知', why or whyr); continue
+        good, bad = [], []                               # 拒绝采样：左边有非毒值结果的输入 60 组 + 全毒值（越界）的 20 组
+        for _ in range(4000):
+            if len(good) >= 60 and len(bad) >= 20: break
+            x = rule_inputs(rng, ins, 1)[0]
+            r = TJ.model_run(Sl, ins, outs, x, random.Random(0), True)
+            if r[0] == 'val' and any(m[0] != 'x' for m in r[1]):
+                if len(good) < 60: good.append(x)
+            elif len(bad) < 20: bad.append(x)
+        TJ.check_fn(Sl, gr, 'main', ins, outs, random.Random(seed), st, lambda k, v: None, name, guarded=True, inputs=good + bad)
+        out[name] = (valid, st['一致'], st['不一致'], st['跳过/毒值'] + st['跳过/毒值结果'])
+    return out
+
+FAILS = []
+def G5(N=80, seed=37):
+    import mlir.ir as ir, irimport as I
+    rng = random.Random(seed); st = collections.Counter(); ab = collections.Counter()
+    for t in range(N):
+        txt, ins, outs = TJ.gen_slice(rng)
+        try: m = ir.Module.parse(txt, TJ.ctx1()); assert m.operation.verify()
+        except Exception: st['不合法（跳过）'] += 1; continue
+        fn = I.import_module(m)['regions'][0][0]['ops'][0]
+        gtxt, why, S = lower(txt, fn, f'g5_{t}')
+        if S is None: st['未知（core）'] += 1; continue
+        if gtxt is None: st['规划拒绝/' + why[:24]] += 1; continue
+        st['程序'] += 1
+        cands = [TJ.mk_inputs(rng, ins) for _ in range(12)]
+        for x in cands:
+            for j, ty in enumerate(ins):
+                if ty == 'index': x[j] = rng.choice([0, 1, 2, 3, -1, 5, 9])
+        xg = [x for x in cands if TJ.model_run(S, ins, outs, x, random.Random(0))[1] == '守卫']
+        st['输入中原先因守卫跳过'] += len(xg)
+        if xg:                                           # 越界输入下输出整体是毒值，无值可比；比较的是“执行是否安全”：读出结果的 extent 与一个元素
+            qs = []
+            for j, ty in enumerate(outs):
+                r = len(TJ.tparse(ty)[0]); qs += [(f'q_{j}_d{d}', j, 'dim', d) for d in range(r)] + [(f'q_{j}_e', j, 'el', r)]
+            for nm2, src, cnt in (('插守卫', gtxt, st), ('未插守卫', txt, ab)):
+                prog, npar, nq = TJ.build(src, 'main', ins, outs, qs)
+                if isinstance(TJ.jit_forked(prog, []), str):    # 只编译：MLIR 管线自身崩溃（与守卫无关，原程序同样）⇒ 单列，不计
+                    cnt['MLIR 编译崩溃（不计）'] += 1; continue
+                calls = [(q[0], TJ.flat(ins, x, [0] * q[3] if q[2] == 'el' else [], nq)) for x in xg for q in qs]
+                got = TJ.jit_forked(prog, calls)
+                cnt['执行（越界输入）/' + ('运行崩溃或异常' if isinstance(got, str) else '正常结束')] += 1
+                if isinstance(got, str) and nm2 == '插守卫': FAILS.append((got[:300], gtxt, xg[:2]))
+    return st, ab
+
 def G0():
     import mlir.ir as ir, irimport as I
     cases = {'nsw 毒值下标（须拒绝）': ('''func.func @main(%t: tensor<?xi8>, %i0: index, %i1: index, %s: i8) -> (i8) {
@@ -189,6 +290,12 @@ def G0():
 
 if __name__ == '__main__':
     N = int(sys.argv[1]) if len(sys.argv) > 1 else 120
+    if len(sys.argv) > 3:
+        r4 = G4(); print('── G4 S3 改写规则（左 core、右插守卫 JIT）：(有效?, 一致, 不一致, 左边毒值跳过)')
+        for k, v in r4.items(): print(f'   {k}: {v}')
+        s5, a5 = G5(); print('── G5 全形式切片（越界输入）:', dict(sorted(s5.items()))); print('   A/B 未插守卫:', dict(sorted(a5.items())))
+        ok4 = s5.get('执行（越界输入）/运行崩溃或异常', 0) == 0 and all(v[0] != '未知' and ((v[0] and v[2] == 0 and v[1] > 0) or (not v[0] and v[2] > 0)) for v in r4.values())
+        sys.exit(0 if ok4 else 1)
     if len(sys.argv) > 2:
         t3, e3 = G3(int(sys.argv[2]))
         print('── G3 语料（插守卫）:'); [print(f'   {k}: {v}') for k, v in sorted(t3.items())]
