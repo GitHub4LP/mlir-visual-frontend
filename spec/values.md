@@ -229,6 +229,22 @@ T2 的覆盖面：13 种二元 op（含可能 UB 的除法/取余/移位）、ns
 
 静态趟数 ≤ KUNROLL 的循环原本一律精确展开。携带 tensor 的循环每展开一趟，上一趟的 tensor 项就被嵌进新的 z3 Lambda（insert_slice/extract_slice 的数据与毒值都是 Lambda）；z3 抽象绑定变量时按嵌套深度重复遍历共享子项，开销约 ×3.5/趟（语料 tensor_dim_of_iter_arg_insertslice：6 趟 2.8 s，10 趟超过 20 分钟）。这是推导不终止，不是语义问题。规则：展开后 tensor 产生 op 总数（趟数 × 体内 tensor 产生 op 数）> KTUNROLL = 8 时，改走摘要路径。摘要路径与 trip > KUNROLL 相同，可靠性不变，只是可能更不精确或判未知。T 语料修复前后一致数相同（1030），只是那个文件不再超时。
 
+### 9.y 第 48 轮：根因修复（项层 β/投影化简），KTUNROLL 降为安全网
+
+第 47 轮的 KTUNROLL 只是治标：同样的指数增长在**直线代码**里也会出现（实测：链式 12 个 insert_slice 13 s，14 个超过 25 s），scf.if 嵌套同理，与循环无关。根因在项的构造方式：`dat(mk(…))` 被保留为“访问器(构造器)”，`sel(Lambda, I)` 被保留为 `Select(Lambda, I)`，于是每个 tensor op 都把前一个 tensor 的完整项嵌进一层新的 Lambda。
+
+修复（core `_proj`/`_sel`）是纯重写，语义不变：
+- 构造器上的投影直接取对应参数；
+- If 上的投影或取元素推进到两支（带记忆，DAG 规模线性）；
+- Lambda 上的取元素做 β 代换（`substitute_vars`）；
+- 常量数组取元素直接取其值。
+
+修复后，每个 tensor 的元素项只有一层 Lambda，推导代价随链长呈多项式增长：直线 40 个 insert_slice 3.6 s；关闭 KTUNROLL 时 64 趟循环 7.1 s。KTUNROLL 由 8 放宽到 512，只作安全网，原先第 47 轮因它走摘要的循环重新得到精确展开。
+
+回归（derivecost_test D1/D2/D3）以“限时内推导出事实”为判据，在 fork 子进程中运行，限时 90 s 只用于防止挂起。旧实现 D1 N=40、D2 10 趟均超时，判据能区分新旧实现。我曾试过“Lambda 嵌套深度”作为确定性度量，但它对旧实现也给 1，不灵敏，已弃用。
+
+语义不变性由外部 JIT 证据保证，数字与修复前完全相同：T 1030/0、T2 2886/0、T3 297/0、valimport A2 1274/0、A3 1322/0。
+
 ## 10 第 35 轮：浮点值层（G1.5；model/core.py 浮点节、valimport、floatjit_test.py）
 
 ### 10.1 语义（逐条对 LLVM LangRef，经 arith-to-llvm 降低）
