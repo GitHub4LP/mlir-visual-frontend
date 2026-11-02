@@ -187,15 +187,22 @@ if __name__ == '__main__':
     rng = random.Random(10)
     st, POOL, OPS = O1(n, rng)
     print('── O1/O2 判定与分工:', dict(st)); print('    缓存:', OR.get().stats)
+    import verdict as V
+    V.check('O1/O2 判定与分工', st['符号+预言机 一致'] >= st['图'] - st.get('不可发射', 0) - st.get('MLIR 崩溃', 0) and st.get('发射缺陷', 0) == 0 and st['预言机调用'] > 0,
+            f"一致 {st['符号+预言机 一致']}/{st['图']}（不可发射 {st.get('不可发射', 0)}，崩溃 {st.get('MLIR 崩溃', 0)}）")
     a, b = [], []
     for k in range(200):
         bs, _ = graph(rng, POOL, [x for x in OPS if x[1] != 'auto'], 3)
         t0 = time.perf_counter(); C.typecheck(bs, '() -> ()'); t1 = time.perf_counter(); C.typecheck(bs, '() -> ()'); t2 = time.perf_counter()
         a.append(t1 - t0); b.append(t2 - t1)
     a.sort(); b.sort(); print(f'    同一体再查一次（中位）：{a[100] * 1e6:.0f} µs → {b[100] * 1e6:.0f} µs（缓存命中）')
-    print('── O3 诊断归位:', dict(O3(max(n // 5, 20), rng, POOL, OPS)))
-    print('── O4 崩溃隔离:', O4())
+    o3 = dict(O3(max(n // 5, 20), rng, POOL, OPS)); print('── O3 诊断归位:', o3)
+    V.check('O3 诊断归位', o3['样本'] > 0 and o3['诊断落在节点上'] == o3['样本'], f"{o3['诊断落在节点上']}/{o3['样本']}")
+    o4 = O4(); print('── O4 崩溃隔离:', o4)
+    V.check('O4 崩溃隔离', o4['好→崩溃→好'] == ['ok', 'crash', 'ok'] and o4['崩溃后的拒绝诊断'][0] == 'reject', str(o4['好→崩溃→好']))
     st5, miss = O5(n, rng)
-    print('── O5 区域/后继/多块:', dict(st5)); print('    无预言机时漏掉的（MLIR 原话归类）:', miss.most_common(8))
+    print('── O5 区域/后继/多块:', dict(st5)); V.check('O5 区域/后继/多块', st5['图'] > 0 and st5['结构 + 类型(含预言机) 一致'] == st5['图'] and st5['多块'] > 0, f"{st5['结构 + 类型(含预言机) 一致']}/{st5['图']}"); print('    无预言机时漏掉的（MLIR 原话归类）:', miss.most_common(8))
     print('    预言机不可用的原因:', OR.WHY_NONE)
     print('── core 计数:', {k: v for k, v in C.TC_STATS.items() if not k.endswith('例') and k != '发射缺陷'}); print('    人工签名误拒例:', C.TC_STATS.get('人工签名误拒例', [])[:3])
+    V.check('人工签名误拒 0', C.TC_STATS.get('人工签名误拒（预言机接受）', 0) == 0, '')
+    V.finish()
