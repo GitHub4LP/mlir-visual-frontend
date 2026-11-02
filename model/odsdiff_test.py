@@ -64,6 +64,10 @@ def run():
 if __name__ == '__main__':
     st, diff = run()
     print('── T1 odssig vs mlir::tblgen::Operator:', dict(st))
+    import verdict as V
+    V.check('T1 odssig vs', st['op'] > 0 and all(st[k + ' 一致'] == st['op'] for k in ('ins', 'outs', 'attrs', 'regions', 'successors'))
+            and all(a is False and b is True for _, a, b in diff.get('infer', [])), f"op {st['op']}，infer 分歧 {st['infer 分歧']}（只允许 odssig 判无规则、tblgen 可推断：保守方向）")
     for k, v in diff.items():
         print(f'   {k}: {len(v)}')
         for x in v[:8]: print('      ', x)
+    V.finish()

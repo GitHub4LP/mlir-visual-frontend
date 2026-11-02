@@ -197,10 +197,18 @@ if __name__ == '__main__':
     nc = int(sys.argv[1]) if len(sys.argv) > 1 else 150
     rng = random.Random(11)
     print('── 示例'); print(rand_comp(random.Random(3)).show())
+    import verdict as V
     st, ex = C1(nc, rng); print('── C1 Φ ≡ 体 ≡ MLIR:', st)
     for e in ex: print('     例', e)
-    print('── C2 嵌套 ≡ 展开:', C2(nc // 2, rng))
-    print('── C3 端口投影:', C3(nc // 3, rng))
-    print('── C4 with 与字面量:', C4(nc // 3, rng))
+    V.check('C1 Φ ≡ 体 ≡ MLIR', st['实例'] > 0 and st['Φ≡体'] == st['实例'] == st['Φ≡MLIR'] and st.get('崩溃例中 Φ 拒绝', 0) == st.get('MLIR 崩溃（不计）', 0),
+            f"{st['Φ≡MLIR']}/{st['实例']}（MLIR 接受 {st['MLIR 接受']}）")
+    c2 = C2(nc // 2, rng); print('── C2 嵌套 ≡ 展开:', c2)
+    V.check('C2 嵌套 ≡ 展开', c2['嵌套≡展开'] == c2['实例'] == c2['展开 Φ≡体'] and 0 < c2['接受'] < c2['实例'], f"{c2['嵌套≡展开']}/{c2['实例']}")
+    c3 = C3(nc // 3, rng); print('── C3 端口投影:', c3)
+    V.check('C3 端口投影', c3['不可靠（有补全却判不可连）'] == 0 and c3['存在补全'] > 0, f"不可靠 {c3['不可靠（有补全却判不可连）']}，判可连但无补全 {c3['判可连但无补全']}/{c3['判可连']}")
+    c4 = C4(nc // 3, rng); print('── C4 with 与字面量:', c4)
+    V.check('C4 with 与字面量', c4['复合 op'] > 0 and c4['可实例化（with）'] == c4['复合 op'] and c4['with 接受'] >= c4['字面量 接受'], f"with 接受 {c4['with 接受']} ≥ 字面量 {c4['字面量 接受']}")
     print('── C5 代价:', C5(rng))
-    print('── C6 定义期可实例化判定（随手连的图）:', C6(nc, rng))
+    c6 = C6(nc, rng); print('── C6 定义期可实例化判定（随手连的图）:', c6)
+    V.check('C6 定义期可实例化', 0 < c6['在类型池上可实例化'] < c6['复合 op'], '判定能区分可/不可实例化（无外部真值，只验非平凡）')
+    V.finish()

@@ -321,13 +321,30 @@ if __name__ == '__main__':
     n7 = int(sys.argv[3]) if len(sys.argv) > 3 else 100
     out, gaps, extra = S0()
     print('── S0 语义属性账:', dict(collections.Counter(out.values())), '缺口', gaps, 'core 多出的参数', extra)
+    import verdict as V
+    V.check('S0 语义属性账', all(v == 'ok' for v in out.values()) and all(g[2] == '无译名' for g in gaps) and S0(R20)[1] and not extra,
+            f"op {len(out)} 全部对账；缺口只有“无译名”（由 valimport A0 判未知）{len(gaps)} 条；回溯第 20 轮能抓出缺口")
     print('   回溯：第 20 轮的 reads ⇒ 缺口', S0(R20)[1])
     print('   回溯：第 22 轮的 reads ⇒ 缺口', S0(R22)[1])
+    v5 = {}
     for iw in (64, 32):
-        print(f'── V5 JIT（IW={iw}）:', V5(n5, random.Random(5 + iw), iw))
-        print(f'   对照 FLAGS_EXT=False（第 22 轮前语义）:', V5(n5, random.Random(5 + iw), iw, flags=False))
-    print('── V6 canonicalize + int-range-optimizations 翻译确认:', V6(n6, random.Random(6)))
-    print('── V7 scf + sccp:', V7(n7, random.Random(7)))
-    print('── V8 IW=32 下 MLIR 折叠是否保持语义（arith vs index 方言）:', V8(n7, random.Random(8)))
-    print('── V9 index 方言 cmp(sub(x,y),0) 规范化（每个谓词：是否改写，{IW: 误编译输入数}）:', V9())
+        a = V5(n5, random.Random(5 + iw), iw); print(f'── V5 JIT（IW={iw}）:', a)
+        b = V5(n5, random.Random(5 + iw), iw, flags=False); print(f'   对照 FLAGS_EXT=False（第 22 轮前语义）:', b)
+        v5[iw] = (a, b)
+    C.set_iw(64); C.FLAGS_EXT = True
+    V.check('V5 JIT', all(a.get('反例（模型有定义而 MLIR 不同）', 0) == 0 and a['一致'] > 0 and b.get('反例（模型有定义而 MLIR 不同）', 0) > 0 for a, b in v5.values()),
+            'IW=64/32：' + '；'.join(f"一致 {a['一致']} 反例 {a.get('反例（模型有定义而 MLIR 不同）', 0)}（对照 {b.get('反例（模型有定义而 MLIR 不同）', 0)}）" for a, b in v5.values()))
+    v6 = V6(n6, random.Random(6)); print('── V6 canonicalize + int-range-optimizations 翻译确认:', v6)
+    V.check('V6 canonicalize', all(v6.get(f'IW=64, remsi={r}: 反例', 0) == 0 and v6.get(f'IW=64, remsi={r}: 精化', 0) > 0 for r in ('langref', 'ub')),
+            f"IW=64 反例 0；IW=32 反例 {v6.get('IW=32, remsi=ub: 反例', 0)}（归因 MLIR 按 64 位折叠 index 常量，L50/V8）")
+    v7 = V7(n7, random.Random(7)); print('── V7 scf + sccp:', v7)
+    V.check('V7 scf + sccp', v7['输入'] > 0 and v7['模型=原程序 JIT'] + v7['模型 UB'] + v7['模型 poison'] == v7['输入'] == v7['模型=sccp 后 JIT'] + v7['模型 UB'] + v7['模型 poison'],
+            f"有定义输入 {v7['模型=原程序 JIT']} 全一致（原程序与 sccp 后）")
+    v8 = V8(n7, random.Random(8)); print('── V8 IW=32 下 MLIR 折叠是否保持语义（arith vs index 方言）:', v8)
+    V.check('V8 IW=32', v8['模型@32 ≠ JIT@32'] == 0 and v8['模型@32 = JIT@32'] > 0 and v8['arith/canonicalize/IW=64: 误编译'] == 0 and v8['arith/canonicalize/IW=32: 误编译'] > 0,
+            f"模型@32≡JIT@32 {v8['模型@32 = JIT@32']}；arith canonicalize 误编译 IW=32 {v8['arith/canonicalize/IW=32: 误编译']}、IW=64 0（A/B 隔断）")
+    v9 = V9(); print('── V9 index 方言 cmp(sub(x,y),0) 规范化（每个谓词：是否改写，{IW: 误编译输入数}）:', v9)
+    V.check('V9 index 方言 cmp', all(v9[p][1][64] == 0 and v9[p][1][32] == 0 for p in ('eq', 'ne')) and all(v9[p][0] == '改写' and v9[p][1][64] > 0 for p in v9 if p not in ('eq', 'ne')),
+            'eq/ne 正确；其余 8 个谓词在 9bae84b0 上误编译（MLIR 缺陷，只记录）')
     print('── 求解器 unknown:', C.STATS['unknown'])
+    V.finish()

@@ -38,7 +38,7 @@ index 操作数按 IW 位的位向量计算。
 ## 3 结果
 | 检验 | 结果 |
 |---|---|
-| S0 属性账 | arith/ub 共 22 个 op，缺口 0，core 多出的参数 0（ub.poison 的 value 登记为无关）。回溯：第 20 轮 reads ⇒ 6 个缺口（含第 21 轮的 nsw）；第 22 轮 reads ⇒ 3 个缺口（divui exact、trunci nsw/nuw） |
+| S0 属性账 | 第 45 轮机器判定：arith/ub 共 38 个 op 全部对账，core 多出的参数 0；缺口只剩 truncf.roundingmode“无译名”（valimport 判未知，§10.2）。**更正**：第 35 轮加入浮点 op 后 S0 实际已失败（fastmath 无译名 11 条、core 多出 nnan/ninf 22 条与 constant.dense 1 条），因退出码恒 0 未被发现；原因是 `core.ATTR_MAP` 未补登 fastmath（valimport._fastmath 已实现），已补。回溯：第 20 轮 reads ⇒ 缺口（含 nsw），第 22 轮 ⇒ 缺口（divui exact 等），敏感性仍成立 |
 | V5 JIT，IW=64 | 1200 个输入（O0 与 O3）：一致 544，模型毒值 456，模型 UB 200，**反例 0** |
 | V5 JIT，IW=32 | 1200 个输入：一致 544，毒值 390，UB 266，**反例 0** |
 | V5 对照：FLAGS_EXT=False | IW=64 反例 37，IW=32 反例 41（例如 `divui exact` 按常量除时被降低为乘以模逆）⇒ 本检验确实会利用被测语义 |

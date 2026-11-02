@@ -162,4 +162,7 @@ if __name__ == '__main__':
     print('── MLIR verifier 断言崩溃的实例:', len(CRASH), dict(CRASHOPS), '含无秩 tensor:', sum('tensor<*' in c for c in CRASH)); [print(c) for c in CRASH[:2]]
     print('── T2 推断:', T2(random.Random(8)))
     print('── T3 代价:', T3())
-    print('── T4 接入 core:', T4())
+    t4 = T4(); print('── T4 接入 core:', t4)
+    import verdict as V
+    V.check('T4 接入 core', all(d and not known for d, known in t4.values()), '病类型图有诊断、值层判未知（不抛异常）')
+    V.finish()

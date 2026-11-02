@@ -120,6 +120,8 @@ if __name__ == '__main__':
     st, per, ex = L1(n, random.Random(5))
     print('── L1 差分（每个 op', n, '个实例）')
     for k, v in st.items(): print('   ', k, dict(v))
+    tot1 = collections.Counter()
+    for v in st.values(): tot1.update(v)
     bycls = collections.defaultdict(collections.Counter)
     for (op, cls), v in per.items(): bycls[cls].update(v); bycls[cls]['op'] += 1; bycls[cls]['有分歧的 op'] += any('一致' not in k and c for k, c in v.items())
     print('── L1 按账目（ods+cpred）'); [print('   ', k, dict(v)) for k, v in bycls.items()]
@@ -127,4 +129,8 @@ if __name__ == '__main__':
     for (op, cls), v in per.items():
         if cls in ('auto', 'cpred') and any(('误收' in k or '误拒' in k) and c for k, c in v.items()):
             print('   ', op, cls, dict(v), [ex.get((op, b)) for b in (True, False) if (op, b) in ex])
+    import verdict as V
+    V.check('L1 差分', sum(v for k, v in tot1.items() if '误拒' in k) == 0 and tot1['+cpred:一致'] > 0, f"实例 {tot1['实例']}，误拒 {sum(v for k, v in tot1.items() if '误拒' in k)}，误收 {tot1['+cpred:误收']}")
+    V.check('L1 按账目', bycls['auto']['有分歧的 op'] == 0 and bycls['auto']['op'] > 0, f"auto op {bycls['auto']['op']}，有分歧 {bycls['auto']['有分歧的 op']}")
     print('── declared op 的误收（C++ verify 的缺口）:', sorted(((op, v.get('+cpred:误收', 0)) for (op, cls), v in per.items() if cls == 'declared'), key=lambda x: -x[1])[:15])
+    V.finish()
