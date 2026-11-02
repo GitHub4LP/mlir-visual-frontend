@@ -28,13 +28,25 @@ def A0():
         lk = G.lookup(op)
         if lk is None: continue
         for nm, *_ in lk[1]['attrs']:
-            if (op, nm) in V.TRANSLATED: out['翻译'] += 1
+            if (op, nm) in V.TRANSLATED and not V.TRANSLATED[(op, nm)].startswith('⇒ 未知'): out['翻译'] += 1
             elif (op, nm) in V.IRRELEVANT: out['语义无关'] += 1
             elif nm in V.STRUCTURAL: out['结构'] += 1
             else: out['拒绝（⇒ 未知）'] += 1; refuse.append(f'{op}.{nm}')
-    for op in ('scf.for', 'scf.if', 'scf.yield', 'func.return'):
-        for nm, *_ in G.lookup(op)[1]['attrs']: out['拒绝（⇒ 未知）'] += 1; refuse.append(f'{op}.{nm}')
+    # 第 46 轮：此处原先把 scf.for/scf.if/scf.yield/func.return 的属性一律记为拒绝——第 41 轮开放 unsignedCmp 后已过时；改为同一分类
     return out, refuse
+
+def A0_probe(refuse):
+    """第 46 轮：账上“拒绝”的属性必须真的经 valimport.to_core 抛 Unknown（不只是记账）。返回 (逐项结果, 不符项)。"""
+    import valimport as V, odssig as G
+    res, bad = {}, []
+    for s in refuse:
+        op, nm = s.rsplit('.', 1)
+        ins, outs = (['a'], [('r', 'f32')]) if op == 'arith.truncf' else ([], [('r', 'i32')])
+        n = {'id': 'r', 'op': op, 'ins': ins, 'outs': outs, 'props': {'_attrs': {nm: '0 : i32'}, '_types': ['f64'] * len(ins)}, 'succs': [], 'regions': []}
+        try: V.to_core([dict(name='b', args=[('a', 'f64')] if ins else [], ops=[n])]); res[s] = '翻译成功'; bad.append(s)
+        except V.Unknown as e: res[s] = 'Unknown' + ('（因该属性）' if (s in str(e) or nm in str(e)) else '（其它原因）')
+        except Exception as e: res[s] = f'异常 {type(e).__name__}'; bad.append(s)
+    return res, bad
 
 def model_eval(S, ins_ty, xs):
     """S：core.derive 的结果；返回 ('skip', 原因) 或 ('val', 无符号值)。"""
@@ -201,10 +213,14 @@ def A3(n, seed=7):
 if __name__ == '__main__':
     n3 = int(sys.argv[1]) if len(sys.argv) > 1 else 300
     lim = int(sys.argv[2]) if len(sys.argv) > 2 else 10 ** 9
+    import verdict as VV
     out, refuse = A0()
     print('── A0 属性账:', dict(out)); print('   拒绝（⇒ 未知）:', refuse)
+    pr, pbad = A0_probe(refuse); print('   探针:', pr)
+    VV.check('A0 属性账', refuse and not pbad, f"翻译 {out['翻译']}，无关 {out['语义无关']}，拒绝 {len(refuse)} 项全部经 to_core 抛 Unknown")
     st, bad = A3(n3)
     print('── A3 切片定向:', dict(st))
+    VV.check('A3 切片定向', st['输入'] > 0 and st['不一致'] == 0 and st['A4 static_zero 发现'] > 0, f"程序 {st['程序']}，输入 {st['输入']}，不一致 {st['不一致']}；错误翻译 static_zero 被发现 {st['A4 static_zero 发现']}")
     for b in bad: print('  ✗', b[1:], '\n', b[0])
     tot = collections.Counter(); exs = collections.defaultdict(list); ctxm = mp.get_context('fork')
     for i, path in enumerate(sorted(glob.glob('corpus/*/*.mlir'))[:lim]):
@@ -215,3 +231,5 @@ if __name__ == '__main__':
         for k, v in ex.items(): exs[k] += v[:2]
     print('── A1/A2/A4 语料'); [print(f'   {k}: {v}') for k, v in sorted(tot.items())]
     for k, v in exs.items(): print('──', k); [print('    ', x) for x in v[:8]]
+    VV.check('A2 一致', tot['A2 输入'] > 0 and tot['A2 不一致'] == 0 and tot['文件超时/崩溃'] == 0, f"输入 {tot['A2 输入']}，不一致 {tot['A2 不一致']}（分母缺口见 clauses M0.2）")
+    VV.finish()
