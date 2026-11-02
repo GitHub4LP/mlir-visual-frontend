@@ -38,6 +38,8 @@ def all_types(fn):
     walk(fn['regions'][0]); return t
 
 DUMP = []
+P3LIST = []      # 第 50 轮：上下文约束段的明细（M1.2 上下文约束建模的真值样本）
+SEGLOG = []      # 每个计入的段：(top op 名, 父 op 名, MLIR 结论 P1/P2/P3)
 def ports_r43(block, lo, hi_, rest=()):
     """消融对照：第 43 轮及以前的端口算法（扁平名字、只看 ins、只扫本块后续 op）。"""
     seg = block['ops'][lo:hi_]; defined, used = {}, []
@@ -81,7 +83,7 @@ def scoped_types(fn, target):
     return walk(fn['regions'][0], {})
 
 def run(lim=300, per=3, seed=43):
-    import mlir.ir as ir, irimport as I, oracle as OR, core as C, structure as ST
+    import mlir.ir as ir, irimport as I, oracle as OR, core as C, structure as ST, ctxcons as X
     from compcorpus_test import _funcs
     rng = random.Random(seed); st = collections.Counter(); ex = collections.defaultdict(list); o = OR.Oracle()
     def note(k, v):
@@ -106,6 +108,13 @@ def run(lim=300, per=3, seed=43):
                 if base is None: st['D0 无法发射'] += 1; continue
                 if o.verify(base)[0] != 'ok': st['D0 原样 MLIR 不接受（不计）'] += 1; continue
                 nf += 1; st['D0 函数'] += 1
+                par = {}
+                def _par(region, chain):
+                    par[id(region)] = chain                      # 祖先链：直接父 op 在前
+                    for b_ in region:
+                        for n_ in b_['ops']:
+                            for r_ in n_['regions']: _par(r_, [n_['op']] + chain)
+                _par(fn['regions'][0], ['func.func'])
                 cands = [(R, i, d) for R, i, d in blocks_with_region(fn) if len(R[i]['ops']) >= 2]
                 if not cands: st['D1 无可提取段（块内非终结 op < 1）'] += 1; continue
                 rich = [c for c in cands if c[2] > 0 or len(c[0]) > 1]          # 偏向嵌套区域与多块区域（端口问题主要出在这里）
@@ -139,11 +148,19 @@ def run(lim=300, per=3, seed=43):
                     if stxt is None or htxt is None: st['D2 无法发射（不计）'] += 1; note('无法发射', list(OR.WHY_NONE.items())[-1:]); continue
                     rs, ds = o.verify(stxt); rh, dh = o.verify(htxt)
                     if 'crash' in (rs, rh): st['MLIR 崩溃（不计）'] += 1; continue
-                    if rs == 'ok' and rh == 'ok': st['P1 端口完备（两者 MLIR 接受）'] += 1; continue
+                    tops, pop = b['ops'][lo:hi], par.get(id(R), ['?'])
+                    cv, cw = X.move_check(tops, pop) if PORTS is None else ('ok', [])
+                    st[f'C 上下文判定/{cv}'] += 1
+                    if rs == 'ok' and rh == 'ok':
+                        st['P1 端口完备（两者 MLIR 接受）'] += 1; SEGLOG.append(([n['op'] for n in tops], pop, 'P1', None)); st[f'C/P1/{cv}'] += 1
+                        if cv == 'reject': note('C 误拒', cw[:1])
+                        continue
                     msgs = [m for _, m in (ds if rs != 'ok' else []) + (dh if rh != 'ok' else [])]
                     if any(PORT_ERR.search(m) for m in msgs):
                         st['P2 端口错误'] += 1; note('P2', (name, 'seg' if rs != 'ok' else 'host', msgs[0][:160])); DUMP.append((name, path, stxt if rs != 'ok' else htxt, msgs[:2], caps, outs)); continue
                     st['P3 上下文约束（非端口）'] += 1; note('P3', msgs[0][:140])
+                    st[f'C/P3/{cv}'] += 1; note('C/P3', (cv, cw[:1]))
+                    SEGLOG.append(([n['op'] for n in tops], pop, 'P3', 'seg' if rs != 'ok' else 'host')); P3LIST.append((name, path, 'seg' if rs != 'ok' else 'host', pop, [n['op'] for n in tops], msgs[:1]))
                     C.ORACLE_ON = False
                     try: dd = C.typecheck([{'name': 'entry', 'args': [(pm[v], types[v]) for v in caps], 'ops': body + [ret]}], sft) if rs != 'ok' else None
                     except Exception: dd = None
@@ -153,7 +170,7 @@ def run(lim=300, per=3, seed=43):
     return st, ex
 
 if __name__ == '__main__':
-    lim = int(sys.argv[1]) if len(sys.argv) > 1 else 300
+    lim = int(sys.argv[1]) if len(sys.argv) > 1 else 1500     # 第 50 轮：默认 300 时只有 1 个函数含嵌套区域、上下文约束 0 段（检验形同虚设）
     per = int(sys.argv[2]) if len(sys.argv) > 2 else 3
     st, ex = run(lim, per)
     print('── L3 提取端口 vs MLIR:', dict(sorted(st.items())))
@@ -163,4 +180,10 @@ if __name__ == '__main__':
     V.check('P 端口 vs MLIR', st['P2 端口错误'] == 0 and st['P1 端口完备（两者 MLIR 接受）'] >= 100,
             f"段 {st['段']}，完备 {st['P1 端口完备（两者 MLIR 接受）']}，端口错误 {st['P2 端口错误']}，上下文 {st['P3 上下文约束（非端口）']}")
     V.check('P 消融灵敏度', sa['P2 端口错误'] > 0, f"旧算法端口错误 {sa['P2 端口错误']}")
+    p3 = st['P3 上下文约束（非端口）']
+    V.check('C1 上下文拒绝 0 误拒', st['C/P1/reject'] == 0, f"P1 段中判拒 {st['C/P1/reject']}；判拒共 {st['C 上下文判定/reject']}")
+    V.check('C2 上下文约束预先指出', p3 >= 10 and st['C/P3/reject'] + st['C/P3/unknown'] == p3,
+            f"P3 {p3} 段：拒 {st['C/P3/reject']}、未知 {st['C/P3/unknown']}、漏 {st['C/P3/ok']}")
+    V.check('C3 判 ok 的段 MLIR 接受', st['C/P3/ok'] == 0 and st['C 上下文判定/ok'] > 0,
+            f"判 ok {st['C 上下文判定/ok']}，其中 MLIR 上下文失败 {st['C/P3/ok']}；P1 中判未知 {st['C/P1/unknown']}/{st['P1 端口完备（两者 MLIR 接受）']}（精度代价）")
     V.finish()

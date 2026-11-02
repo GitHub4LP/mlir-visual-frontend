@@ -75,6 +75,19 @@ Schema v3 只描述端口、类型、语义和效应，没有覆盖 MLIR 的结�
 **上下文约束 14 段**（memref.generic_atomic_rmw 体要求无副作用、tensor.parallel_insert_slice 要求 InParallelOpInterface 父 op 等）：提取改变了 op 的父上下文。
 这不是端口问题，但对前端是真约束；结构层目前一例也没有预先指出（0/14）——缺口，见 §8。
 
+**第 50 轮更正与补全（model/ctxcons.py）**：14 段里没有一段来自 ODS 的 HasParent。7 段是子 op 的 C++ verify 读父 op（parallel_insert_slice），7 段是祖先 op 的 C++/接口校验读体（generic_atomic_rmw 纯度 2 段，matmul 的 add/mul 体 5 段）。所以只导入 HasParent 只能抓到 0/14。现在分三级判定：
+- **reject**：ODS HasParent/ParentOneOf。这是 MLIR 原生 trait 校验（`OpTrait::HasParent::Impl::verifyTrait`）。650 个 op 中 15 个带此约束，类名全部可解析。定向检验 8/8 与 MLIR 一致（ctxcons_test C4）。
+- **unknown**：已声明校验（C++ verify/verifyRegions、接口 verify，沿调用闭包展开，深度 3）在同一提交的源码（inventory/cpp/）里文本上读父/祖先 op 或读体，或者源码里找不到。这一级只给警告，没有拒绝权。
+- **ok**：两者都不命中。
+
+真实 IR 结果（capture_test，1500 个函数，4435 段）：
+- 14 段上下文失败全部预先指出（未知 14，漏 0）。
+- 判 ok 的 3908 段中，MLIR 上下文失败 0 段。
+- 判拒 0 段，误拒 0。
+- 精度代价：MLIR 接受的段里有 513/4421（11.6%）被判为未知。原因是文本扫描与调用闭包过近似，例如 scf.for 的校验既读体，又经闭包触及 getParent。
+
+另外更正一处检验缺陷：capture_test 原先默认只跑 300 个函数，其中只有 1 个含嵌套区域，上下文段为 0，这项检验实际形同虚设。默认已改为 1500。
+
 ## 7 对前端的指导
 1. 编辑器里的“连线”分两种：数据边（R5、R6，局部检查）和控制边（R3、R4、R5、R7，会触发支配重算）。前端优先提供结构化控制（scf），把非结构化 cf 限制在显式的“CFG 容器”里，让大多数编辑只走局部检查。
 2. 补全和连线候选直接来自义务：可连的源 = 当前点可见（R6）且支配（R5）的值；可调用的符号 = 最近符号表里的符号，加上嵌套表里 public 的符号（S2、S3）。
@@ -82,6 +95,6 @@ Schema v3 只描述端口、类型、语义和效应，没有覆盖 MLIR 的结�
 4. 改名和改签名是带扇出的变换，必须通过反向索引原子地完成（MLIR 的 SymbolTable::replaceAllSymbolUses 的前端版）。
 
 ## 8 未覆盖（下一步）
-- 提取的上下文约束（父 op 约束、区域体纯度）：结构层未建模，capture_test 中 0/14 被预先指出。
+- 提取的上下文约束：第 50 轮已覆盖（14/14 预先指出，只到未知级；HasParent 有拒绝权）。精度缺口：MLIR 接受的段中 11.6% 被判未知，需要更细的校验语义（例如只读区域参数/yield 类型的父校验）。
 - L5（needs_ssacfg）的外部证据仍只有定向 X5。
 attribute/property 的类型和约束；interface（作为 Schema 上的能力谓词）；用户类型（ADT）；方言扩展；rewrite/pass 作为带契约的图变换。
