@@ -311,4 +311,14 @@ if __name__ == '__main__':
     must = [k for k in st if k.startswith('K6') and ('恢复' in k) and '正确' in k]
     k6ok = len(must) == 2 * len(HOSTS) + 1 and st[f'K9 体内 scf.if：降低后 n={BIG} 正确'] and k7['恢复后 verify 失败'] == 0 and k8['不一致'] == 0 and k8['恢复后 verify 失败'] == 0 and k8['一致'] > 0 and k8['大迭代值不一致'] == 0 and k8['恢复后 2 万次外层迭代 ok'] == k8['程序']
     must = [f'K2 {h}/包 大迭代 正确' for h in HOSTS] + [f'K1 {h}/包 小迭代 正确' for h in HOSTS]
-    sys.exit(0 if ok0 and not bad and all(st[k] for k in must) and e is None and k6ok else 1)
+    import verdict as V
+    V.check('K0 ODS 对账', ok0, str(d0)[:120])
+    V.check('K1 小迭代', not bad and all(st[f'K1 {h}/包 小迭代 正确'] for h in HOSTS), '')
+    V.check('K2 A/B', all(st[f'K2 {h}/包 大迭代 正确'] for h in HOSTS) and any(not st[f'K2 {h}/不包 大迭代 正确'] for h in HOSTS),
+            '包 alloca_scope 大迭代全部正确；不包至少一处失败（A/B 隔断）')
+    V.check('K3 逃逸', e is None, str(dict(O.WHY_NONE))[:120])
+    k6r = [k for k in st if k.startswith('K6') and '恢复' in k and '正确' in k]
+    V.check('K6 第 38 轮', len(k6r) == 2 * len(HOSTS) + 1 and k7['恢复后 verify 失败'] == 0, f'恢复后正确 {len(k6r)}/{2 * len(HOSTS) + 1}；K7 语料恢复后 verify 失败 {k7["恢复后 verify 失败"]}')
+    V.check('K8 生成器', k8['一致'] > 0 and k8['不一致'] == 0 and k8['恢复后 verify 失败'] == 0 and k8['大迭代值不一致'] == 0 and k8['恢复后 2 万次外层迭代 ok'] == k8['程序'], str(dict(k8))[:160])
+    V.check('K9 D2', bool(st[f'K9 体内 scf.if：降低后 n={BIG} 正确']) and bool(st[f'K9 体内 scf.if：降低后 n={SMALL} 正确']), f'标准管线 {r0[0]}；降低后两种 n 均正确')
+    V.finish()

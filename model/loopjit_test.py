@@ -126,4 +126,7 @@ if __name__ == '__main__':
     st, ex = L1(N)
     print('── L1/L2:'); [print(f'   {k}: {v}') for k, v in sorted(st.items())]
     for k, v in ex.items(): print('──', k); [print('    ', x[:700]) for x in v]
-    sys.exit(0 if st['不一致'] == 0 and not any(k.startswith('不一致/') for k in st) and st['一致'] > 0 and l3['未知'] == 0 else 1)
+    import verdict as V
+    V.check('L1 生成器', st['不一致'] == 0 and not any(k.startswith('不一致/') for k in st) and st['一致'] > 0, f"一致 {st['一致']}，不一致 {st['不一致']}")
+    V.check('L3 trip_count', l3['未知'] == 0 and l3['有事实'] > 0, str(dict(l3)))
+    V.finish()
