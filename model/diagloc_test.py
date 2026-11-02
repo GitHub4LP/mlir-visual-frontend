@@ -151,5 +151,9 @@ if __name__ == '__main__':
     st, ex = run(lim)
     print('── 诊断归位（真实 IR + 单点变异）:'); [print(f'   {k}: {v}') for k, v in sorted(st.items())]
     for k, v in ex.items(): print('──', k); [print('    ', x) for x in v]
+    import verdict as V
     rej = st['MLIR 拒绝'] - st['R1 诊断无 loc（语法层）']
-    sys.exit(0 if rej > 0 and st['R1 落在节点上'] == rej else 1)
+    V.check('R1', rej > 0 and st['R1 落在节点上'] == rej, f"{st['R1 落在节点上']}/{rej}")
+    V.check('R2', st['R2 MLIR 首诊断 ∈ 被改节点或其使用者'] == rej, f"{st['R2 MLIR 首诊断 ∈ 被改节点或其使用者']}/{rej}")
+    V.check('R3', st['R3 我们的层先抓住'] > 0 and st['R3 抓住且首诊断 ∈ 被改节点或使用者'] == st['R3 我们的层先抓住'], f"{st['R3 抓住且首诊断 ∈ 被改节点或使用者']}/{st['R3 我们的层先抓住']}")
+    V.finish()
