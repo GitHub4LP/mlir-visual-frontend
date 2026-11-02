@@ -127,4 +127,8 @@ if __name__ == '__main__':
     n = int(sys.argv[1]) if len(sys.argv) > 1 else 60
     st, bad = run(n)
     print('── L12 接口定律方向 vs JIT:', dict(st))
+    import verdict as V
+    V.check('L12 接口定律方向', st['判有效'] > 0 and st['有效·JIT不符'] == 0 and st['翻译不符'] == 0 and st['无效·JIT确认'] == st['无效·值层可见'],
+            f"判有效 {st['判有效']}（JIT 不符 {st['有效·JIT不符']}），判无效 {st['判无效']}（值层可见 {st['无效·值层可见']}，JIT 确认 {st['无效·JIT确认']}，仅毒值/UB 层 {st['无效·仅毒值/UB层']}）")
+    V.finish()
     for b in bad[:3]: print('  ✗', b[0], b[1], '\n', b[2], '\n', b[3])
