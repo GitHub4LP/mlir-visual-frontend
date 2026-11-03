@@ -48,7 +48,7 @@ Schema v3 只描述端口、类型、语义和效应，没有覆盖 MLIR 的结�
 `derive_struct(体) = ⟨captures, free_syms, needs_ssacfg, multi_block, isolated_ok⟩`
 - 组合律 L3（捕获）：透明内联进 IsolatedFromAbove 的宿主时，captures 必须提升为显式端口；captures 为空 ⇔ 可声明 IsolatedFromAbove（这是推导，不是声明）。
 - 组合律 L4（符号）：透明模式下 free_syms 变成宿主所在符号表的解析义务（S2/S3）；不透明模式（func + call）下，它们是复合定义所在表的义务。两种模式解析到不同的表时，**语义不同**，所以必须判定一致或者拒绝透明模式。这一点与 alloca_scope 的问题（derivation-v3.md §5）同构：透明内联都要保持作用域。
-- L5（区域种类）：needs_ssacfg 的复合 op 不能内联进 Graph 区域；它只能以不透明模式出现，或者先结构化（cf → scf）。
+- L5（区域种类）：needs_ssacfg 的复合 op 不能内联进 Graph 区域；它只能以不透明模式出现，或者先结构化（cf → scf）。needs_ssacfg ≝ 体的顶层区域多于 1 块（第 52 轮更正，见 §6.2）。
 
 ## 6 差分结果
 - 15 个手写用例，覆盖全部 12 条义务，每个负例都触发了预期的那条义务：与 MLIR 判定 15/15 一致。
@@ -102,5 +102,20 @@ Schema v3 只描述端口、类型、语义和效应，没有覆盖 MLIR 的结�
 - 留出集（之后 1116 个函数，3345 段，未参与收窄）：P3 172 段全部判未知（多为 vector.mask 内的 transfer_read/write：子 op 读父，以及 vector.mask 读体），判 ok 漏 0，误拒 0，P1 未知 30/3173（0.9%）。检验 C6。
 - 余下的未知大多是真依赖：affine.* 要求 AffineScope 祖先（维度/符号合法性），vector.transfer_* 在 vector.mask 内。属于噪声的主要是 scf.for 的 24 段（getForInductionVarOwner 读的是块参数属主，即 for 自己，文本扫描分不出）。
 - 仍是文本过近似，不是校验语义的证明；只产生未知，不拒绝。
-- L5（needs_ssacfg）的外部证据仍只有定向 X5。
+- L5（needs_ssacfg）：第 52 轮补上外部证据，见 §6.2。
+
+### 6.2 第 52 轮：Graph 区域（L5 外部证据与一处误拒）
+
+MLIR 的规则（9bae84b0）：Verifier.cpp `verifyOnEntrance` 要求已注册 op 的 Graph 区域“0 或 1 块”，与 SingleBlock trait 无关；支配只在 SSACFG 区域里检查，`mayBeGraphRegion` 把未注册 op 的区域也当作可能是 Graph（RegionKindInterface.cpp），因此不查支配。
+
+更正：
+- **判据**：needs_ssacfg 原为“体内任何处有带后继的 op”。它既误报（嵌套 op 自己区域里的 cf，内联后那个区域的种类不变；真实语料中 3 个函数），又漏报（无跳转的不可达块）。现改为“顶层区域多于 1 块”。单块区域不可能有顶层跳转，因为入口块不能有前驱。
+- **误拒（有拒绝权的结构层）**：ODS 导入的 op 原先一律按 SSACFG 查 R5 支配。所以 gpu.module、builtin.module 一类 Graph 区域里先用后定义，以及未注册 op 的区域，MLIR 接受，我们却判 R5。现按 ODS 取区域种类：HasOnlyGraphRegion/GraphRegionNoTerminator ⇒ Graph；C++ 自定 RegionKindInterface 或未导入/未注册 ⇒ 未知（不查 R5、不判 R7）。R7 增加“Graph 区域多于 1 块”。
+
+检验（l5_test）：
+- L5a：ODS 中 Graph 区域 op 共 6 个，全带 SingleBlock，结构层都判为 Graph。
+- L5b：语料中 MLIR 接受的 2599 个函数，体内联进 builtin.module（参数换成 ub.poison），needs_ssacfg ⇔ MLIR “0 or 1 blocks” 一致 2599/2599。其中顶层多块的只有 5 个（语料所限）。单块函数内联后 MLIR 接受 2570，其余 24 个被拒，原因是 memref.alloca 需要 AutomaticAllocationScope 祖先，属于上下文约束，与 L5 无关（对应 M5.3）。
+- L5c：定向 7/7（三种 Graph/未注册区域先用后定义：MLIR 接受、结构层不报；SSACFG 区域先用后定义：两边都拒；多块 Graph 区域：R7 且 MLIR 拒；嵌套 cf 与不可达块：新判据对、旧判据错）。
+
+未覆盖：Graph 区域没有顺序语义，体内有副作用的 op 内联进去后，执行次序由谁定义，MLIR 不规定。值层不对 Graph 区域的体推导事实，这一点尚未写成条款。
 attribute/property 的类型和约束；interface（作为 Schema 上的能力谓词）；用户类型（ADT）；方言扩展；rewrite/pass 作为带契约的图变换。
