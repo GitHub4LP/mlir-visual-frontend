@@ -82,13 +82,13 @@ def scoped_types(fn, target):
         return None
     return walk(fn['regions'][0], {})
 
-def run(lim=300, per=3, seed=43):
+def run(lim=300, per=3, seed=43, skip=0):
     import mlir.ir as ir, irimport as I, oracle as OR, core as C, structure as ST, ctxcons as X
     from compcorpus_test import _funcs
     rng = random.Random(seed); st = collections.Counter(); ex = collections.defaultdict(list); o = OR.Oracle()
     def note(k, v):
         if len(ex[k]) < 4: ex[k].append(v)
-    nf = 0
+    nf = 0; sk = 0
     for path in sorted(glob.glob('corpus/*/*.mlir')):
         if nf >= lim: break
         src = open(path).read()
@@ -107,6 +107,7 @@ def run(lim=300, per=3, seed=43):
                 base = OR.emit_core(fn['regions'][0], ft, name='f', symbols=syms)
                 if base is None: st['D0 无法发射'] += 1; continue
                 if o.verify(base)[0] != 'ok': st['D0 原样 MLIR 不接受（不计）'] += 1; continue
+                if sk < skip: sk += 1; continue          # 第 51 轮：留出集（跳过前 skip 个合格函数）
                 nf += 1; st['D0 函数'] += 1
                 par = {}
                 def _par(region, chain):
@@ -154,6 +155,7 @@ def run(lim=300, per=3, seed=43):
                     if rs == 'ok' and rh == 'ok':
                         st['P1 端口完备（两者 MLIR 接受）'] += 1; SEGLOG.append(([n['op'] for n in tops], pop, 'P1', None)); st[f'C/P1/{cv}'] += 1
                         if cv == 'reject': note('C 误拒', cw[:1])
+                        for w in (cw if cv == 'unknown' else [])[:1]: st['C/P1/unknown 原因/' + re.sub(r'（.*', '', w)[:60]] += 1
                         continue
                     msgs = [m for _, m in (ds if rs != 'ok' else []) + (dh if rh != 'ok' else [])]
                     if any(PORT_ERR.search(m) for m in msgs):
@@ -186,4 +188,11 @@ if __name__ == '__main__':
             f"P3 {p3} 段：拒 {st['C/P3/reject']}、未知 {st['C/P3/unknown']}、漏 {st['C/P3/ok']}")
     V.check('C3 判 ok 的段 MLIR 接受', st['C/P3/ok'] == 0 and st['C 上下文判定/ok'] > 0,
             f"判 ok {st['C 上下文判定/ok']}，其中 MLIR 上下文失败 {st['C/P3/ok']}；P1 中判未知 {st['C/P1/unknown']}/{st['P1 端口完备（两者 MLIR 接受）']}（精度代价）")
+    # 第 51 轮：读体判据按前 1500 个函数的未知原因收窄过，须在未参与收窄的留出集上再量（防止对样本过拟合）
+    hs, hx = run(lim, per, seed=44, skip=lim)
+    print('── 留出集（跳过前', lim, '个合格函数）:', {k: v for k, v in sorted(hs.items()) if k.startswith(('C/P', 'P1', 'P3', 'D0 函数', '段'))})
+    for k in ('C/P3', 'C 误拒'): print('   ', k, hx.get(k, [])[:4])
+    V.check('C6 留出集上下文判定', hs['D0 函数'] >= 300 and hs['C/P1/reject'] == 0 and hs['C/P3/ok'] == 0,
+            f"函数 {hs['D0 函数']}，段 {hs['段']}；P1 判拒 {hs['C/P1/reject']}、判未知 {hs['C/P1/unknown']}/{hs['P1 端口完备（两者 MLIR 接受）']}；"
+            f"P3 {hs['P3 上下文约束（非端口）']}：拒 {hs['C/P3/reject']}、未知 {hs['C/P3/unknown']}、漏 {hs['C/P3/ok']}")
     V.finish()
