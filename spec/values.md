@@ -510,3 +510,20 @@ FZ2 为首跑之后补的定向检验，非预注册，5/5 通过。
 - 浮点族不含 tensor、memref、控制流和超越函数（exp、log 等仍判未知）。
 - 每个程序 6 个输入。
 - math-uplift-to-fma 只在带 contract 标志时改写，生成器从不产生 contract，因此这条管线的 0 偏离是空检验，不能据此宣称可用。
+
+## 16 第 60 轮：浮点元素 tensor 签名的语料函数（model/ftensorjit_test.py，M0.2）
+
+**缺口**：tensorjit_test 只构造整数 tensor 输入。签名含浮点 tensor 的函数，模型给出了事实，却记为“有事实但签名含非整数 tensor”跳过（94 个）。这些事实此前**从未经外部对照**。这是可靠性缺口，不只是覆盖率缺口。
+
+**方法**：浮点 tensor 元素的位模式取 (seed + Σc_k·i_k) mod 2^BW，seed 取 floatjit 的特殊值或随机位模式，c_k ∈ [-3, 3]，因此相邻元素是相邻位模式，覆盖 ±0、次正规、±Inf、NaN。JIT 侧在 i64 上计算后 trunci、bitcast；模型侧 Int2BV、fpBVToFP。结果按位模式比较，NaN 只比较“是 NaN”。f16 预先排除（第 35b 轮 LLVM 缺陷），本批中为 0 个。阈值在运行前写定：比较 ≥ 300、不一致 0、文件超时 0；seed+1 灵敏度比较 ≥ 50，发现率 ≥ 50%。
+
+| | 候选 | 执行 | 比较（dim/元素/标量） | 浮点值（NaN） | 不一致 | seed+1 发现 |
+|---|---|---|---|---|---|---|
+| 首跑（每函数 4 组输入） | 94 | 36 | 562 | 364（70） | 0 | 70/101 |
+| 二跑（至多 16 组取 4 组） | 94 | 43 | 673（215/430/28） | 434（57） | 0 | 105/131 |
+
+- **事后改动**：二跑的采样改动是看过首跑执行率之后做的。只改了采样，阈值和判据未变。
+- 未执行 51：47 个所有输入都不满足守卫（954 次），说明 harness 的随机输入很少落在这些函数的切片界内，事实在界内的部分仍未对照；JIT 不可用 4 个：2 个是 for-loop-canonicalization 的 `_no_canonicalize` 用例，缓冲化失败（Yield operand not equivalent to iter bbArg）；2 个是 MLIR 进程崩溃（insert_slice_rank_reducing −9、fold_empty_tensor_with_slice −11），只记录。
+- 灵敏度未发现的 26 例主要是 NaN→NaN 和守卫路径。
+- 本批函数的浮点值都是被**搬运**的（切片、insert、dim、scf 携带），没有被计算的：浮点 arith 逐元素作用于 tensor 在 core 中判未知（arith.constant 7、arith.select 4、tensor.cast 4）。这是正确的保守行为。
+- 剩余缺口：浮点 tensor 签名候选 516 个，其中 374 个含值层未覆盖的 op（collapse/expand_shape、linalg、vector、pad 为主）。
