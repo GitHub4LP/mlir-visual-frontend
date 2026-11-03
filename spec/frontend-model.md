@@ -77,7 +77,7 @@
 
 ## 5 降级 ⟦·⟧ 与它的义务
 - 〔M5.1〕⟦·⟧ 包含 pass 管线，不只是 IR 翻译。判据是 Sem(g) ⊑ Sem(pipeline(⟦g⟧))；资源性质（栈）也要经管线保持（M5.3）。反例：LICM 提升 tensor.extract，bufferize 之后变成无条件的 load（difftest/）。管线只能取钉定提交上经差分检验的白名单 pass（L55，values §15）；9bae84b0 上 scf-for-loop-peeling（lb > ub 时多执行一次）与 remove-dead-values（留下空操作数的调用）不在白名单里。
-- 〔M5.2〕复合 op 有三种落地方式：内联（透明，默认）；func + call（不透明）；IRDL op（不透明，有 MLIR 身份）。IRDL 只能表达 any/is/相等，所以不透明模式下使用点仍由前端用 Φ 判定（L48）。
+- 〔M5.2〕复合 op 有三种落地方式（内联进 Graph 区域时，体内可能有副作用的 op 次序未定义 ⇒ 未知，L56）：内联（透明，默认）；func + call（不透明）；IRDL op（不透明，有 MLIR 身份）。IRDL 只能表达 any/is/相等，所以不透明模式下使用点仍由前端用 Φ 判定（L48）。
 - 〔M5.3〕内联要保持作用域：体内有自动作用域分配（ODS 导出的集合）时包一层 alloca_scope；有 memref 输出时判逃逸未建模、不发射；遇到自由符号时要判定两种模式下解析是否一致（L4）。降级管线在全部优化之后、方言降低之前把作用域语义落成 stacksave/stackrestore（lowering.lower_alloca_scopes），因为本提交 MLIR 的标准降低不尊重 scf.for 的作用域 trait，且降不下体内有控制流的结构化区域内 alloca_scope（closure §8.1）。
 - 〔M5.4〕后端诊断通过 Location（节点 id）回映到节点（L31）。
 

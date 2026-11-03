@@ -117,5 +117,36 @@ MLIR 的规则（9bae84b0）：Verifier.cpp `verifyOnEntrance` 要求已注册 o
 - L5b：语料中 MLIR 接受的 2599 个函数，体内联进 builtin.module（参数换成 ub.poison），needs_ssacfg ⇔ MLIR “0 or 1 blocks” 一致 2599/2599。其中顶层多块的只有 5 个（语料所限）。单块函数内联后 MLIR 接受 2570，其余 24 个被拒，原因是 memref.alloca 需要 AutomaticAllocationScope 祖先，属于上下文约束，与 L5 无关（对应 M5.3）。
 - L5c：定向 7/7（三种 Graph/未注册区域先用后定义：MLIR 接受、结构层不报；SSACFG 区域先用后定义：两边都拒；多块 Graph 区域：R7 且 MLIR 拒；嵌套 cf 与不可达块：新判据对、旧判据错）。
 
-未覆盖：Graph 区域没有顺序语义，体内有副作用的 op 内联进去后，执行次序由谁定义，MLIR 不规定。值层不对 Graph 区域的体推导事实，这一点尚未写成条款。
+Graph 区域没有顺序语义：体内有副作用的 op 内联进去以后，执行次序由谁定义，MLIR 不规定。第 57 轮写成 L56，见 §6.3。
 attribute/property 的类型和约束；interface（作为 Schema 上的能力谓词）；用户类型（ADT）；方言扩展；rewrite/pass 作为带契约的图变换。
+
+### 6.3 第 57 轮：Graph 区域里的副作用次序（L56，model/graphorder_test.py）
+
+**为什么是“未知”而不是“拒绝”**
+- 第 52 轮 L5b 中，单块函数体内联进 builtin.module 后，MLIR 接受了 2570 个，其中不少含有 store、alloc、call。这说明 MLIR 的 verifier 接受这类 IR，但不规定其中的执行次序。
+- 9bae84b0 中带 Graph 区域的 op 分三类，都没有次序语义：
+  - 符号容器：builtin.module、gpu.module。
+  - transform 的模式描述：apply_patterns 等 4 个。
+  - scf.forall.in_parallel：唯一可执行的一类。它的 C++ verify 只允许 ParallelCombiningOpInterface op，目的地必须是 forall 的输出块参；重叠写入的结果未定义。
+- 我们没有 A/B 证据证明哪种次序被 MLIR 拒绝，所以按 L33 不拒绝，只判未知并警告。值层本来就不对 Graph 区域的体推导事实。
+
+**判据（structure.graph_order）**
+- Graph 区域，或可能为 Graph 的 '?' 区域（未注册 op、C++ 自定 RegionKindInterface）里，可能有副作用的 op 都判未知。
+- 副作用分类 effect_class 自下而上取 ODS：
+  - NoMemoryEffect / MemoryEffects<[]>（含 Pure）⇒ none
+  - RecursiveMemoryEffects ⇒ 递归看体
+  - DeclareOpInterfaceMethods<MemoryEffectOpInterface>（C++ getEffects，如 linalg.generic）、操作数上的 MemRead/MemWrite、未导入 ⇒ may
+- Symbol/IsolatedFromAbove 的 op 在所在处不执行，豁免：模块里的 func.func 体、gpu.func 的副作用不计入。
+
+**检验**
+- G1 定向 8/8。其中 in_parallel 里放纯 op 时 MLIR 拒绝，我们不拒（这类情况交预言机）。
+- G2 消融：不递归错 1 例，无 Symbol 豁免错 4 例，不看 C++ 接口错 1 例。
+- G3 外部对照：语料 1317 个块（另有 183 个块绑定无法解析，跳过）。每个直接在函数体里、无区域、有结果的 op（每块每个 op 名取 1 个），在原处克隆一份不用的副本，再跑 MLIR canonicalize（贪心驱动只删 wouldOpBeTriviallyDead 的 op）。
+  - 共 207 个 op 名、2415 个实例。
+  - none 删除 2070、none 保留 **0**：分类器没有低估副作用。
+  - may 保留 34、may 删除 311：过近似 17 个 op 名，主要是只读的 load/transfer_read，以及 alloc、tensor 上的 transfer_write。对“次序”而言，读与写之间的次序本来就要计入，所以把只读算作 may 是对的；MLIR 删除只读 op 用的是更弱的“死”概念。
+
+**边界**
+- 无结果的 op 和 recursive 类没有外部对照，只有定向例。
+- in_parallel 内不重叠的 parallel_insert_slice 本来是确定的，我们一律判未知，这是精度代价。
+- “区域种类 '?'”按可能为 Graph 处理，会在 C++ 自定 RegionKindInterface 的 SSACFG 区域里产生多余的未知。
