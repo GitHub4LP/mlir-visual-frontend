@@ -18,7 +18,14 @@ import odsjson as O, odssig as G
 HERE = os.path.dirname(os.path.abspath(__file__))
 CPP = os.path.join(HERE, '..', 'inventory', 'cpp')
 PARENT_RE = re.compile(r'getParentOp\b|getParentOfType\b|getParentRegion\b|getParentWithTrait\b|->getParent\(\)|\.getParent\(\)')
-BODY_RE = re.compile(r'getBody\(|getBlock\(|\bwalk\(|getOps<|getOperations\(|\bfront\(\)|getRegion\(|getRegions\(|getTerminator\(|without_terminator|'
+# 第 51 轮：段不含终结 op，原处换成 func.call 后，祖先体的块结构、块参数、终结 op（及其操作数的值与类型）都不变；
+# 变的只是体内非终结 op 本身。所以只把“读体内 op”的写法算作读体：遍历/取 op、取值的定义 op 或使用者、判体内 op 的副作用。
+# region.front()（入口块）、getBody()（块本身）、getTerminator/back()（终结 op）、getYieldedValues 不算。
+BODY_RE = re.compile(r'\bwalk\s*[<(]|getOps<|getOperations\(|without_terminator|isMemoryEffectFree|isPure\(|hasSingleEffect|wouldOpBeTriviallyDead|'
+                     r'getDefiningOp|getUsers\(|getUses\(|use_begin|user_begin|hasOneUse|use_empty|hasSingleElement|getNumOperations|'
+                     r'for\s*\(\s*(?:auto|Operation|mlir::Operation)\s*[&*]+\s*\w+\s*:|make_early_inc_range|getPrevNode|getNextNode|'
+                     r'(?:[Bb]lock\w*|getBody\(\w*\)|getBlock\(\))\s*(?:\.|->)\s*(?:front|begin)\(\)|->front\(\)')
+BODY_RE_V50 = re.compile(r'getBody\(|getBlock\(|\bwalk\(|getOps<|getOperations\(|\bfront\(\)|getRegion\(|getRegions\(|getTerminator\(|without_terminator|'
                      r'isMemoryEffectFree|isPure\(|hasSingleEffect|getYieldedValues|getBodyRegion|getLoopRegions')
 STOP = {'verify', 'verifyRegions', 'emitOpError', 'emitError', 'success', 'failure', 'isa', 'cast', 'dyn_cast', 'get', 'size', 'getType',
         'getOperation', 'llvm', 'if', 'for', 'while', 'switch', 'return', 'sizeof', 'static_cast', 'reinterpret_cast', 'emitWarning'}
@@ -55,19 +62,23 @@ def index():
             while j < len(s) and d:
                 d += {'{': 1, '}': -1}.get(s[j], 0); j += 1
             body = s[m.end():j]; i = j
-            full.setdefault((pre, name), []).append(body); short.setdefault(name.split('::')[-1], []).append(body)
+            full.setdefault((pre, name), []).append(body); short.setdefault(name.split('::')[-1], []).append((name.split('::')[-2] if '::' in name else '', body))
     return full, short
 
-def _closure(bodies, depth=3):
-    """沿调用闭包展开（按末段名；STOP 与定义过多的名字不跟）。返回（全部文本, 是否有未解析——此处只按体是否为空记）。"""
-    _, short = index(); seen, out, frontier = set(), list(bodies), list(bodies)
+def _closure(bodies, depth=3, own=()):
+    """沿调用闭包展开（按末段名；STOP 与定义过多的名字不跟）。
+    第 51 轮：不跟“别的 op 类”的成员函数（限定名的类部分是某个已导入 op 的 C++ 类、且不是本 op 的类）——
+    那些方法作用于另一个 op，不是本 op 的校验；接口类、detail 命名空间、自由函数照跟。"""
+    _, short = index(); foreign = set(cpp2op()) - set(own); seen, out, frontier = set(), list(bodies), list(bodies)
     for _ in range(depth):
         nxt = []
         for b in frontier:
             for nm in set(re.findall(r'\b((?:[A-Za-z_]\w*::)*[A-Za-z_]\w*)\s*(?:<[^<>;]*>)?\s*\(', b)):
                 k = nm.split('::')[-1]
-                if k in STOP or k in seen or k not in short or len(short[k]) > 3: continue
-                seen.add(k); nxt += short[k]
+                if k in STOP or k in seen or k not in short: continue
+                defs = [bd for q, bd in short[k] if q not in foreign]
+                if not defs or len(defs) > 3: continue
+                seen.add(k); nxt += defs
         out += nxt; frontier = nxt
     return '\n'.join(out)
 
@@ -97,7 +108,7 @@ def checks(op):
             calls = [c.split('::')[-1] for c in re.findall(r'((?:\w+::)*verify\w*|(?:\w+::)*is\w+Impl)\s*\(', code)]
             if calls and not all(c in short for c in calls): unres.append(it)
             bodies.append(code)
-    return _closure(bodies), unres, S['structural']
+    return _closure(bodies, own=(cls,)), unres, S['structural']
 
 def _cls(rec):
     """ODS 记录名 → C++ 类名（tblgen 默认：去掉第一个 '_' 之前的方言前缀）。"""
