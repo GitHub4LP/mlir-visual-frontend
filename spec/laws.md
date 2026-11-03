@@ -21,7 +21,7 @@ A/B 级的“0 分歧”必须同时报告**触发数**（L38）和**送达率**
 | L2 | 复合摘要不能限制到 Pre 上 | 同上 | C | 同上 |
 | L3 | 捕获提升为端口；IsolatedFromAbove 由推导得到 | structure §5、§6.1 | B | 真实 IR 提取 4435 段 MLIR 端口错误 0（第 43 轮算法 8，消融，capture_test）；structure_fuzz 不可靠 0；X2 |
 | L4 | 透明/不透明模式下，自由符号在不同的表里解析 | structure §5 | B（+A） | 解析规则有 Y1 语料作证（symbols.md）；“两种模式语义不同”只有 X6 自证 |
-| L5 | needs_ssacfg 的体不能内联进 Graph 区域 | structure §5 | B | X5 + R7 差分 |
+| L5 | needs_ssacfg（顶层区域多块）的体不能内联进 Graph 区域；Graph 区域与未注册 op 的区域不查支配 | structure §5、§6.2 | B | X5；l5_test：真实 IR 2599 函数 MLIR 一致（第 52 轮），Graph 区域 op 审计 6/6，定向 7/7 |
 | L6 | 复合摘要的 UB 和毒值必须依赖输入毒值 | core-v4 §4 | C | 穷举解释器 900/900。MLIR 没有可执行的毒值语义；外部真值只能用 V2/V3 的方法间接得到（§3） |
 | L7 | 局部分配的 alloc/free/读写不外泄；泄漏只是诊断，不是效应（第 30 轮澄清：“同块”只决定泄漏诊断） | core-v4 §4、effects | B | 第 30 轮 X7：48 个穷举用例对照同一提交 MLIR canonicalize（包进结果不用的 execute_region）。模型判纯的 12 个，MLIR 全部删除，不可靠 0；保守 12 个，全是参数上的只读（MLIR 视不用的读为死代码，模型保留 Read）。变异（丢参数 Free）抓出 12 |
 | L8 | 属性按指称存储 | definitions | B→A | D1 300/300；第 13 轮起属性值就是 MLIR Attribute（L35，A） |

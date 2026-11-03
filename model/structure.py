@@ -38,6 +38,8 @@ class StructSchema:
     pure_graph_ok: bool = True  # 可否出现在 Graph 区域里
     term_op: str = None         # 第 15 轮：SingleBlockImplicitTerminator<X> 的 X（ODS）
     need_term: bool = None      # 第 15 轮：区域块须以终结子结尾（ODS：已导入、非 NoTerminator、无 RegionKindInterface）；None = 未知
+    rkind: str = 'SSACFG'       # 第 52 轮：ODS 导入 op 的区域种类：HasOnlyGraphRegion/GraphRegionNoTerminator ⇒ Graph；
+                                #   C++ 自定 RegionKindInterface 或未导入/未注册 op ⇒ '?'（MLIR mayBeGraphRegion：未注册 op 的区域可能是 Graph，不查支配）
 
 def ssacfg(term, **kw): return RegionSpec(kind='SSACFG', term=term, **kw)
 
@@ -73,8 +75,11 @@ def st(op):
         if it is not None and not any(x in it for x in ('NoTerminator', 'RegionKindInterface')): need = True
         to = SY.implicit_terminator(op)
     except Exception: to = None
-    return StructSchema(op, regions=None, terminator=term, succs=(0, 10 ** 9), need_term=need, term_op=to)
-def region_specs(s, n): return s.regions if s.regions is not None else [RegionSpec(term='?')] * len(n['regions'])
+    try: it = SY.interfaces(op)
+    except Exception: it = None
+    rk = '?' if it is None else 'Graph' if ({'HasOnlyGraphRegion', 'GraphRegionNoTerminator'} & set(it)) else '?' if 'RegionKindInterface' in it else 'SSACFG'
+    return StructSchema(op, regions=None, terminator=term, succs=(0, 10 ** 9), need_term=need, term_op=to, rkind=rk)
+def region_specs(s, n): return s.regions if s.regions is not None else [RegionSpec(term='?', kind=s.rkind)] * len(n['regions'])
 
 # ───────────────────────── 2 图表示
 # Blk  = dict(name, args=[(vid, ty)], ops=[Node])
@@ -272,6 +277,8 @@ def _check_node(n, d, scope_vals, tables, types, path):
             d.add(n['id'], 'R1', f"区域 #{ri} 至多 {rc[ri][1]} 个块")
         elif not rc and spec.single_block and len(blocks) > 1:
             d.add(n['id'], 'R1', f"区域 #{ri} 只允许一个块")
+        if spec.kind == 'Graph' and len(blocks) > 1:            # 第 52 轮：MLIR Verifier.cpp verifyOnEntrance——已注册 op 的 Graph 区域须 0 或 1 块（与 SingleBlock 无关）
+            d.add(n['id'], 'R7', f"Graph 区域 #{ri} 有 {len(blocks)} 个块（至多 1 个）")
         names = {b['name'] for b in blocks}
         inner_defs = _defs_of(blocks)
         inner_types = dict(types); _types_of(blocks, inner_types, deep=False)
@@ -299,7 +306,7 @@ def _check_node(n, d, scope_vals, tables, types, path):
                 if not (os_.succs[0] <= len(o['succs']) <= os_.succs[1]):
                     d.add(o['id'], 'R3', f"{o['op']} 需要 {os_.succs} 个后继，给了 {len(o['succs'])}")
                 if o['succs']: CHECKED['R3'] += 1
-                if o['succs'] and spec.kind != 'SSACFG':
+                if o['succs'] and spec.kind == 'Graph':
                     d.add(o['id'], 'R7', "Graph 区域里不允许块间跳转")
                 for si, (sn, sargs) in enumerate(o['succs']):
                     if sn not in names:
@@ -425,7 +432,15 @@ def derive_struct(blocks):
                 nreg += len(n['regions'])
                 for r in n['regions']: walk(r, set() if any(x.isolated for x in (st(n['op']).regions or [])) else here)
     walk(blocks, set())
-    return StructSummary(caps, syms, jumps, len(blocks) > 1, not caps, nreg)
+    # 第 52 轮：needs_ssacfg 只看顶层区域是否多块。MLIR 对 Graph 区域的要求是“0 或 1 块”（Verifier.cpp）；
+    # 嵌套区域里的跳转属于嵌套 op 自己的区域，内联后种类不变；单块区域不可能有顶层跳转（入口块不能有前驱）。
+    # 旧判据“体内任何处有后继”既误报（嵌套 cf）又漏报（无跳转的不可达块）——见 l5_test 消融。
+    return StructSummary(caps, syms, len(blocks) > 1, len(blocks) > 1, not caps, nreg)
+
+def needs_ssacfg_v51(blocks):
+    """第 51 轮及以前的判据（消融用）：体内任何处有带后继的 op。"""
+    def any_succ(bs): return any(n['succs'] or any(any_succ(r) for r in n['regions']) for b in bs for n in b['ops'])
+    return any_succ(blocks)
 
 # ───────────────────────── 5 发射 MLIR（通用形式，便于差分测试）
 
