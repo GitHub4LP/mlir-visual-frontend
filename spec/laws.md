@@ -74,7 +74,7 @@ A/B 级的“0 分歧”必须同时报告**触发数**（L38）和**送达率**
 | L52 | MLIR 变换作真值时须有 JIT 对照；误编译的变换记入 MLIR 缺陷账 | values | A | V9：index CmpOp::canonicalize 对 8 个谓词错误 |
 | L53 | 导入即审计：真实 IR 进入值层前，每个 MLIR 属性须被翻译（带条件）或登记为无关，否则 ⇒ 未知；值层对任何导入不崩溃 | values §8 | A | A2 语料 1036/1036、A3 切片 1322/1322 vs JIT；变异可抓出；修前 tensor 切片/0 维/逐元素 cast/i0 崩溃 |
 | L54 | 名字即语义身份：按名字共享（或按键缓存）的项，名字须单射编码全部语义来源（含全局语义开关）；冲突拒绝、不覆盖 | names | B | 第 26–28 轮清点出 8 个不可靠缺陷（循环摘要参数、洞×2、端口重名、原生覆盖、Schema 跨开关、Workspace 键漏开关、ADT 同名合并），其中 3 个有 JIT 反例见证；names N1–N7、loopsum U0–U3 回归 |
-| L55 | 管线白名单：⟦·⟧ 的 pass 管线只能取在钉定提交上经差分检验、0 偏离且不产生非法 IR 的 pass；不在白名单里的 pass 一律不用 | values §15 | B | 第 56 轮 pipezoo：15 条管线，800 个程序（不透明复合调用加毒值、scf.for），基线确定值 1992，模型反例 0。13 条管线偏离 0；scf-for-loop-peeling 在 lb > ub 时偏离 11（MLIR 缺陷，upstream main 已修）；remove-dead-values 在 245/800 个程序上产生空操作数的 func.call |
+| L55 | 管线白名单：⟦·⟧ 的 pass 管线只能取在钉定提交上经差分检验、0 偏离且不产生非法 IR 的 pass；不在白名单里的 pass 一律不用 | values §15 | B | 第 56 轮 pipezoo：15 条管线，800 个程序（不透明复合调用加毒值、scf.for），基线确定值 1992，模型反例 0。13 条管线偏离 0；scf-for-loop-peeling 在 lb > ub 时偏离 11（MLIR 缺陷，upstream main 已修）；remove-dead-values 在 245/800 个程序上产生空操作数的 func.call。第 58 轮浮点族（floatzoo，584 个程序，基线 3125，模型反例 0）：11 条管线 0 偏离；arith-expand 的 maximumf/minimumf 不保号；math-expand-ops 的 ceil 越界错误、fma 不再融合。白名单按程序族成立（values §15.1） |
 | L56 | Graph 区域无执行次序：可能有副作用的 op（ODS 自下而上：NoMemoryEffect/MemoryEffects<[]> ⇒ 无；RecursiveMemoryEffects ⇒ 看体；其余过近似为可能有；Symbol/IsolatedFromAbove 在所在处不执行）落在 Graph 区域（或可能为 Graph 的区域）⇒ 未知并警告，不拒绝 | structure §6.3 | B | 第 57 轮 graphorder_test：定向 8/8，3 项消融各错 ≥1；副作用分类与 MLIR canonicalize 死代码删除对照，207 个 op 名、2415 个实例，判 none 而 MLIR 保留 0，过近似 17 个 op 名 |
 
 **分布**（46 行，含新增的 L17″；L34a/b、L36a/b 各算一行）：A 12、B 10、C 14、D 8，已否定 2（L17′、L32）。一条律有两级时，按主要证据计。
