@@ -586,3 +586,71 @@ if __name__ == '__main__':
             blk('y', [ret(ins=['c'])])]
     s = derive_struct(body)
     print(f'捕获={s.captures} 自由符号={s.free_syms} 需要SSACFG={s.needs_ssacfg} 多块={s.multi_block} 可声明隔离={s.isolated_ok}')
+
+# ───────────────────────── 第 57 轮：Graph 区域里的副作用次序（L56）
+# Graph 区域没有执行次序（LangRef “Graph regions”：op 的次序不承载语义）。体内有副作用的 op 内联进去以后，
+# 谁先执行，MLIR 不规定；9bae84b0 中唯一可执行的 Graph 区域 scf.forall.in_parallel 也只说“重叠写入的结果未定义”。
+# 所以：Graph 区域中（直接或经 RecursiveMemoryEffects 嵌套）可能有副作用的 op ⇒ 未知并警告，从不拒绝（无 A/B 拒绝证据，L33）。
+# 副作用分类自下而上取 ODS：NoMemoryEffect / MemoryEffects<[]>（含 Pure）⇒ 无；RecursiveMemoryEffects ⇒ 看体；
+# 其它（操作数上的 MemRead/MemWrite 修饰、C++ 实现的 MemoryEffectOpInterface、未导入）⇒ 可能有（过近似，只影响精度）。
+# Symbol / IsolatedFromAbove 的 op（func.func、gpu.func、memref.global…）在所在处不执行，体内副作用不计入。
+def effect_class(op):
+    """'none' | 'recursive' | 'may'（只读 ODS trait 表，不读操作数修饰：读不到 ⇒ 'may'）。"""
+    try:
+        import odsjson as O
+        dia = op.split('.')[0]
+        if dia not in O.DIALECTS or op not in O.ops(dia): return 'may'
+        d = O.records(dia); seen = set(); found = set()
+        def walk(t):
+            nm = O.ref(t)
+            if nm in seen: return
+            seen.add(nm); x = d.get(nm)
+            if not isinstance(x, dict): return
+            sc = x.get('!superclasses') or []
+            if 'TraitList' in sc:
+                for u in x.get('traits') or []: walk(u)
+                return
+            if 'MemoryEffects' in sc: found.add('none' if not (x.get('effects') or []) else 'may')
+            elif x.get('cppInterfaceName') == 'MemoryEffectOpInterface': found.add('may')   # C++ getEffects（如 linalg.generic）：读不到 ⇒ 可能有
+            elif nm == 'RecursiveMemoryEffects': found.add('recursive')
+        for t in d[O.ops(dia)[op]].get('traits', []): walk(t)
+        if 'may' in found: return 'may'
+        if 'recursive' in found: return 'recursive'
+        return 'none' if 'none' in found else 'may'
+    except Exception: return 'may'
+
+def _not_executed_here(op):
+    try:
+        import symtab as SY
+        it = set(SY.interfaces(op) or ())
+    except Exception: it = set()
+    return bool(it & {'Symbol', 'SymbolOpInterface', 'IsolatedFromAbove'}) or op in ('func.func', 'builtin.module')
+
+def may_effect(n):
+    """节点在所在处执行时可能有副作用 ⇒ 返回首个原因（op 名），否则 None。"""
+    if _not_executed_here(n['op']): return None
+    c = effect_class(n['op'])
+    if c == 'may': return n['op']
+    if c == 'recursive':
+        for r in n['regions']:
+            for b in r:
+                for x in b['ops']:
+                    w = may_effect(x)
+                    if w: return w
+    return None
+
+def graph_order(root):
+    """遍历全图：Graph 区域（含未注册/C++ 自定种类的 '?' 区域，按可能为 Graph 处理）里可能有副作用的 op。
+    返回 [(节点 id, op, 原因 op, 区域种类)]——结论是“未知：执行次序未定义”，不是拒绝。"""
+    out = []
+    def walk(n):
+        s = st(n['op'])
+        for blocks, spec in zip(n['regions'], region_specs(s, n)):
+            for b in blocks:
+                for x in b['ops']:
+                    if spec.kind in ('Graph', '?'):
+                        w = may_effect(x)
+                        if w: out.append((x['id'], x['op'], w, spec.kind))
+                    walk(x)
+    walk(root)
+    return out
