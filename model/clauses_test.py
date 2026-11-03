@@ -69,7 +69,7 @@ def k6():
     orig = rd; muts = [
         ('删规范编号', 'spec/frontend-model.md', '〔M3.5〕', ''),
         ('坏标记', 'spec/clauses.md', 'floatjit_test:F1 浮点定向', 'floatjit_test:F9 不存在'),
-        ('C 级撑 A', 'spec/clauses.md', '| L7 | B | 检验 |', '| L6 | B | 检验 |'),
+        ('C 级撑 A', 'spec/clauses.md', '| L7 | B | 检验 |', '| L21 | B | 检验 |'),   # 第 53 轮：L6 升 B，改用 L21（C）
         ('非法状态', 'spec/clauses.md', '| B | 检验 | R5 21971/0 不符 |', '| B | 已完成 | R5 21971/0 不符 |'),
         ('漏引定律', 'spec/clauses.md', '| L11, L12 |', '| L11 |')]
     got = 0
