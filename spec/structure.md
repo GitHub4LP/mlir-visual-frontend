@@ -95,6 +95,12 @@ Schema v3 只描述端口、类型、语义和效应，没有覆盖 MLIR 的结�
 4. 改名和改签名是带扇出的变换，必须通过反向索引原子地完成（MLIR 的 SymbolTable::replaceAllSymbolUses 的前端版）。
 
 ## 8 未覆盖（下一步）
-- 提取的上下文约束：第 50 轮已覆盖（14/14 预先指出，只到未知级；HasParent 有拒绝权）。精度缺口：MLIR 接受的段中 11.6% 被判未知，需要更细的校验语义（例如只读区域参数/yield 类型的父校验）。
+- 提取的上下文约束：第 50 轮已覆盖（14/14 预先指出，只到未知级；HasParent 有拒绝权）。
+
+**第 51 轮（精度）**：第 50 轮的 513 个未知段按原因拆开，412 个来自“祖先校验读体”，而其中绝大多数只是取入口块（`getRegion().front()`）、块参数或终结 op。段不含终结 op，原处换成 func.call 后，祖先看到的块结构、块参数、终结 op 及其操作数都不变，变的只有体内的非终结 op。所以“读体”收窄为读体内 op 的写法：遍历 op（walk、getOps、getOperations、范围 for）、取值的定义 op 或使用者、判体内 op 的副作用、块的 front/begin。调用闭包也不再跟“别的 op 类”的成员函数（作用于另一个 op，不属于本 op 的校验），接口类、detail 命名空间与自由函数照跟。
+- 调参集（前 1500 个函数，4435 段）：未知 513 → 102（2.3%），14/14 仍预先指出，误拒 0，判 ok 4319 段中 MLIR 失败 0。
+- 留出集（之后 1116 个函数，3345 段，未参与收窄）：P3 172 段全部判未知（多为 vector.mask 内的 transfer_read/write：子 op 读父，以及 vector.mask 读体），判 ok 漏 0，误拒 0，P1 未知 30/3173（0.9%）。检验 C6。
+- 余下的未知大多是真依赖：affine.* 要求 AffineScope 祖先（维度/符号合法性），vector.transfer_* 在 vector.mask 内。属于噪声的主要是 scf.for 的 24 段（getForInductionVarOwner 读的是块参数属主，即 for 自己，文本扫描分不出）。
+- 仍是文本过近似，不是校验语义的证明；只产生未知，不拒绝。
 - L5（needs_ssacfg）的外部证据仍只有定向 X5。
 attribute/property 的类型和约束；interface（作为 Schema 上的能力谓词）；用户类型（ADT）；方言扩展；rewrite/pass 作为带契约的图变换。
