@@ -22,7 +22,7 @@
 | M1.3 | 类型签名：自动签名；复合由有拒绝权的层判定 | odssig、composite | odssig_test:L1 差分; odsdiff_test:T1 odssig vs; compsig_test:C1 Φ ≡ 体 ≡ MLIR; compsig_test:C3 端口投影 | L25, L27, L28, L29, L46, L47 | A | 检验 | |
 | M1.4 | 属性：ODS 值域；复合参数约束 = 使用点合取 | attrsig、defs | attrsig_test:A2 变异差分; defs_test:D1 attribute; defs_test:D3 | L8, L9, L10, L34a/b, L35 | B | 部分 | L10 只有 D3 16/16，样本小 |
 | M1.5 | declared 义务只由预言机裁决 | oracle、modular | modular_test:M2 体级预言机; modular_test:M3 单元级预言机 | L40, L43, L44 | A | 检验 | 残差 580 例全部归因 |
-| M1.6 | 值层 Sem/UB/Poison；复合摘要推导 | core、valimport | sem_test:V1 无标志程序; values_test:V5 JIT; loop_test:W2 与 MLIR 执行; adtjit_test:A11 L11 | L6, L17″, L49 | C | 部分 | 原生子集有 B/A；复合摘要的毒值依赖 L6 仍 C |
+| M1.6 | 值层 Sem/UB/Poison；复合摘要推导 | core、valimport | sem_test:V1 无标志程序; values_test:V5 JIT; loop_test:W2 与 MLIR 执行; adtjit_test:A11 L11; poison_test:P1 毒值实参的确定值 vs JIT; poison_test:P2 消融灵敏度 | L6, L17″, L49 | B | 检验 | 原生子集 B/A；复合摘要的毒值依赖（L6）第 53 轮外部化：毒值实参下确定值 614/614 与 JIT 一致（可达结果 100），消融 O3 反例 328。毒值/UB 方向不可测（精化自由度）；浮点、tensor 的毒值未外部化 |
 | M1.7 | 效应 compose_eff | core | effects_test:X7 L7 效应组合 | L7 | B | 检验 | 48 例，不可靠 0 |
 | M1.8 | caps 由字段派生（对降低后的 MLIR，含守卫与 L22 义务） | core.caps、gspec、义务传播 | caps_test:C1：原生 op; caps_test:C3：义务经复合 op 调用传播; caps_test:C4：MLIR 判 Pure; defs_test:caps= | — | B | 检验 | 第 39 轮：113 原生实例 一致 98/保守 15/宽松 0；保守中 remui/remsi 经 JIT A/B 证实 MLIR 错（上游已修）；C3 变异可抓 |
 | M1.9 | 复合与原生同构；声明只收窄且检查 | core、composite | compsig_test:C6 定义期可实例化; core_test:T2 跨层组合律 | L25, L46 | A | 检验 | |
@@ -44,7 +44,7 @@
 | M3.6 | math 精确子集 | core math 节 | floatjit_test:MUN = | — | B | 检验 | 混入 F1（第 47 轮：verdict 要求含 math 的已执行函数 > 0，默认 n=200 为 81/197，且 F1 不一致 0；math 例仍与 F1 共用逐输出比较，不单独分 op 计）；isinf/isnormal 无降低 |
 | M3.7 | 精化判据；MLIR 变换作真值须有 JIT | core.refines | sem_test:V2 MLIR canonicalize; values_test:V7 scf + sccp; values_test:V9 index 方言 cmp | L52 | A | 检验 | |
 | M3.8 | 循环摘要、不变式、越界步进 UB | core 循环节 | loopsum_test:U0 复合 op 参数; loop_test:W6 L19 JIT; loop_test:W6 归纳变量越界; loopjit_test:L1 生成器; loopjit_test:L3 trip_count; derivecost_test:D4 全局预算回退摘要; derivecost_test:D5 预算耗尽判未知 | L13, L18′, L19, L53 | B | 检验 | 第 41 轮：iN 界补越界 UB、unsignedCmp 开放；JIT 211/211（8 种类型×比较方式），trip_count 45/45 有事实 |
-| M3.9 | ADT 降级与接口定律 | defs、core | adtjit_test:A11 L11; l12jit_test:L12 接口定律方向 | L11, L12 | B | 部分 | 毒值层依赖 L6（C） |
+| M3.9 | ADT 降级与接口定律 | defs、core | adtjit_test:A11 L11; l12jit_test:L12 接口定律方向 | L11, L12 | B | 部分 | L6 已为 B（第 53 轮，整数 arith + select），但 ADT 降级后的毒值层未外部化 |
 | M4.1 | 放置节点：connectable 补全 | odssig | odssig_test:L1 差分 | L29, L37 | A | 检验 | 精确性由 L36b/L29 推出 |
 | M4.2 | 连边/填洞 = 项代换（摘要体内重推导） | edit、core | edit_test:E2 L20 连接洞; names_test:N1c 洞在循环摘要内 | L20′ | C | 元理论 | 内部一致性：真值按定义是全量重推导 |
 | M4.3 | 改参数：属性层 | attrsig | attrsig_test:A2 变异差分 | L34a/b | A | 检验 | |
