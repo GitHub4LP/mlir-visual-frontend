@@ -15,7 +15,7 @@ import mlir.ir as ir
 import irimport as I, attrsig as A, verdict as V
 
 SYM = ('sym_name', 'sym_visibility')
-SKIP = collections.Counter()
+SKIP = collections.Counter(); RESID = collections.Counter()   # E2 精度缺口：我们收而 MLIR 拒，按 (op, 属性)
 def is_sym(name, cons): return name in SYM or 'SymbolRef' in (cons or '') or 'SymbolName' in (cons or '')
 
 def _walk(op):
@@ -34,7 +34,8 @@ def sites(m):
         for na in o.attributes:
             k = na if isinstance(na, str) else na.name
             if k in names:
-                try: out.append((i, o.name, k, names[k]['cons'], str(o.attributes[k])))
+                try: out.append((i, o.name, k, names[k]['cons'], str(o.attributes[k]),
+                                 tuple(str(x.type) for x in o.operands), tuple(str(x.type) for x in o.results)))
                 except Exception: SKIP['绑定无法取属性'] += 1     # 绑定对部分 dense 属性（complex 元素）抛 TypeError
     return out
 
@@ -58,8 +59,8 @@ def chunk_job(ch, groups):
     out = []
     for ss, cands in groups:
         for v in cands:
-            single = [_verify(ch, [(i, nm, v)]) for i, _, nm, _, _ in ss]
-            allv = _verify(ch, [(i, nm, v) for i, _, nm, _, _ in ss])
+            single = [_verify(ch, [(i, nm, v)]) for i, _, nm, *_ in ss]
+            allv = _verify(ch, [(i, nm, v) for i, _, nm, *_ in ss])
             out.append((allv, single, v, ss[0][3], ss[0][2]))
     return out
 
@@ -126,6 +127,17 @@ def run(lim, seed=59, gmax=4, ncand=6):
                 st[f'{layer}/E1 违例'] += 1; note(f'{layer} E1 违例', (cons, nm, v[:60], allv, single))
     return st, ex, data
 
+def ours_rejects(s, v):
+    """使用点约束 = 属性自身的 ODS 约束（attrsig.check，只看被替换的属性；其余必需属性此处未提供）
+    + 引用该属性的 op 级关系（attrsig.rel_check，对照使用点的操作数/结果类型）。第 59 轮二跑：首跑只用前者，低估精度。"""
+    import typesig as TS
+    if any(x[0] == s[2] for x in A.check(s[1], {s[2]: v})): return True
+    try: ins = [TS.parse(t) for t in s[5]]; outs = [TS.parse(t) for t in s[6]]
+    except Exception: return False
+    if None in ins or None in outs: return False
+    try: return bool(A.rel_check(s[1], {s[2]: v}, ins, outs))
+    except Exception: return False
+
 def E2(data, lim_cases=4000, seed=59):
     """我们的合取 vs MLIR：在 E1 的同一类用例上，attrsig.check 逐点求值。只需判拒 ⇒ MLIR 拒（误拒 0）。"""
     rng = random.Random(seed + 1)
@@ -143,7 +155,7 @@ def E2(data, lim_cases=4000, seed=59):
             g = g[:4]
             cands = sorted(pool[cons])[:3] + [rng.choice(sorted(pool[rng.choice(allcons)])) for _ in range(3)]
             for v in cands:
-                rej = any(x[0] == s[2] for s in g for x in A.check(s[1], {s[2]: v}))   # 只看被替换的属性（其余必需属性此处未提供）
+                rej = any(ours_rejects(s, v) for s in g)
                 jobs.append((ch, g, v, rej))
     jobs = jobs[:lim_cases]
     bych = collections.defaultdict(list)
@@ -156,6 +168,7 @@ def E2(data, lim_cases=4000, seed=59):
             st['用例'] += 1
             st[f'我们{"拒" if rej else "收"}/MLIR{"收" if ok else "拒"}'] += 1
             if rej and ok: ex.append((g[0][1], g[0][2], v[:60]))
+            if not rej and not ok: RESID[(g[0][1], g[0][2])] += 1
     return st, ex
 
 if __name__ == '__main__':
@@ -168,6 +181,7 @@ if __name__ == '__main__':
             f"符号层（单列）：用例 {st['符号/用例']}，违例 {st['符号/E1 违例']}")
     s2, ex2 = E2(data)
     print('E2', dict(sorted(s2.items())), ex2[:6])
+    print('E2 精度缺口按 (op, 属性)', RESID.most_common(12))
     V.check('E2 我们的合取不误拒', s2['用例'] >= 1000 and s2['我们拒/MLIR收'] == 0,
             f"用例 {s2['用例']}：我们拒且 MLIR 拒 {s2['我们拒/MLIR拒']}，我们收且 MLIR 拒 {s2['我们收/MLIR拒']}（精度缺口：关系约束、C++ verify），我们收 MLIR 收 {s2['我们收/MLIR收']}，误拒 {s2['我们拒/MLIR收']}")
     V.finish()
