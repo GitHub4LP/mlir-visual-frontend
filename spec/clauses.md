@@ -22,7 +22,7 @@
 | M1.3 | 类型签名：自动签名；复合由有拒绝权的层判定 | odssig、composite | odssig_test:L1 差分; odsdiff_test:T1 odssig vs; compsig_test:C1 Φ ≡ 体 ≡ MLIR; compsig_test:C3 端口投影 | L25, L27, L28, L29, L46, L47 | A | 检验 | |
 | M1.4 | 属性：ODS 值域；复合参数约束 = 使用点合取 | attrsig、defs | attrsig_test:A2 变异差分; defs_test:D1 attribute; defs_test:D3 | L8, L9, L10, L34a/b, L35 | B | 部分 | L10 只有 D3 16/16，样本小 |
 | M1.5 | declared 义务只由预言机裁决 | oracle、modular | modular_test:M2 体级预言机; modular_test:M3 单元级预言机 | L40, L43, L44 | A | 检验 | 残差 580 例全部归因 |
-| M1.6 | 值层 Sem/UB/Poison；复合摘要推导 | core、valimport | sem_test:V1 无标志程序; values_test:V5 JIT; loop_test:W2 与 MLIR 执行; adtjit_test:A11 L11; poison_test:P1 毒值实参的确定值 vs JIT; poison_test:P2 消融灵敏度 | L6, L17″, L49 | B | 检验 | 原生子集 B/A；复合摘要的毒值依赖（L6）第 53 轮外部化：毒值实参下确定值 614/614 与 JIT 一致（可达结果 100），消融 O3 反例 328。毒值/UB 方向不可测（精化自由度）；浮点、tensor 的毒值未外部化 |
+| M1.6 | 值层 Sem/UB/Poison；复合摘要推导 | core、valimport | sem_test:V1 无标志程序; values_test:V5 JIT; loop_test:W2 与 MLIR 执行; adtjit_test:A11 L11; poison_test:P1 毒值实参的确定值 vs JIT; poison_test:P2 消融灵敏度; poison_test:P3 依赖数据的毒值来源 | L6, L17″, L49 | B | 检验 | 原生子集 B/A；复合摘要的毒值依赖（L6）第 53 轮外部化：毒值实参下确定值 614/614 与 JIT 一致（可达结果 100），消融 O3 反例 328；第 54 轮扩到五种依赖数据的毒值来源，确定值 3748/3748（确为毒值且可达 224），首跑 shrui_exact 样本不足 FAIL，新样本 PASS。毒值/UB 方向不可测（精化自由度）；浮点、tensor 的毒值未外部化 |
 | M1.7 | 效应 compose_eff | core | effects_test:X7 L7 效应组合 | L7 | B | 检验 | 48 例，不可靠 0 |
 | M1.8 | caps 由字段派生（对降低后的 MLIR，含守卫与 L22 义务） | core.caps、gspec、义务传播 | caps_test:C1：原生 op; caps_test:C3：义务经复合 op 调用传播; caps_test:C4：MLIR 判 Pure; defs_test:caps= | — | B | 检验 | 第 39 轮：113 原生实例 一致 98/保守 15/宽松 0；保守中 remui/remsi 经 JIT A/B 证实 MLIR 错（上游已修）；C3 变异可抓 |
 | M1.9 | 复合与原生同构；声明只收窄且检查 | core、composite | compsig_test:C6 定义期可实例化; core_test:T2 跨层组合律 | L25, L46 | A | 检验 | |
