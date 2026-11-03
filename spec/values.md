@@ -435,3 +435,38 @@ L11 的数据精化含毒值子句：¬P_A ⇒ ¬P_L ∧ abs(out_L) = out_A。A1
 **发现（精度，不影响可靠性）**：抽象层里 `option.some(毒值)` 整体是毒值，所以 `is_some(some(毒值))` 也是毒值；降级后 tag 是常量 1，结果确定。也就是说，抽象层比 MLIR 更“毒”，方向可靠，代价是精度。
 
 **边界**：只覆盖 option 一种 ADT；L12 的接口定律方向没有在毒值输入下单独检验；“抽象输入含毒值”的计数没有排除未使用的输入。
+
+## 15 第 56 轮：管线白名单差分（model/pipezoo_test.py，M5.1，L55）
+
+判据：Sem(g) ⊑ Sem(pipeline(⟦g⟧))。在模型给出确定值的输入上，经管线 P、再接标准降低之后的 JIT 结果必须等于这个值。
+
+**程序族**
+- **A**：复合 op 以不透明方式落地（func + func.call，M5.2），调用方随机注入 poison_test 的六种毒值来源，也可能不注入。
+- **B**：loop_test.gen 生成的程序，含 i8/i32/i64/index、类型转换、select、静态 scf.for（含嵌套）。
+
+**执行与归因**：每个程序在 fork 子进程里跑完全部管线。归因按 L52 分三类：
+- 模型反例：基线 JIT 与模型确定值不同。
+- 变换偏离：基线与模型一致，管线后不同。
+- 管线失败：单列，不计入分母。
+
+管线清单与阈值都在运行前写定。
+
+**结果**：两族各 400 个程序，基线确定值 1992，模型反例 0（Z0 PASS）。
+
+| 管线 | 程序 | 确定值 | 偏离 | 失败 |
+|---|---|---|---|---|
+| inline、canonicalize、cse、sccp、loop-invariant-code-motion、control-flow-sink、symbol-dce、scf-for-loop-canonicalization、scf-for-loop-specialization、int-range-optimizations、arith-unsigned-when-equivalent、arith-expand、组合（inline,canonicalize,cse,sccp,LICM,canonicalize） | 各 800 | 各 1992 | 0 | 0 |
+| scf-for-loop-peeling | 800 | 1992 | **11**（基线 O3 也与模型一致：11/11） | 0 |
+| remove-dead-values | 555 | 1633 | 0 | **245** |
+
+**MLIR 缺陷账（只记录，不提 upstream）**
+- **scf-for-loop-peeling（向后剥离）**：拆分点为 ub − ((ub − lb) mod step)。当 lb > ub 时，这个点落到 lb 之下，于是本应为空的循环被剥出一次迭代并执行。最小例：lb=2、ub=1、step=2，执行后 10 → 11；peel-front 不受影响（Z2）。upstream main 的 peelForLoop 已改为 ub − ((ub − min(lb, ub)) remui step)，并在常量 ub ≤ lb 时直接放弃剥离，所以该缺陷在 9bae84b0 之后已修。
+- **remove-dead-values**：调用方把实参传给公开 callee，callee 不使用该参数时，这个 pass 会删掉调用方里实参的定义，留下操作数为空的 func.call，于是 pass 失败，报 "null operand found"（Z3 最小例）。upstream 现状未查。
+
+**白名单（9bae84b0，对上述程序族）**：上表中偏离为 0 的 13 条管线，加上 bufferize、scf→cf、作用域降低三条。peeling 与 remove-dead-values 不在白名单内。
+
+**边界**
+- 程序族不含 tensor、memref、浮点和多块 cf。
+- 每个程序只取 4 个输入。
+- peeling 的偏离只在 B 族出现，因为只有 B 族含 scf.for。
+- 白名单只对已检验的程序族成立；扩到新程序族要重新做差分。
