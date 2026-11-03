@@ -470,3 +470,43 @@ L11 的数据精化含毒值子句：¬P_A ⇒ ¬P_L ∧ abs(out_L) = out_A。A1
 - 每个程序只取 4 个输入。
 - peeling 的偏离只在 B 族出现，因为只有 B 族含 scf.for。
 - 白名单只对已检验的程序族成立；扩到新程序族要重新做差分。
+
+### 15.1 第 58 轮：浮点程序族（model/floatzoo_test.py）
+
+**程序族 F**：floatjit_test.gen，类型为 f16、bf16、f32、f64。包含：
+- arith 二元运算、negf、cmpf+select
+- math 一元运算、fma、isnan、isfinite
+- 常量、extf/truncf、fptosi/fptoui 经整数 math 再 sitofp/uitofp
+- fastmath 随机取 none、nnan、ninf
+
+比较方法同 floatjit：NaN 只比“是否为 NaN”，其余逐位比较。
+
+**排除（运行前写定）**：含 `sitofp i32/i64 → f16` 的程序共 16 个，不计入。本机为 aarch64，LLVM f16 误编译（35b）会污染基线。
+
+**管线**：14 条，清单运行前写定。除通用 pass 外，新增 arith-expand（两种选项）、math-expand-ops、math-uplift-to-fma、arith-emulate-unsupported-floats（bf16/f16 经 f32）。
+
+**阈值（运行前写定）**：FZ0 基线比较 ≥ 1500 且模型反例 0；FZ1 每条管线 ≥ 300 个程序，偏离全部可归因。
+
+**结果**：600 个程序，执行 584 个，基线比较 3125，模型反例 0。FZ0、FZ1 均 PASS。
+- 11 条管线 0 偏离：inline、canonicalize、cse、sccp、LICM、control-flow-sink、symbol-dce、int-range-optimizations、math-uplift-to-fma、arith-emulate-unsupported-floats、组合管线。
+- arith-expand（两种选项）偏离各 1。
+- math-expand-ops 偏离 15。
+- 所有偏离的基线 O0 与 O3 都与模型一致，归因于 MLIR 变换。
+
+**MLIR 缺陷账（9bae84b0；只记录，不提 upstream）**
+
+FZ2 为首跑之后补的定向检验，非预注册，5/5 通过。
+- **arith-expand 的 maximumf/minimumf 展开不区分 ±0**：展开式为 `select(cmpf ugt/ult, lhs, rhs)` 再处理 NaN。ODS 文档写明 maximumf “把 -0.0 视为小于 +0.0”，但展开后 maximumf(+0,−0) 得到 −0，minimumf(−0,+0) 得到 +0。错误与操作数次序有关，所以随机程序里很少触发（1/3125）。upstream main 的同一段代码未变。
+- **math-expand-ops 的 ceil 展开经 fptosi i64**：|x| ≥ 2^63、±Inf、NaN 时结果错误，例如 ceil(1e300) 和 ceil(+Inf) 都得到 2^63。upstream main 已重写 convertCeilOp，是否修复未逐例验证。
+- **math-expand-ops 的 fma 展开为 mulf+addf**：不再融合，舍入不同。例如 fma(1+2⁻⁵², 1−2⁻⁵¹, −1) 应为 −2⁻¹⁰⁴，展开后得到 0。这改变了 math.fma 的语义；upstream main 未变。
+
+**L55 白名单按程序族细化**
+- arith-expand 对整数族（第 56 轮）可用；对含 maximumf/minimumf 的浮点程序不可用。
+- math-expand-ops 不可用。
+- 其余 11 条对浮点族可用。
+- 前端如需展开浮点 max/min，必须自带保号的展开，不能依赖 arith-expand。
+
+**边界**
+- 浮点族不含 tensor、memref、控制流和超越函数（exp、log 等仍判未知）。
+- 每个程序 6 个输入。
+- math-uplift-to-fma 只在带 contract 标志时改写，生成器从不产生 contract，因此这条管线的 0 偏离是空检验，不能据此宣称可用。
