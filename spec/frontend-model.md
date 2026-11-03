@@ -27,7 +27,7 @@
 | 类型签名 | 端口约束 Pred 树、多态签名 | tblgen JSON 自动签名（L28/L29） | 有拒绝权的层逐节点判定（L25/L46/L47）；compsig 的符号 Φ 只用于呈现与端口投影（L27） | A / A | M1.3 |
 | 属性 | 参数值域、必需性 | ODS 导入，值是 MLIR Attribute（L34、L35） | 使用点约束的合取（L10） | A / B | M1.4 |
 | declared 义务 | C++ verify、开放接口、区域分支边 | 只有预言机能裁决（L43、L44） | 透明内联后交预言机 | A | M1.5 |
-| 值层 | Sem / UB / Poison | 人工覆盖层，经 JIT 差分审计（§3） | 推导（L6） | B（原生，§3 所列子集）/ C（复合摘要的毒值依赖） | M1.6 |
+| 值层 | Sem / UB / Poison | 人工覆盖层，经 JIT 差分审计（§3） | 推导（L6） | B（原生，§3 所列子集；复合摘要的毒值依赖第 53 轮升 B，只限确定值方向） | M1.6 |
 | 效应 | MemoryEffects 三元组 | ODS | compose_eff（L7） | B | M1.7 |
 | caps | Speculatable、Pure 等 | 由上面各字段派生，不单独声明；对降低后的 MLIR 而言（含守卫与 L22 义务） | 同左 | B | M1.8 |
 
@@ -57,7 +57,7 @@
 - 〔M3.6〕**math**：只登记降到正确舍入或精确 LLVM 内建的子集（absf、ceil/floor/trunc/round/roundeven、sqrt、fma、isnan、isfinite、absi、ctlz/cttz/ctpop）；超越函数、copysign、fpowi、isinf/isnormal 判未知（values §11）。
 - 〔M3.7〕**精化判据**：src 不 UB ⇒ tgt 不 UB；src 非毒值 ⇒ tgt 值相同且非毒值。改写、fold、降级都用这同一个判据；外部校准是 MLIR 自己的变换（canonicalize、int-range-optimizations、sccp）在模型下必须是精化，且该变换本身要有 JIT 对照（L52）。
 - 〔M3.8〕**循环**：摘要名 = 结构 + 语义开关，体内参数与捕获值都是实参（L18′）；不变式先做归纳检查，再作为公理（L19）；scf.for 越界步进是 UB（loops §8）。
-- 〔M3.9〕**用户 ADT 与接口定律**：ADT 降级正确性 = 抽象函数下的精化（L11）；接口定律是定向精化（L12，值层）。毒值层的结论依赖 L6（C），前端不得只凭毒值层结论做变换。
+- 〔M3.9〕**用户 ADT 与接口定律**：ADT 降级正确性 = 抽象函数下的精化（L11）；接口定律是定向精化（L12，值层）。毒值层：L6 第 53 轮升 B，但只检验了“确定值”方向（整数 arith + select），ADT 降级后的毒值层未外部化；前端不得只凭“此处是毒值/UB”的结论做变换。
 
 ## 4 前端动作表（判据 3）
 | 前端动作 | 要问的层 | 需要重算的范围 | 代价（本原型实测） | 诊断依据 | 补全/引导依据 | 条款 |
@@ -82,7 +82,7 @@
 - 〔M5.4〕后端诊断通过 Location（节点 id）回映到节点（L31）。
 
 ## 6 当前已知的不足（非规范；按 clauses.md 的“缺口/部分”行处理）
-- 值层复合摘要的毒值依赖（L6）仍是 C；caps（M1.8）的外部参照是 MLIR LICM 判定 + 分歧处 JIT A/B（values §12），毒值 tensor 操作数处偏保守。
+- 值层复合摘要的毒值依赖（L6）第 53 轮升 B：毒值实参下的确定值经 JIT 外部化（values §14）；“是毒值/UB”方向是精化自由度，执行测不出，不能单独作为变换依据；caps（M1.8）的外部参照是 MLIR LICM 判定 + 分歧处 JIT A/B（values §12），毒值 tensor 操作数处偏保守。
 - M5.3：alloca 逃逸未建模（拒发）；多块循环体不处理（报原因）；M5.1 只在 tensor/bufferize、scf→cf 与作用域降低三条管线上有差分。
 - 值层未覆盖：浮点 tensor、memref 内容、cf 多块、scf.while、func.call、complex、超越函数（均判未知）。
 - 递归、方言注册与版本、transform 方言、DataFlow、bytecode、WASM：coverage 里是 ✗。
