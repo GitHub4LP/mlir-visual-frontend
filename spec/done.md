@@ -70,4 +70,5 @@
 - 第 55 轮（M3.9 → 检验）：新增 adtpoison_test，在 ADT 降级分量里注入毒值，阈值预先写定，首跑即通过。确定值 13374/13374 与 JIT（O0+O3）一致，其中 none 载荷毒化的 2314 个；两种消融 O3 反例分别为 8266、650。条款：检验 41，部分 3（M0.2、M1.4、M5.1）。
 - 第 56 轮（M5.1 → 检验，新增 L55 管线白名单）：pipezoo_test 对 15 条管线做差分，800 个程序，基线确定值 1992，模型反例 0；13 条管线 0 偏离。发现两处 MLIR 缺陷：scf-for-loop-peeling 在 lb > ub 时偏离（upstream 已修），remove-dead-values 产生空操作数（245/800）。两处都只记录，不提 upstream。条款：检验 42，部分 2（M0.2、M1.4）。
 - 第 57 轮（L56 Graph 区域副作用次序）：structure.effect_class/graph_order；graphorder_test 定向 8/8，3 项消融有效；副作用分类与 MLIR 死代码删除对照，207 个 op 名、2415 个实例，判 none 而 MLIR 保留 0。M1.2 的未覆盖项闭合，结论为未知级，不拒绝。
+- 第 59 轮（M1.4 → 检验）：l10_test 在真实 IR 上检验 L10：非符号属性 895 组、6972 例，违例 0；符号属性 373 例违例（重名），L10 收窄为非符号属性。E2 attrsig 误拒 0/3958。条款：检验 43，部分 1（M0.2）。补记第 57 轮：G1 首跑 7/8 FAIL（in_parallel 纯 op 解析即被拒），改为直接构造节点后 PASS；effect_class 的 MemoryEffectOpInterface 分支是看过 linalg.generic 的 ODS 后补加的。
 - 第 58 轮（M5.1 浮点族，values §15.1）：floatzoo_test 584 个程序、14 条管线，基线 3125、模型反例 0；arith-expand 浮点 max/min 不保号，math-expand-ops ceil/fma 偏离（FZ2 事后定向 5/5）；L55 白名单按程序族细化。
