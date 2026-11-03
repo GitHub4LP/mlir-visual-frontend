@@ -22,7 +22,7 @@ A/B 级的“0 分歧”必须同时报告**触发数**（L38）和**送达率**
 | L3 | 捕获提升为端口；IsolatedFromAbove 由推导得到 | structure §5、§6.1 | B | 真实 IR 提取 4435 段 MLIR 端口错误 0（第 43 轮算法 8，消融，capture_test）；structure_fuzz 不可靠 0；X2 |
 | L4 | 透明/不透明模式下，自由符号在不同的表里解析 | structure §5 | B（+A） | 解析规则有 Y1 语料作证（symbols.md）；“两种模式语义不同”只有 X6 自证 |
 | L5 | needs_ssacfg（顶层区域多块）的体不能内联进 Graph 区域；Graph 区域与未注册 op 的区域不查支配 | structure §5、§6.2 | B | X5；l5_test：真实 IR 2599 函数 MLIR 一致（第 52 轮），Graph 区域 op 审计 6/6，定向 7/7 |
-| L6 | 复合摘要的 UB 和毒值必须依赖输入毒值 | core-v4 §4、values §14 | B（第 53 轮；整数 arith + select，i8–i64） | 穷举解释器 900/900；poison_test：调用方在 MLIR 里制造毒值经 func.call 传入，模型经摘要给出确定值 614 个输入（O0+O3）与 JIT 一致 614/614，其中毒值实参数据流可达结果 100；摘要去掉输入毒值依赖（消融）O3 反例 328。毒值/UB 方向是精化自由度，不可测 |
+| L6 | 复合摘要的 UB 和毒值必须依赖输入毒值 | core-v4 §4、values §14 | B（第 53 轮；整数 arith + select，i8–i64） | 穷举解释器 900/900；poison_test：调用方在 MLIR 里制造毒值经 func.call 传入，模型经摘要给出确定值 614 个输入（O0+O3）与 JIT 一致 614/614，其中毒值实参数据流可达结果 100；摘要去掉输入毒值依赖（消融）O3 反例 328；第 54 轮依赖数据的五种来源（nsw/nuw/exact/trunci nuw）确定值 3748/3748，确为毒值且可达 224，每种来源消融 O3 反例均 > 0。毒值/UB 方向是精化自由度，不可测 |
 | L7 | 局部分配的 alloc/free/读写不外泄；泄漏只是诊断，不是效应（第 30 轮澄清：“同块”只决定泄漏诊断） | core-v4 §4、effects | B | 第 30 轮 X7：48 个穷举用例对照同一提交 MLIR canonicalize（包进结果不用的 execute_region）。模型判纯的 12 个，MLIR 全部删除，不可靠 0；保守 12 个，全是参数上的只读（MLIR 视不用的读为死代码，模型保留 Read）。变异（丢参数 Free）抓出 12 |
 | L8 | 属性按指称存储 | definitions | B→A | D1 300/300；第 13 轮起属性值就是 MLIR Attribute（L35，A） |
 | L9 | 参数与元数据的命名空间分离 | definitions | B | D2 不可靠 0。**第 21 轮发现：D2 只比较接受与否，nsw 的语义被 _den_of 丢掉而没被发现** |
