@@ -72,3 +72,4 @@
 - 第 57 轮（L56 Graph 区域副作用次序）：structure.effect_class/graph_order；graphorder_test 定向 8/8，3 项消融有效；副作用分类与 MLIR 死代码删除对照，207 个 op 名、2415 个实例，判 none 而 MLIR 保留 0。M1.2 的未覆盖项闭合，结论为未知级，不拒绝。
 - 第 59 轮（M1.4 → 检验）：l10_test 在真实 IR 上检验 L10：非符号属性 895 组、6972 例，违例 0；符号属性 373 例违例（重名），L10 收窄为非符号属性。E2 误拒 0/3958，先抓 MLIR 拒绝的 75%（二跑加入 op 级关系约束；首跑 46% 为低估，改动在看过缺口分类之后，误拒判据不变）。条款：检验 43，部分 1（M0.2）。补记第 57 轮：G1 首跑 7/8 FAIL（in_parallel 纯 op 解析即被拒），改为直接构造节点后 PASS；effect_class 的 MemoryEffectOpInterface 分支是看过 linalg.generic 的 ODS 后补加的。
 - 第 58 轮（M5.1 浮点族，values §15.1）：floatzoo_test 584 个程序、14 条管线，基线 3125、模型反例 0；arith-expand 浮点 max/min 不保号，math-expand-ops ceil/fma 偏离（FZ2 事后定向 5/5）；L55 白名单按程序族细化。
+- 第 60 轮（M0.2 分母）：ftensorjit_test 对 94 个此前从未对照的浮点 tensor 签名函数做 JIT 对照（values §16）。执行 43，比较 673/673，其中浮点值 434；seed+1 发现 105/131。二跑的采样改动是事后做的。47 个函数的所有输入都不满足守卫，没有执行。M0.2 仍为部分。
