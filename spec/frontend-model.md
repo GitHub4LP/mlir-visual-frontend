@@ -57,7 +57,7 @@
 - 〔M3.6〕**math**：只登记降到正确舍入或精确 LLVM 内建的子集（absf、ceil/floor/trunc/round/roundeven、sqrt、fma、isnan、isfinite、absi、ctlz/cttz/ctpop）；超越函数、copysign、fpowi、isinf/isnormal 判未知（values §11）。
 - 〔M3.7〕**精化判据**：src 不 UB ⇒ tgt 不 UB；src 非毒值 ⇒ tgt 值相同且非毒值。改写、fold、降级都用这同一个判据；外部校准是 MLIR 自己的变换（canonicalize、int-range-optimizations、sccp）在模型下必须是精化，且该变换本身要有 JIT 对照（L52）。
 - 〔M3.8〕**循环**：摘要名 = 结构 + 语义开关，体内参数与捕获值都是实参（L18′）；不变式先做归纳检查，再作为公理（L19）；scf.for 越界步进是 UB（loops §8）。
-- 〔M3.9〕**用户 ADT 与接口定律**：ADT 降级正确性 = 抽象函数下的精化（L11）；接口定律是定向精化（L12，值层）。毒值层：L6 第 53 轮升 B，但只检验了“确定值”方向（整数 arith + select），ADT 降级后的毒值层未外部化；前端不得只凭“此处是毒值/UB”的结论做变换。
+- 〔M3.9〕**用户 ADT 与接口定律**：ADT 降级正确性 = 抽象函数下的精化（L11）；接口定律是定向精化（L12，值层）。毒值层：L6 第 53 轮升 B，ADT 降级后的毒值层第 55 轮外部化（values §14.2），都只检验了“确定值”方向；前端不得只凭“此处是毒值/UB”的结论做变换。
 
 ## 4 前端动作表（判据 3）
 | 前端动作 | 要问的层 | 需要重算的范围 | 代价（本原型实测） | 诊断依据 | 补全/引导依据 | 条款 |

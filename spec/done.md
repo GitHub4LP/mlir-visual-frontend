@@ -67,3 +67,4 @@
 - 第 52 轮（L5 外部证据；M1.2 → 检验）：needs_ssacfg 判据由“任何处有后继”更正为“顶层区域多块”（MLIR Verifier：Graph 区域 0 或 1 块）。真实 IR 2599 个函数内联进 builtin.module，一致 2599/2599；旧判据语料误报 3。同时修复结构层误拒：ODS op 的 Graph 区域与未注册 op 的区域原按 SSACFG 查 R5 支配，先用后定义被误判；现按 ODS 取区域种类。新增 l5_test（L5a/L5b/L5c）。回归 PASS：core、oracle、symtab、structure_fuzz、obligations、modular、incr。条款：检验 39、部分 5。
 - 第 53 轮（L6 外部化；M1.6 → 检验）：新增 poison_test。调用方在 MLIR 里制造毒值（shli x, w），经 func.call 传入随机复合 op；模型只经摘要推导。600 个程序、4800 个输入（O0+O3）：确定值 614/614 与 JIT 一致（毒值实参可达结果 100）；摘要去掉输入毒值依赖后 O3 反例 328。L6 由 C 升 B。clauses_test K6 自检改用 L21 作 C 级注入。条款：检验 40、部分 4。
 - 第 54 轮（L6 毒值来源扩面）：poison_test P3，五种依赖数据的毒值来源，阈值预先写定。首跑 seed 54（每种来源 120 个程序）中 shrui_exact 可达样本 6 < 10，判 FAIL；新样本 seed 55（每种来源 300 个程序）PASS：确定值 3748/3748，确为毒值且可达 224，消融 O3 反例每种来源都 > 0。样本量是在看到首跑结果后才定的，已在 values §14.1 写明。
+- 第 55 轮（M3.9 → 检验）：新增 adtpoison_test，在 ADT 降级分量里注入毒值，阈值预先写定，首跑即通过。确定值 13374/13374 与 JIT（O0+O3）一致，其中 none 载荷毒化的 2314 个；两种消融 O3 反例分别为 8266、650。条款：检验 41，部分 3（M0.2、M1.4、M5.1）。
