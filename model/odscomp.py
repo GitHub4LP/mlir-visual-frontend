@@ -15,11 +15,12 @@
 
 有拒绝权的依据：每个原子都是 odssig/attrsig 的同一判定（L29/L34a，真实 IR 误拒 0），代换不改变判定（逐点等价由 odscomp_test S1/S2 检验）。
 """
+import itertools
 import typesig as TS, odssig as G
 
 def ev(e, T):
     k = e[0]
-    if k == 'p': return T[e[1]]
+    if k == 'p': return T[e[1]] if e[1] < len(T) else None
     if k == 'k': return e[1]
     x = ev(e[3], T)
     if x is None or isinstance(x, list): return None
@@ -125,7 +126,7 @@ def holds(a, T):
     if a[0] == 'rel':
         x, (idx, op, mini, partial), groups = a[1], a[2], a[3]
         gt = [[ev(e, T) for e in g] for g in groups]
-        if any(t is None for g in gt for t in g): return False
+        if any(ev(e, T) is None for e in _aexprs(a)): return False      # 只要求被引用的表达式有值（投影时类外端口为 None）
         S1 = dict(mini, rel=[x]); ni = len(mini['ins'])
         return not G.check(S1, gt[:ni], None if partial else gt[ni:])
     n, ie, oe = a[1], a[2], a[3]
@@ -195,3 +196,62 @@ def render(P, names):
         else: rel.append(f'attr@{a[1]["op"]}({", ".join(names[i] for i in sorted(ps))})')
     return {'ports': {names[i]: sorted(set(v)) for i, v in unary.items()}, 'relations': list(dict.fromkeys(rel)),
             'unknown': P.residual, 'bottom': P.bottom}
+
+# ───────────────────────── 单端口投影：端口 j 的最大类型范围 R_j(t) ≝ ∃其余端口. Φ（第 63 轮）
+EQ = {'same', 'same_ops'}          # 精确相等（AllTypesMatch、SameTypeOperands）；samec_all 允许动态维兼容，不是相等
+def project(Q):
+    """返回 (cls, ranges)。cls：端口 → 等价类代表（由端口间精确相等关系合并）。
+    ranges[j] = (atoms, exact)：atoms 是只涉及 j 所在等价类的原子（类内端口都取 t 后求值）；
+    exact ⇔ 没有原子把该类与类外端口联系起来（此时 R_j 与其余端口独立：R_j(t) ⇔ atoms(t) ∧ 其余类可满足）。
+    exact=False 时 atoms 只是必要条件（上近似），呈现须标“上近似”。"""
+    par = list(range(Q.n))
+    def f(i):
+        while par[i] != i: par[i] = par[par[i]]; i = par[i]
+        return i
+    for a in Q.atoms:
+        if a[0] == 'rel' and a[1][0] in EQ:
+            es = _aexprs(a)
+            if es and all(e[0] == 'p' for e in es):
+                for e in es[1:]: par[f(e[1])] = f(es[0][1])
+    cls = [f(i) for i in range(Q.n)]
+    touch = {}
+    for a in Q.atoms:
+        cs = {cls[p] for e in _aexprs(a) for p in ports_of(e)}
+        for c in cs: touch.setdefault(c, []).append((a, len(cs) == 1))
+    ranges = {}
+    for j in range(Q.n):
+        lst = touch.get(cls[j], [])
+        ranges[j] = ([a for a, solo in lst if solo], all(solo for _, solo in lst))
+    return cls, ranges
+
+def range_holds(Q, cls, ranges, j, t):
+    """R_j(t) 的类内部分：类内端口都取 t，求值只涉及该类的原子。"""
+    if Q.bottom: return False
+    T = [t if cls[i] == cls[j] else None for i in range(Q.n)]
+    return all(holds(a, T) for a in ranges[j][0])
+
+def render_ranges(Q, names):
+    cls, rg = project(Q)
+    out = {}
+    for j in range(Q.n):
+        if cls[j] != j and names[cls[j]] in out: out[names[j]] = f'= {names[cls[j]]}'; continue
+        cons = sorted({_label(a) if a[0] != 'pred' else a[1] for a, in [(x,) for x in rg[j][0]]})
+        out[names[j]] = ('精确' if rg[j][1] else '上近似') + ': ' + ' ∧ '.join(cons)
+    return out
+
+def range3(Q, j, t, hints, maxw=1024):
+    """三值的单端口范围：('in', 见证) 找到使 Φ 成立的完整端口赋值；('out', None) 必要条件（类内原子）已不成立；
+    ('unknown', None) 必要条件成立但未找到见证。见证搜索：其余每个端口在 {hints[i]（如原类型）, t} 中取值（≤ maxw 种组合），
+    这覆盖“其余端口保持原样”与“相关端口跟随 t”两类常见情形。'in' 与 'out' 都是确定判断；前端连线检查可据此给出 可连 / 不可连 / 未定。"""
+    cls, rg = project(Q)
+    try: tp = TS.parse(t) if isinstance(t, str) else t
+    except Exception: return ('unknown', None)
+    if not range_holds(Q, cls, rg, j, tp): return ('out', None)
+    others = sorted({cls[i] for i in range(Q.n)} - {cls[j]})
+    rep = {c: next(i for i in range(Q.n) if cls[i] == c) for c in others}
+    for k, combo in enumerate(itertools.product((0, 1), repeat=len(others))):
+        if k >= maxw: break
+        asg = {c: (t if b else hints[rep[c]]) for c, b in zip(others, combo)} | {cls[j]: t}
+        T = [asg[cls[i]] for i in range(Q.n)]
+        if evaluate(Q, T): return ('in', T)
+    return ('unknown', None)
