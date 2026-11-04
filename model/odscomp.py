@@ -115,7 +115,7 @@ def derive(sl, ports, inner=None):
         mini = dict(S, ins=[(nm, _T, m, b) for nm, _, m, b in S['ins']], outs=[(nm, _T, m, b) for nm, _, m, b in S['outs']], infer=None)
         groups = gi + ([] if partial else go)
         for x in S['rel']:
-            if x[2] not in ('ods', 'cpred'): continue
+            if x[2] not in ('ods', 'cpred', 'nf'): continue
             P.atoms.append(('rel', x, (idx, n['op'], mini, partial), groups, [e for g in gi for e in g], [] if partial else [e for g in go for e in g]))
     P.outs_e = []; P.env = ex
     return P
@@ -199,7 +199,8 @@ def render(P, names):
         elif a[0] == 'pred': rel.append(f'{a[1]}({show(a[3], names)})')
         elif a[0] == 'rel':
             es = _aexprs(a)
-            rel.append(f'{a[1][0]}({", ".join(show(e, names) for e in es)})')
+            if a[1][0] == 'nf': rel.append(f'nf[{a[1][3]}]({", ".join(show(e, names) for e in es)})')   # 第 66 轮：规范化规则带呈现文本
+            else: rel.append(f'{a[1][0]}({", ".join(show(e, names) for e in es)})')
         else: rel.append(f'attr@{a[1]["op"]}({", ".join(names[i] for i in sorted(ps))})')
     return {'ports': {names[i]: sorted(set(v)) for i, v in unary.items()}, 'relations': list(dict.fromkeys(rel)),
             'unknown': P.residual, 'ground': P.ground, 'bottom': P.bottom}
