@@ -401,6 +401,7 @@ def _dense_i64(txt, n):
     else: xs = [int(v)] * n
     return xs if len(xs) == n else None
 
+@functools.lru_cache(None)
 def _yaml_provider(nm):
     """命名 op：返回 f(操作数类型表, attrs) → (映射表, 循环数)；不可套用（映射用到非属性符号等）返回 None。"""
     import affine as AF
@@ -435,6 +436,7 @@ def _yaml_provider(nm):
             except AF.AffineError as e: raise NFUnknown(str(e))
         maps = [(nd, 0, [AF.subst_syms(e, vals) for e in es]) for nd, _, es in parsed]
         return maps, nloops_fixed
+    prov.iters = list(so.get('iterator_types') or [])
     return prov, rankpoly, nops
 
 class _Crash(Exception):
@@ -548,6 +550,152 @@ def nf_attrs(n, at):
     at = dict(at)
     r0 = rs[0]
     at['\x00bbargs'] = None if len(r0) != 1 else [t for _, t in r0[0].get('args', [])]
+    at['\x00block'] = None if len(r0) != 1 else r0[0]          # 第 71 轮：区域体（ContractionOpInterface）
     return at
 
 IFACE['接口 verify: LinalgOp::Trait'] = _linalg_iface
+
+
+# ───────────────────────── 第 71 轮：ConvolutionOpInterface（47 个 yaml op）与 ContractionOpInterface（7 个 yaml op），closure §9.11
+# 依据：Linalg/IR/LinalgInterfaces.cpp isConvolutionInterfaceImpl / ConvAccessExprWalker / isContractionInterfaceImpl / isContractionBody。
+
+def _proj_perm(m):
+    """AffineMap::isProjectedPermutation(allowZeroInResults=false)：无符号、结果数 ≤ 维数、每个结果是互不相同的单个维。"""
+    import affine as AF
+    nd, ns, es = m
+    if ns or len(es) > nd: return False
+    ds = [AF.is_dim(e) for e in es]
+    return None not in ds and len(set(ds)) == len(ds)
+
+def _conv_input(es):
+    """ConvAccessExprWalker 对输入映射每个结果的先序访问：单个维 ⇒ 非卷积维；两项相加且每项为维或 维×常数 ⇒ 两维为卷积维；
+    同一维在任何位置第二次出现 ⇒ 失败。表达式按 MLIR 构造期化简后的形状判断（两维线性式、常数项 0）。返回 (卷积维, 非卷积维) 或 None。"""
+    import affine as AF
+    conv, unconv = set(), set()
+    for e in es:
+        d = AF.is_dim(e)
+        if d is not None:
+            if d in conv or d in unconv: return None
+            unconv.add(d); continue
+        if e[0] != 'lin' or e[2] != 0 or len(e[1]) != 2 or any(k[0] != 'd' for k in e[1]): return None
+        a, b = sorted(k[1] for k in e[1])
+        for x in (a, b):
+            if x in conv or x in unconv: return None
+            conv.add(x)
+    return conv, unconv
+
+def conv_ok(nin, ninit, maps, iters):
+    import affine as AF
+    if nin < 2 or ninit != 1: return False
+    r = _conv_input(maps[0][2])
+    if r is None: return False
+    conv, unconv = r
+    if not _proj_perm(maps[1]) or not _proj_perm(maps[-1]): return False
+    out = [AF.is_dim(e) for e in maps[-1][2]]; flt = [AF.is_dim(e) for e in maps[1][2]]
+    outs, flts = set(out), set(flt); allk = set()
+    for d in out:
+        if d >= len(iters): return False                         # iteratorTypes[d] 越界：未定义行为，按拒绝（命名 op 不会出现）
+        if (d in unconv and d not in flts) or (d in conv and d not in flts) or (d not in conv and d not in unconv and d in flts) or (d in unconv and d in flts):
+            if iters[d] != 'parallel': return False
+            allk.add(d); continue
+        return False
+    for d in flt:
+        if d in outs and d not in unconv and d not in conv: continue
+        if (d in conv and d not in outs) or (d in unconv and d not in outs):
+            if d >= len(iters) or iters[d] != 'reduction': return False
+            if d in allk: return False
+            allk.add(d); continue
+        if d in unconv and d in outs: continue
+        return False
+    if len(allk) != len(iters): return False
+    if not conv: return False
+    return True
+
+_TERM = {}
+def _is_term(op):
+    """mightHaveTrait<IsTerminator>：已注册 op 看 ODS trait；未导入方言 ⇒ 未建模。"""
+    import odsjson as O, structure as ST
+    dia = op.split('.')[0]
+    if dia not in O.DIALECTS: raise NFUnknown(op)
+    if op not in O.ops(dia): return True                         # 未注册 op：mightHaveTrait 为真
+    if op not in _TERM:
+        d = O.records(dia); seen = set(); hit = [False]
+        def walk(t):
+            nm = O.ref(t)
+            if nm in seen: return
+            seen.add(nm); x = d.get(nm)
+            if nm == 'Terminator' or (isinstance(x, dict) and x.get('trait') == '::mlir::OpTrait::IsTerminator'): hit[0] = True
+            if isinstance(x, dict) and 'TraitList' in (x.get('!superclasses') or []):
+                for u in x.get('traits') or []: walk(u)
+        for t in d[O.ops(dia)[op]].get('traits', []): walk(t)
+        _TERM[op] = hit[0]
+    return _TERM[op]
+
+_PAIRS = {('arith.mulf', 'arith.addf'), ('arith.muli', 'arith.addi'), ('complex.mul', 'complex.add'), ('arith.andi', 'arith.ori')}
+def contraction_body(blk):
+    """isContractionBody（MulF/AddF、MulI/AddI、complex Mul/Add、AndI/OrI）。blk：core 块 {'args', 'ops'}。"""
+    import structure as ST, odsjson as O
+    ops = blk.get('ops') or []; args = [a for a, _ in blk.get('args', [])]
+    if not ops or not _is_term(ops[-1]['op']): return False
+    if len(args) != 3: return False
+    term = ops[-1]
+    if len(term['ins']) != 1: return False
+    dfn = {o: n for n in ops for o, _ in n['outs']}
+    def src(v):
+        while True:
+            if v in args: return v
+            n = dfn.get(v)
+            if n is None: raise NFUnknown('区域捕获外部值')
+            if len(n['ins']) != 1: return v
+            dia = n['op'].split('.')[0]
+            if dia not in O.DIALECTS: raise NFUnknown(n['op'])
+            if ST.effect_class(n['op']) != 'none': return v
+            v = n['ins'][0]
+    y = src(term['ins'][0])
+    red = dfn.get(y)
+    if red is None or len(red['outs']) != 1 or len(red['ins']) != 2: return False
+    l, r = src(red['ins'][0]), src(red['ins'][1])
+    if l != args[2] and r != args[2]: return False
+    c = src(r if l in args else l)
+    ew = dfn.get(c)
+    if ew is None or len(ew['outs']) != 1 or len(ew['ins']) != 2: return False
+    if (ew['op'], red['op']) not in _PAIRS: return False
+    a, b = src(ew['ins'][0]), src(ew['ins'][1])
+    return (a, b) in ((args[0], args[1]), (args[1], args[0]))
+
+def _blk(attrs):
+    if '\x00block' not in attrs: raise NFUnknown('无区域信息')
+    return attrs['\x00block']
+
+def _yaml_maps(nm, I, O, attrs):
+    p = _yaml_provider(nm)
+    prov, rankpoly, _ = p
+    maps, _n = prov(list(I) + list(O), attrs)
+    return maps, prov.iters
+
+def _conv_iface(S):
+    nm = S['op'].split('.', 1)[1]
+    p = _yaml_provider(nm)
+    if p is None or p[1]: return None
+    outs = [n for n, *_ in S['outs']]
+    def f(I, O, *R_at):
+        maps, iters = _yaml_maps(nm, I, O, R_at[-1])
+        return conv_ok(len(I), len(O), maps, iters)
+    return [_r(['inputs', 'outputs'] + outs, f'ConvolutionOpInterface（{nm}）：≥2 输入、1 输出；输入映射为维或两维和（ConvAccessExprWalker），filter/输出映射为投影置换；循环逐一归类且迭代器种类相符；卷积维非空', f, attrs=True)]
+
+def _contr_iface(S):
+    nm = S['op'].split('.', 1)[1]
+    p = _yaml_provider(nm)
+    if p is None or p[1]: return None
+    outs = [n for n, *_ in S['outs']]
+    def f(I, O, *R_at):
+        if len(I) != 2 or len(O) != 1: return False
+        maps, iters = _yaml_maps(nm, I, O, R_at[-1])
+        if not any(t == 'reduction' for t in iters): return False
+        if not all(_proj_perm(m) for m in maps): return False
+        b = _blk(R_at[-1])
+        return b is not None and contraction_body(b)
+    return [_r(['inputs', 'outputs'] + outs, f'ContractionOpInterface（{nm}）：2 输入 1 输出；有归约循环；映射均为投影置换；区域体为 u5(u1(c) ⊕ u2(u3(a) ⊗ u4(b)))（⊕/⊗ ∈ addf/mulf、addi/muli、complex add/mul、ori/andi，u 为无副作用一元 op）', f, attrs=True)]
+
+IFACE['接口 verify: ConvolutionOpInterface::Trait'] = _conv_iface
+IFACE['接口 verify: ContractionOpInterface::Trait'] = _contr_iface
