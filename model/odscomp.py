@@ -16,7 +16,7 @@
 有拒绝权的依据：每个原子都是 odssig/attrsig 的同一判定（L29/L34a，真实 IR 误拒 0），代换不改变判定（逐点等价由 odscomp_test S1/S2 检验）。
 """
 import itertools
-import typesig as TS, odssig as G
+import typesig as TS, odssig as G, attrsig as A_
 
 def ev(e, T):
     k = e[0]
@@ -116,7 +116,9 @@ def derive(sl, ports, inner=None):
         groups = gi + ([] if partial else go)
         for x in S['rel']:
             if x[2] not in ('ods', 'cpred', 'nf'): continue
-            P.atoms.append(('rel', x, (idx, n['op'], mini, partial), groups, [e for g in gi for e in g], [] if partial else [e for g in go for e in g]))
+            try: _at = A_.from_core(n)
+            except Exception: _at = None
+            P.atoms.append(('rel', x, (idx, n['op'], mini, partial, _at), groups, [e for g in gi for e in g], [] if partial else [e for g in go for e in g]))
     P.outs_e = []; P.env = ex
     return P
 _T = lambda t: True
@@ -131,11 +133,11 @@ def holds(a, T):
     if a[0] == 'pred':
         t = ev(a[3], T); return t is not None and bool(a[2](t))
     if a[0] == 'rel':
-        x, (idx, op, mini, partial), groups = a[1], a[2], a[3]
+        x, (idx, op, mini, partial, at), groups = a[1], a[2], a[3]
         gt = [[ev(e, T) for e in g] for g in groups]
         if any(ev(e, T) is None for e in _aexprs(a)): return False      # 只要求被引用的表达式有值（投影时类外端口为 None）
         S1 = dict(mini, rel=[x]); ni = len(mini['ins'])
-        return not G.check(S1, gt[:ni], None if partial else gt[ni:])
+        return not G.check(S1, gt[:ni], None if partial else gt[ni:], attrs=at)
     n, ie, oe = a[1], a[2], a[3]
     it = [ev(e, T) for e in ie]; ot = [ev(e, T) for e in oe]
     if any(t is None for t in it + ot): return False
@@ -179,7 +181,8 @@ def simplify(P):
             seen.add(k)
         elif a[0] == 'rel':
             if a[1][0] in REFLEXIVE and len({key(e) for e in es}) <= 1: continue
-            k = ('rel', a[1][0], tuple(a[1][1]), id(a[1][3]) if a[1][0] == 'match' else None, a[2][3], tuple(tuple(key(e) for e in g) for g in _relgroups(a)))
+            k = ('rel', a[1][0], tuple(a[1][1]), id(a[1][3]) if a[1][0] == 'match' else None, a[2][3],
+                 tuple(sorted(a[2][4].items())) if a[1][0] == 'nf' and a[1][5] and a[2][4] else None, tuple(tuple(key(e) for e in g) for g in _relgroups(a)))
             if k in seen: continue
             seen.add(k)
         Q.atoms.append(a)

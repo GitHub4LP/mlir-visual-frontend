@@ -300,3 +300,38 @@ R_j(t) ≝ ∃ 其余端口. Φ_comp，即用户需求里“签名允许的最�
 **边界**：
 - 穷尽性只相对于所选特征成立。其余特征（例如更多布局形式、方言自定义类型）未枚举。规则不读这些特征，但 MLIR 是否同样不读，没有被检验。
 - 剩余残差仍来自其他 op，按 resid_stat 的长尾顺序逐批规范化：vector.transfer_read/write、tensor.extract_slice/insert_slice、memref.subview 等。
+
+### 9.7 第二批：tensor / memref / vector（第 67 轮）
+
+**机制扩展**：规范化规则可以读取 op 的属性，写作 `('nf', 端口组, 'nf', 呈现, 判定, 需要属性)`。属性取自节点（`attrsig.from_core`）：core 逐点判定直接传入属性；odscomp 把属性记在 rel 原子上。复合 op 内部节点的属性由实现图固定，所以端口类型的谓词仍是精确的。这一点对应用户要求的“签名间约束（属性）与类型约束的交互”。没有属性信息时（属性为符号参数），需要属性的规则不判，取上近似。规则在端口不满足 ODS 基本约束时无定义，按拒绝处理，因为此时 ODS 约束本身已经拒绝。
+
+**覆盖**（依据 MLIR 9bae84b0 C++ 源码）：
+
+| op | 规则 | 被覆盖的 declared |
+|---|---|---|
+| tensor.dim | result = index | 接口 verify: ShapedDimOpInterface |
+| memref.load / store | #indices = rank(memref) | C++ verify() |
+| tensor.cast | elt 相同 ∧ compat（不比较编码） | 接口 verify: CastOpInterface |
+| vector.broadcast | isBroadcastableTo（标量 = elt；尾部维度相等或源为 1；可伸缩标志规则） | C++ verify() |
+| vector.shape_cast | elt 相同 ∧ numel 相同 ∧ 可伸缩维个数相同 | C++ verify() |
+| vector.transpose | rank 相同 ∧ permutation 是排列 ∧ dim(result,i) = dim(src,perm[i])（不比较可伸缩标志，与 MLIR 一致） | C++ verify() |
+
+**检验**（nf_test N1，每个 op 有自己的生成器，包含属性取值：13 种 permutation，含非法排列）：
+
+| 判据 | 结果 |
+|---|---|
+| N1（本批 7 op） | 比较 5006，接受 202；误拒 0，误收 0；消融误收 2292 |
+| N1（累计 19 op） | 比较 45506，接受 2547；误拒 0，误收 0；崩溃 868（按拒绝计） |
+| odscomp S1–S4（27960 实例） | 全 PASS；S3 误拒 0，残差为空时误收 0 |
+| 残差为空的复合 op | 1911 → 2590 / 5592（34.2% → 46.3%） |
+| projcomp P1/P2/P4/P5 | 全 PASS（P1 7891 比较，不一致 0） |
+| core_test T1/T2 | PASS |
+| odssig_test L1 | 误拒 0（21877 实例，三个层级都统计）；按账目改用完整模型（ods+cpred+nf）后，auto 196 个 op、cpred 13 个 op 分歧均为 0 |
+| resid_stat（5557 个复合 op） | 残差非空 4033 → 2968；残差中 C++ verify 3899 → 3045，接口 verify 2411 → 1759 |
+
+**过程（如实记录）**：
+- 试跑时 vector.transpose 在 0 维、空 permutation 上误拒 1 例。原因是解析 `array<i64>` 时把 64 读成了元素。修正后才跑全量。
+- odssig_test 首跑在规则内部抛出异常：shape_cast 的规则收到了非 vector 端口。已改为规则无定义时判拒绝，随后复跑。
+- 复跑时“L1 按账目”FAIL（auto 类有分歧 2）。原因是 nf 覆盖后，tensor.cast 和 shape_cast 由 declared 转为 auto，但这一项原先只按 ods+cpred 比较。改为按完整模型比较后 PASS。这是检验口径随机制一起修正，不是放宽：被比较的模型更强，且不允许分歧。
+
+**下一批**（work/resid67.txt）：vector.transfer_read 722、transfer_write 504、tensor.extract_slice 470、insert_slice 339、memref.subview 322、vector.contract 234。修好前 10 个 op 可清空 1321/2968。这些 op 的规则都依赖属性，例如 permutation_map、in_bounds、static_offsets/sizes/strides，还涉及结果类型推断（strided 布局）。
