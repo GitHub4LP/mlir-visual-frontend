@@ -4,6 +4,8 @@
   S1 化简 ≡ 原始：所有实例上 evaluate(simplify(Φ)) == evaluate(Φ)，不一致 0。
   S2 Φ ≡ 逐点判定（第 62 轮二跑后补：推导异常须为 0，否则切片被静默排除）：Φ(T) 与 composite.instantiate + core.typecheck（不开预言机）一致，不一致 0
      （instantiate 失败 ⇔ Φ 拒绝）。
+  （第 64 轮）残差分为两类：定值残差指节点类型不含端口变量，校验结果是常量，在定义时对实现图校验一次（原类型被 MLIR 接受）即可消去；
+  其余为残差。S3 只在原类型被接受后计数，所以“残差为空”指消去定值残差后为空。阈值不变。
   S3 对 MLIR：误拒（Φ 拒绝、MLIR 接受）0；误收（Φ 接受、MLIR 拒绝）只允许出现在 Unknown 残差非空的复合 op 上，残差为空时误收 0。
   S4 嵌套 ≡ 展开：把切片前半作为内层复合 op 嵌进外层，Φ_嵌套(T) == Φ_展开(T)，不一致 0，且实例数 > 0。
   S5（只报告，无阈值）：残差为空的复合 op 占比、化简前后原子数、呈现样例。
@@ -39,7 +41,7 @@ def run_file(path, q, kslice, kmut, seed):
                 try: P = D.derive(sl, ports); Q = D.simplify(P)
                 except Exception as e: st['推导异常'] += 1; note('推导异常', f'{[n["op"] for n in sl]} {type(e).__name__}: {str(e)[:90]}'); continue
                 unk = bool(P.residual)
-                st['复合 op'] += 1; st['复合 op/残差为空'] += not unk
+                st['复合 op'] += 1; st['复合 op/残差为空'] += not unk; st['复合 op/含定值残差'] += bool(P.ground); st['复合 op/仅定值残差'] += bool(P.ground) and not unk
                 st['原子/化简前'] += len(P.atoms); st['原子/化简后'] += len(Q.atoms)
                 if not unk and len(Q.atoms) and len(ex['呈现']) < 6: note('呈现', f'{[n["op"] for n in sl]} {D.render(Q, ports)}')
                 for r in P.residual: st['残差/' + re.sub(r'^[\w.]+: ', '', r)[:40]] += 1
@@ -109,5 +111,5 @@ if __name__ == '__main__':
     V.check('S3 对MLIR', tot['S3 实例'] > 0 and tot['S3 误拒'] == 0 and tot['S3 误收/残差为空'] == 0,
             f"实例 {tot['S3 实例']}（接受 {tot['S3 MLIR 接受']}），误拒 {tot['S3 误拒']}，误收：残差为空 {tot['S3 误收/残差为空']}，残差非空 {tot['S3 误收/残差非空（Unknown）']}")
     V.check('S4 嵌套≡展开', tot['S4 实例'] > 0 and tot['S4 不一致'] == 0, f"实例 {tot['S4 实例']}，不一致 {tot['S4 不一致']}")
-    print(f"S5 复合 op {tot['复合 op']}，残差为空 {tot['复合 op/残差为空']}；原子 {tot['原子/化简前']} → {tot['原子/化简后']}")
+    print(f"S5 复合 op {tot['复合 op']}，残差为空 {tot['复合 op/残差为空']}（其中仅有定值残差 {tot['复合 op/仅定值残差']}，含定值残差 {tot['复合 op/含定值残差']}）；原子 {tot['原子/化简前']} → {tot['原子/化简后']}")
     V.finish()
