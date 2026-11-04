@@ -315,12 +315,54 @@ CANDIDATES.update({
 REG = dict(CANDIDATES)      # 第 66 轮起：nf_test N1 全 PASS 的 op 才留在这里（closure §9.6/§9.7）；未通过的 op 须从 CANDIDATES 删去或修正
 ENABLED = True
 
+# ───────────────────────── 第 69 轮：接口级规则（一条规则覆盖实现该接口的所有 op；op 特有的参数从 ODS 记录读出）
+def _op_record(op):
+    import odsjson as O
+    dia, nm = op.split('.', 1)
+    try: d = O.records(dia)
+    except Exception: return None
+    for n in d['!instanceof']['Op']:
+        r = d[n]
+        if r.get('opName') == nm and d[O.ref(r['opDialect'])]['name'] == dia: return r
+    return None
+def dps_init_group(S):
+    """getDpsInitsMutable() { return get<Name>Mutable(); } ⇒ 端口组名（ODS 访问器名 = 驼峰化的端口名）。读不出返回 None（该 op 不套用接口规则）。"""
+    r = _op_record(S['op'])
+    txt = (r or {}).get('extraClassDeclaration') or ''
+    m = _re.search(r'getDpsInitsMutable\(\)\s*\{\s*return\s+get(\w+)Mutable\(\);\s*\}', txt)
+    if not m: return None
+    acc = m.group(1)
+    for nm, *_ in S['ins']:
+        if ''.join(w[:1].upper() + w[1:] for w in nm.split('_')) == acc: return nm
+    return None
+def _dps(S):
+    """verifyDestinationStyleOpInterface：每个 init 是 tensor 或 memref（含无秩）；tensor 结果个数 = tensor init 个数；
+    第 i 个 init 若为 tensor，则第 i 个结果存在且类型与之相同（getTiedOpResult 按 init 下标取结果；越界为断言，按拒绝）。"""
+    g = dps_init_group(S)
+    if g is None: return None
+    outs = [nm for nm, *_ in S['outs']]
+    def f(I, *R):
+        res = [t for grp in R for t in grp]
+        if any(t[0] not in ('tensor', 'memref') for t in I): return False
+        tin = [i for i, t in enumerate(I) if t[0] == 'tensor']
+        if sum(t[0] == 'tensor' for t in res) != len(tin): return False
+        return all(i < len(res) and res[i] == I[i] for i in tin)
+    return [_r([g] + outs, f'DPS：{g} 每项为 tensor/memref；tensor 结果个数 = tensor {g} 个数；第 i 个 tensor {g} = 第 i 个结果', f)]
+IFACE = {'接口 verify: DestinationStyleOpInterface::Trait': _dps}
+
 def apply(S, reg=None):
-    """给签名加上规范化原子，并把覆盖的 declared 条目移出。"""
+    """给签名加上规范化原子，并把覆盖的 declared 条目移出。先按 op（REG），再按接口（IFACE）。"""
     reg = REG if reg is None else reg
-    if not ENABLED or S['op'] not in reg: return S
-    covers, mk = reg[S['op']]
-    S = dict(S); S['rel'] = list(S['rel']) + mk(S)
-    S['nf_covered'] = [d for d in S['declared'] if d in covers]
-    S['declared'] = [d for d in S['declared'] if d not in covers]
+    if not ENABLED: return S
+    S = dict(S); S['rel'] = list(S['rel']); S.setdefault('nf_covered', [])
+    if S['op'] in reg:
+        covers, mk = reg[S['op']]
+        S['rel'] += mk(S)
+        S['nf_covered'] = S['nf_covered'] + [d for d in S['declared'] if d in covers]
+        S['declared'] = [d for d in S['declared'] if d not in covers]
+    if reg is REG:
+        for d in [d for d in S['declared'] if d in IFACE]:
+            rs = IFACE[d](S)
+            if rs is None: continue
+            S['rel'] += rs; S['nf_covered'].append(d); S['declared'] = [x for x in S['declared'] if x != d]
     return S
