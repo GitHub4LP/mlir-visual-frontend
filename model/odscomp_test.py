@@ -71,8 +71,9 @@ def run_file(path, q, kslice, kmut, seed):
                         C.ORACLE_ON = False
                         try: pt = not C.typecheck(bs, ft)
                         except Exception: st['core 异常'] += 1; continue
-                    st['S2 不一致'] += pt != raw
-                    if pt != raw: note('S2 不一致', f'{[n["op"] for n in sl]} {T} Φ={raw} 逐点={pt}')
+                    if raw is D.UNK: st['点未定（nf 未建模）'] += 1
+                    st['S2 不一致'] += raw is not D.UNK and pt != raw
+                    if raw is not D.UNK and pt != raw: note('S2 不一致', f'{[n["op"] for n in sl]} {T} Φ={raw} 逐点={pt}')
                     if nest is not None:
                         nv = D.evaluate(nest, T); st['S4 实例'] += 1; st['S4 不一致'] += nv != raw
                         if nv != raw: note('S4 不一致', f'{[n["op"] for n in sl]} {T} 嵌套={nv} 展开={raw}')
@@ -84,9 +85,10 @@ def run_file(path, q, kslice, kmut, seed):
                     truth = tr == 'ok'
                     if kind == '原类型' and not truth: st['原类型独立后被拒（依赖上下文）'] += 1; break
                     st['S3 实例'] += 1; st['S3 MLIR 接受'] += truth
-                    st['S3 误拒'] += truth and not raw
-                    if truth and not raw: note('S3 误拒', f'{[n["op"] for n in sl]} {T}')
-                    if raw and not truth:
+                    st['S3 误拒'] += truth and raw is False
+                    if truth and raw is False: note('S3 误拒', f'{[n["op"] for n in sl]} {T}')
+                    if raw is D.UNK: st['S3 点未定（交预言机）'] += 1; st['S3 点未定/MLIR 接受'] += truth
+                    if raw is True and not truth:
                         st['S3 误收/残差非空（Unknown）' if unk else 'S3 误收/残差为空'] += 1
                         if not unk: note('S3 误收/残差为空', f'{[n["op"] for n in sl]} {T} {diags[0][1][:100] if diags else ""}')
     q.put((st, dict(ex)))
@@ -106,10 +108,10 @@ if __name__ == '__main__':
         for k, v in ex.items(): exs[k] += v[:2]
     print('── 合计'); [print(f'   {k}: {v}') for k, v in sorted(tot.items())]
     for k, v in exs.items(): print('──', k); [print('    ', x) for x in v[:8]]
-    V.check('S1 化简≡原始', tot['实例'] > 0 and tot['S1 不一致'] == 0, f"实例 {tot['实例']}，不一致 {tot['S1 不一致']}")
+    V.check('S1 化简≡原始', tot['文件超时/崩溃'] == 0 and tot['实例'] > 0 and tot['S1 不一致'] == 0, f"实例 {tot['实例']}，不一致 {tot['S1 不一致']}，文件崩溃 {tot['文件超时/崩溃']}")
     V.check('S2 Φ≡逐点', tot['实例'] > 0 and tot['S2 不一致'] == 0 and tot['推导异常'] == 0, f"不一致 {tot['S2 不一致']}/{tot['实例']}，推导异常 {tot['推导异常']}")
     V.check('S3 对MLIR', tot['S3 实例'] > 0 and tot['S3 误拒'] == 0 and tot['S3 误收/残差为空'] == 0,
-            f"实例 {tot['S3 实例']}（接受 {tot['S3 MLIR 接受']}），误拒 {tot['S3 误拒']}，误收：残差为空 {tot['S3 误收/残差为空']}，残差非空 {tot['S3 误收/残差非空（Unknown）']}")
+            f"实例 {tot['S3 实例']}（接受 {tot['S3 MLIR 接受']}），误拒 {tot['S3 误拒']}，误收：残差为空 {tot['S3 误收/残差为空']}，残差非空 {tot['S3 误收/残差非空（Unknown）']}；点未定 {tot['S3 点未定（交预言机）']}（MLIR 接受 {tot['S3 点未定/MLIR 接受']}）")
     V.check('S4 嵌套≡展开', tot['S4 实例'] > 0 and tot['S4 不一致'] == 0, f"实例 {tot['S4 实例']}，不一致 {tot['S4 不一致']}")
     print(f"S5 复合 op {tot['复合 op']}，残差为空 {tot['复合 op/残差为空']}（其中仅有定值残差 {tot['复合 op/仅定值残差']}，含定值残差 {tot['复合 op/含定值残差']}）；原子 {tot['原子/化简前']} → {tot['原子/化简后']}")
     V.finish()

@@ -32,7 +32,9 @@ def records(dialect):
     for td in tds:
         out = f'{CACHE}/{td.replace("/", "_")}.json'
         if not os.path.exists(out):
-            subprocess.run([TOOLS[0] + '/llvm-tblgen', '-dump-json', '-I', SITE] + (['-I', GEN] if os.path.isdir(GEN) else []) + [f'{SITE}/mlir/Dialect/{td}.td', '-o', out], check=True)
+            tmp = f'{out}.{os.getpid()}.tmp'                # 第 68 轮：并发进程同时生成缓存时曾读到半写文件 ⇒ 先写临时文件再原子改名
+            subprocess.run([TOOLS[0] + '/llvm-tblgen', '-dump-json', '-I', SITE] + (['-I', GEN] if os.path.isdir(GEN) else []) + [f'{SITE}/mlir/Dialect/{td}.td', '-o', tmp], check=True)
+            os.replace(tmp, out)
         txt = open(out).read()
         if merged is not None: txt = re.sub(r'anonymous_(\d+)', lambda m: f'anonymous_f{len(seen)}_{m.group(1)}', txt)   # 匿名记录编号是每次 tblgen 运行各自的 ⇒ 跨文件会撞名
         seen.append(td); d = json.loads(txt)

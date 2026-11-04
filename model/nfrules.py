@@ -156,13 +156,162 @@ def _transpose(S):
         return all(b[1][i] == a[1][p[i]] for i in range(r))
     return [_r(['vector', 'result'], 'rank 相同 ∧ permutation 是 0..rank-1 的排列 ∧ dim(result,i) = dim(vector,perm[i])', f, attrs=True)]
 
+# ───────────────────────── 第 68 轮：切片族（tensor.extract_slice / insert_slice）
+DYN = -(1 << 63)                       # ShapedType::kDynamic
+def offsets_sizes_strides_ok(rank_, nO, nS, nT, attrs):
+    """OffsetSizeAndStrideOpInterface（verifyOffsetSizeAndStrideOp，maxRanks = {rank, rank, rank}）：
+    三个静态数组长度都为 rank；各自的动态操作数个数 = 数组中 kDynamic 的个数；静态 offset/size 非负。返回 (o, s, t) 或 None。"""
+    o, sz, st = (ints(attrs.get(k)) for k in ('static_offsets', 'static_sizes', 'static_strides'))
+    if None in (o, sz, st) or rank_ is None: return None
+    if (nS, nT, nO) != (sz.count(DYN), st.count(DYN), o.count(DYN)): return None
+    if not (len(o) == len(sz) == len(st) == rank_): return None
+    if any(x < 0 and x != DYN for x in o + sz): return None
+    return o, sz, st
+def in_bounds(shape, o, sz, st):
+    """verifyInBoundsSlice：静态源维上，offset < dim，且 offset + (size-1)*stride < dim（size/stride 静态时）。"""
+    for i, d in enumerate(shape):
+        if d is None or o[i] == DYN: continue
+        if o[i] >= d: return False
+        if sz[i] == DYN or st[i] == DYN: continue
+        if o[i] + (sz[i] - 1) * st[i] >= d: return False
+    return True
+def rank_reduced(exp_dims, exp_elt, cand):
+    """isRankReducedType(expected, cand)：类型相同即成立；否则 rank(cand) ≤ rank(expected)，
+    computeRankReductionMask（matchDynamic=false：? 只与 ? 匹配，未匹配的维必须是静态 1），且元素类型相同。不比较编码。"""
+    if cand[1] is None: return False
+    red = list(cand[1]); j = 0
+    if len(red) > len(exp_dims): return False
+    for d in exp_dims:
+        if j < len(red) and d == red[j]: j += 1; continue
+        if d != 1: return False
+    return j == len(red) and cand[2] == exp_elt
+def _dims_of(sz): return tuple(None if x == DYN else x for x in sz)
+def _extract_slice(S):
+    def f(Src, O, Z, T, R, attrs):
+        if len(Src) != 1 or len(R) != 1: return False
+        src, res = Src[0], R[0]
+        ost = offsets_sizes_strides_ok(rank(src), len(O), len(Z), len(T), attrs)
+        if ost is None: return False
+        o, sz, st = ost
+        return rank_reduced(_dims_of(sz), src[2], res) and in_bounds(src[1], o, sz, st)
+    return [_r(['source', 'offsets', 'sizes', 'strides', 'result'],
+               'static_* 长度 = rank(source)，动态操作数个数 = kDynamic 个数，静态 offset/size ≥ 0；'
+               'result 是 tensor<static_sizes × elt(source)> 的降秩（只能去掉静态 1 维，elt 相同，不比较编码）；静态维上不越界', f, attrs=True)]
+def _insert_slice(S):
+    def f(Src, D, O, Z, T, R, attrs):
+        if len(Src) != 1 or len(D) != 1 or len(R) != 1: return False
+        src, dst = Src[0], D[0]
+        ost = offsets_sizes_strides_ok(rank(dst), len(O), len(Z), len(T), attrs)
+        if ost is None: return False
+        o, sz, st = ost
+        return R[0] == dst and rank_reduced(_dims_of(sz), dst[2], src) and in_bounds(dst[1], o, sz, st)
+    return [_r(['source', 'dest', 'offsets', 'sizes', 'strides', 'result'],
+               'static_* 长度 = rank(dest)，动态个数相符，静态 offset/size ≥ 0；source 是 tensor<static_sizes × elt(dest)> 的降秩；'
+               '静态维上不越界；result = dest（DestinationStyle）', f, attrs=True)]
+
+# ───────────────────────── 第 68 轮：vector.transfer_read / transfer_write
+def affine_map(txt):
+    """affine_map<(d0, d1)[s0] -> (d1, 0)> → (维数, 符号数, 结果表)；结果项为 ('d', k) / ('c', v) / ('e', 文本)。"""
+    if txt is None: return None
+    m = _re.fullmatch(r'\s*(?:affine_map<)?\s*\(([^)]*)\)\s*(?:\[([^\]]*)\])?\s*->\s*\((.*)\)\s*>?\s*', txt)
+    if not m: return None
+    dims = [x.strip() for x in m.group(1).split(',') if x.strip()]
+    syms = [x.strip() for x in (m.group(2) or '').split(',') if x.strip()]
+    res = []
+    for e in [x.strip() for x in m.group(3).split(',')] if m.group(3).strip() else []:
+        if e in dims: res.append(('d', dims.index(e)))
+        elif _re.fullmatch(r'-?\d+', e): res.append(('c', int(e)))
+        else: res.append(('e', e))
+    return len(dims), len(syms), res
+def bool_array(txt):
+    if txt is None: return None
+    return _re.findall(r'true|false', txt)
+def bits(t):
+    """DataLayout 默认（无 DLTI）下的 getTypeSizeInBits；不支持的类型返回 None（MLIR 报 missing data layout，致命）。"""
+    if t[0] in ('i', 'f'): return width(t)
+    if t == ('index',): return 64
+    if t[0] == 'opaque' and _re.fullmatch(r'!llvm\.ptr(<\d+>)?', t[1]): return 64     # LLVMPointerType 无 DLTI 时 64 位（各地址空间）
+    if t[0] == 'opaque': raise NFUnknown(t[1])                                           # 其他方言类型的 DataLayoutTypeInterface：未建模 ⇒ 不判
+    if t[0] == 'complex':
+        w = bits(t[1]) if len(t) > 1 and isinstance(t[1], tuple) else None
+        if w is None: return None
+        b = -(-w // 8); al = 1
+        while al < b: al *= 2
+        ia = al * 8
+        return -(-w // ia) * ia + w
+    return None
+class NFUnknown(Exception):
+    """规则在该输入上未建模（方言自定义类型等）：odssig.check 不据此拒绝（上近似），见 closure §9.8 边界。"""
+def valid_vector_elt(t):
+    """VectorType::isValidElementType：int/index/float 或实现 VectorElementTypeInterface 的类型（llvm.ptr 等）。"""
+    if t[0] in ('i', 'f') or t == ('index',): return True
+    if t[0] == 'opaque' and _re.fullmatch(r'!llvm\.ptr(<\d+>)?', t[1]): return True
+    if t[0] == 'opaque': raise NFUnknown(t[1])
+    return False
+def transfer_common(Sh, V, M, nidx, attrs):
+    """verifyTransferOp + 索引个数 + verifyPermutationMap。返回 (ok, 置换表)。"""
+    pm, inb = affine_map(attrs.get('permutation_map')), bool_array(attrs.get('in_bounds'))
+    if pm is None or inb is None: return False, None
+    nd, ns, res = pm
+    if Sh[0] not in ('memref', 'tensor') or Sh[1] is None: return False, None          # 无秩 tensor：getRank 断言（崩溃）⇒ 拒绝
+    if nidx != len(Sh[1]): return False, None
+    if V[0] != 'vector': return False, None
+    vr = len(V[1]); e = Sh[2]
+    if e[0] == 'vector':
+        if vr == 0 or not e[1]: return False, None                                    # getShape().back() 于 0 维：断言
+        bs, bv = bits(e[2]), bits(V[2])
+        if bs is None or bv is None or (bv * V[1][-1]) % (bs * e[1][-1]): return False, None
+        if len(e[1]) > vr or len(res) != vr - len(e[1]) or M: return False, None
+    else:
+        bs, bv = bits(e), bits(V[2])
+        if bs is None or bv is None or (bv * (1 if vr == 0 else V[1][-1])) % bs: return False, None
+        if len(res) != vr: return False, None
+    if ns != 0 or nd != len(Sh[1]): return False, None
+    # verifyPermutationMap（掩码推断要求它成立，否则断言）：每个结果是维或常数 0，维不重复
+    seen = set()
+    for k, v in res:
+        if k == 'e' or (k == 'c' and v != 0) or (k == 'd' and v in seen): return False, None
+        if k == 'd': seen.add(v)
+    if M:
+        used = sorted(seen); pos = {v: i for i, (k, v) in enumerate(res) if k == 'd'}
+        sc = TS.scalable(V)
+        shape = [V[1][pos[d]] for d in used] or [1]
+        scal = tuple(sc[pos[d]] for d in used) or (False,)
+        m = M[0]
+        if not (m[0] == 'vector' and m[2][0] == 'i' and m[2][1] == 1 and list(m[1]) == shape and tuple(TS.scalable(m)) == tuple(scal if used else (False,))): return False, None
+    if len(res) != len(inb): return False, None
+    return True, res
+def _transfer_read(S):
+    def f(B, I, P, M, R, attrs):
+        if len(B) != 1 or len(P) != 1 or len(R) != 1: return False
+        ok, _ = transfer_common(B[0], R[0], M, len(I), attrs)
+        if not ok: return False
+        e, p = B[0][2], P[0]
+        return p == e if e[0] == 'vector' else (p == e and valid_vector_elt(p))
+    return [_r(['base', 'indices', 'padding', 'mask', 'vector'],
+               '#indices = rank(base)；base 为 memref 或有秩 tensor；最内维位宽整除；permutation_map 输入维 = rank(base)、无符号、结果数 = rank(vector)（元素为 vector 时减其秩）、'
+               '结果为不重复的维或 0；mask = 由 permutation_map 推出的 i1 vector；|in_bounds| = 结果数；padding = elt(base)', f, attrs=True)]
+def _transfer_write(S):
+    def f(V, B, I, M, R, attrs):
+        if len(V) != 1 or len(B) != 1: return False
+        ok, res = transfer_common(B[0], V[0], M, len(I), attrs)
+        if not ok or any(k == 'c' for k, _ in res): return False                       # hasBroadcastDim
+        b = B[0]                                                                       # DestinationStyle：tensor base ⇔ 有结果且类型相同
+        return (len(R) == 1 and R[0] == b) if b[0] == 'tensor' else len(R) == 0
+    return [_r(['valueToStore', 'base', 'indices', 'mask', 'result'],
+               '同 transfer_read 的公共部分（无 padding）；permutation_map 不含常数 0（无广播维）；base 为 tensor 时 result = base，为 memref 时无结果', f, attrs=True)]
+
 # 候选规则（待 nf_test 证实）与已登记规则分开：REG 只放经检验的 op
 CANDIDATES = {op: (CAST_COVERS, _cast_rules) for op in _CAST}
 CANDIDATES.update({
     'tensor.dim': ({'接口 verify: ShapedDimOpInterface::Trait'}, _dim), 'memref.load': ({'C++ verify()'}, _load),
     'memref.store': ({'C++ verify()'}, _store), 'tensor.cast': ({'接口 verify: CastOpInterface::Trait'}, _tcast),
     'vector.broadcast': ({'C++ verify()'}, _bcast), 'vector.shape_cast': ({'C++ verify()'}, _shape_cast),
-    'vector.transpose': ({'C++ verify()'}, _transpose)})
+    'vector.transpose': ({'C++ verify()'}, _transpose),
+    'tensor.extract_slice': ({'C++ verify()', '接口 verify: OffsetSizeAndStrideOpInterface::Trait'}, _extract_slice),
+    'tensor.insert_slice': ({'C++ verify()', '接口 verify: OffsetSizeAndStrideOpInterface::Trait', '接口 verify: DestinationStyleOpInterface::Trait'}, _insert_slice),
+    'vector.transfer_read': ({'C++ verify()', '接口 verify: DestinationStyleOpInterface::Trait'}, _transfer_read),
+    'vector.transfer_write': ({'C++ verify()', '接口 verify: DestinationStyleOpInterface::Trait'}, _transfer_write)})
 REG = dict(CANDIDATES)      # 第 66 轮起：nf_test N1 全 PASS 的 op 才留在这里（closure §9.6/§9.7）；未通过的 op 须从 CANDIDATES 删去或修正
 ENABLED = True
 

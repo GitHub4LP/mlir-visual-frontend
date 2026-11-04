@@ -13,7 +13,7 @@
 真实 IR 上的检验沿用 odscomp_test S3（误拒 0；残差为空时误收 0）与 projcomp P1–P5，阈值不变。
 用法：PYTHONPATH=model python3 model/nf_test.py [op 名…]
 """
-import sys, itertools, collections, multiprocessing as mp
+import re, random, sys, itertools, collections, multiprocessing as mp
 
 CONTS = ['{}', 'vector<4x{}>', 'vector<2x{}>', 'vector<[4]x{}>', 'tensor<4x{}>', 'tensor<?x{}>', 'tensor<*x{}>',
          'tensor<4x{}, "enc">', 'tensor<2x4x{}>', 'memref<4x{}>', 'memref<*x{}>',
@@ -65,7 +65,86 @@ def gen_transpose(op):
             for p in PERMS:
                 if abs(len(p) - len(sa)) > 1: continue
                 yield [_v(sa, 'f32')], [_v(sb, 'f32')], {'permutation': 'array<i64' + (': ' + ', '.join(map(str, p)) if p else '') + '>'}
+# 第 68 轮：切片族。源/目的形状 × 静态 offsets/sizes/strides（含 kDynamic、负数、越界、长度不符）× 结果/源类型（含降秩、编码、元素不同）
+DYN = -(1 << 63)
+def _t(dims, e='f32', enc=None):
+    s = 'tensor<' + ''.join(('?' if d is None else str(d)) + 'x' for d in dims) + e + (f', "{enc}"' if enc else '') + '>'
+    return s
+SL_SHAPES = [(), (4,), (None,), (4, 6), (1, 6), (None, 6)]
+def _sl_attrs(r):
+    """每个秩给一组有代表性的 (offsets, sizes, strides)。"""
+    opts = {0: [([], [], [])],
+            1: [([0], [4], [1]), ([1], [2], [2]), ([DYN], [2], [1]), ([0], [DYN], [DYN]), ([3], [2], [1]), ([4], [1], [1]), ([0], [1], [1]), ([-1], [1], [1]), ([0], [-1], [1]), ([0, 0], [1, 1], [1, 1])],
+            2: [([0, 0], [4, 6], [1, 1]), ([0, 0], [1, 6], [1, 1]), ([1, 2], [1, 3], [1, 1]), ([0, DYN], [DYN, 1], [1, DYN]), ([0, 4], [1, 3], [1, 1]), ([0, 0], [1, 1], [1, 1]), ([0, 0], [2, 3], [2, 2]), ([0], [4], [1])]}
+    return opts.get(r, [])
+def _arr(v): return 'array<i64' + (': ' + ', '.join(map(str, v)) if v else '') + '>'
+def _cands(sz, e):
+    """候选的切片类型：精确、降秩（去掉 1）、全动态、元素不同、带编码、秩过大。"""
+    d = tuple(None if x == DYN else x for x in sz)
+    out = {d, tuple(x for x in d if x != 1), tuple(None for _ in d), d + (1,)}
+    if d: out |= {d[1:], d[:-1]}
+    res = [_t(c, e) for c in out] + [_t(d, 'i32'), _t(d, e, 'enc')]
+    return res
+def gen_extract_slice(op):
+    for sh in SL_SHAPES:
+        for o, sz, st in _sl_attrs(len(sh)):
+            at = {'static_offsets': _arr(o), 'static_sizes': _arr(sz), 'static_strides': _arr(st)}
+            nd = [o.count(DYN), sz.count(DYN), st.count(DYN)]
+            for extra in (0, 1):                      # 动态操作数个数正确 / 多一个
+                cnt = [nd[0] + extra, nd[1], nd[2]]
+                for res in _cands(sz, 'f32'):
+                    yield [_t(sh)] + ['index'] * sum(cnt), [res], dict(at, operandSegmentSizes=f'array<i32: 1, {cnt[0]}, {cnt[1]}, {cnt[2]}>')
+            yield [_t(sh, enc='enc')] + ['index'] * sum(nd), [_t(tuple(None if x == DYN else x for x in sz))], dict(at, operandSegmentSizes=f'array<i32: 1, {nd[0]}, {nd[1]}, {nd[2]}>')
+def gen_insert_slice(op):
+    for sh in SL_SHAPES:
+        for o, sz, st in _sl_attrs(len(sh)):
+            at = {'static_offsets': _arr(o), 'static_sizes': _arr(sz), 'static_strides': _arr(st)}
+            nd = [o.count(DYN), sz.count(DYN), st.count(DYN)]
+            for extra in (0, 1):
+                cnt = [nd[0] + extra, nd[1], nd[2]]
+                for src in _cands(sz, 'f32'):
+                    for res in (_t(sh), _t(sh, 'i32')):
+                        yield [src, _t(sh)] + ['index'] * sum(cnt), [res], dict(at, operandSegmentSizes=f'array<i32: 1, 1, {cnt[0]}, {cnt[1]}, {cnt[2]}>')
+# 第 68 轮：transfer_read/write。源（memref/tensor/无秩/vector 元素/complex 元素/vector 本身）× 向量 × permutation_map × in_bounds × mask × 索引个数
+TR_SRC = ['memref<4x8xf32>', 'tensor<4x8xf32>', 'memref<8xf32>', 'tensor<*xf32>', 'memref<4x8xi8>', 'memref<4xvector<2xf32>>', 'memref<4x8xcomplex<f32>>', 'memref<f32>', 'vector<4x8xf32>', 'memref<4x8x!llvm.ptr>']
+TR_VEC = ['vector<4xf32>', 'vector<2x4xf32>', 'vector<[4]xf32>', 'vector<f32>', 'vector<2xf32>', 'vector<4xi8>', 'vector<4x2xf32>', 'vector<3xf32>', 'vector<8xi32>', 'vector<8x!llvm.ptr>']
+TR_MAP = {0: ['affine_map<() -> ()>', 'affine_map<() -> (0)>'],
+          1: ['affine_map<(d0) -> (d0)>', 'affine_map<(d0) -> (0)>', 'affine_map<(d0) -> ()>', 'affine_map<(d0) -> (d0, 0)>', 'affine_map<(d0)[s0] -> (d0)>', 'affine_map<(d0) -> (1)>'],
+          2: ['affine_map<(d0, d1) -> (d1)>', 'affine_map<(d0, d1) -> (d0)>', 'affine_map<(d0, d1) -> (d0, d1)>', 'affine_map<(d0, d1) -> (d1, d0)>',
+              'affine_map<(d0, d1) -> (0, d1)>', 'affine_map<(d0, d1) -> (d1, d1)>', 'affine_map<(d0, d1) -> (d0 + d1)>', 'affine_map<(d0, d1) -> ()>', 'affine_map<(d0) -> (d0)>']}
+def _rank(t):
+    m = re.match(r'(?:memref|tensor|vector)<((?:[0-9?]+x|\[[0-9]+\]x)*)', t)
+    return None if '<*' in t else len(re.findall(r'x', m.group(1))) if m else 0
+def _masks(vec, mp):
+    """候选 mask：无、按规则推断的、形状错的、非可伸缩版本。"""
+    out = [None, 'vector<4xi1>', 'vector<2x4xi1>', 'vector<4x2xi1>', 'vector<[4]xi1>', 'vector<1xi1>']
+    return out
+def gen_transfer(op):
+    rng = random.Random(68)
+    for src in TR_SRC:
+        r = _rank(src) or 0
+        for vi, vec in enumerate(TR_VEC):
+            pert = vi < 2                                   # 独立缺陷（in_bounds 长度、索引个数、padding 类型）只在前两种向量上扰动
+            for mp in TR_MAP.get(r, []) + (TR_MAP[1][:1] if r != 1 else []):
+                n_res = mp.split('->')[1].count('d') + len(re.findall(r'[(, ]0[,)]', mp.split('->')[1]))
+                for nb in ({n_res, n_res + 1} if pert else {n_res}):
+                    inb = '[' + ', '.join(['false'] * nb) + ']'
+                    for nidx in ({r, r + 1} if pert else {r}):
+                        for mk in _masks(vec, mp):
+                            if mk is not None and rng.random() < 0.6: continue
+                            elt = re.search(r'(xcomplex<f32>|vector<2xf32>|f32|i8|!llvm.ptr)>$', src)
+                            pad = {'xcomplex<f32>': 'complex<f32>', 'vector<2xf32>': 'vector<2xf32>', 'f32': 'f32', 'i8': 'i8', '!llvm.ptr': '!llvm.ptr'}.get(elt.group(1) if elt else 'f32', 'f32')
+                            m_ = [mk] if mk else []
+                            at = {'permutation_map': mp, 'in_bounds': inb}
+                            if op == 'vector.transfer_read':
+                                for pd in ({pad, 'f32', 'i8'} if pert else {pad}):
+                                    yield [src] + ['index'] * nidx + [pd] + m_, [vec], dict(at, operandSegmentSizes=f'array<i32: 1, {nidx}, 1, {len(m_)}>')
+                            else:
+                                for res in ({(src,) if src.startswith('tensor') else (), (), ('tensor<4x8xf32>',)} if pert else {(src,) if src.startswith('tensor') else ()}):
+                                    yield [vec, src] + ['index'] * nidx + m_, list(res), dict(at, operandSegmentSizes=f'array<i32: 1, 1, {nidx}, {len(m_)}>')
 GEN = {'tensor.dim': gen_dim, 'memref.load': gen_load, 'memref.store': gen_store, 'tensor.cast': gen_cast,
+       'vector.transfer_read': gen_transfer, 'vector.transfer_write': gen_transfer,
+       'tensor.extract_slice': gen_extract_slice, 'tensor.insert_slice': gen_insert_slice,
        'vector.broadcast': gen_bcast, 'vector.shape_cast': gen_shape_cast, 'vector.transpose': gen_transpose}
 
 def emit(op, ins, outs, attrs):
@@ -89,7 +168,8 @@ def run_op(op, q):
         if tr == 'crash': st['MLIR 崩溃'] += 1; len(ex['崩溃']) < 2 and ex['崩溃'].append((ins, outs, attrs))
         try: ti, to = [TS.parse(t) for t in ins], [TS.parse(t) for t in outs]
         except Exception: st['模型不可解析'] += 1; continue
-        gi, go = G.bind(S, ti, S['ins']), G.bind(S, to, S['outs'])
+        seg = N.ints(attrs['operandSegmentSizes']) if 'operandSegmentSizes' in attrs else None
+        gi, go = G.bind(S, ti, S['ins'], seg), G.bind(S, to, S['outs'])
         model = gi is not None and go is not None and not G.check(S, gi, go, attrs=attrs)
         ods = gi is not None and go is not None and not G.check(S0, gi, go, attrs=attrs)
         truth = tr == 'ok'

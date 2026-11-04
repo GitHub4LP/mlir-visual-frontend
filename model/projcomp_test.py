@@ -63,6 +63,7 @@ def run_file(path, q, kslice, seed):
                         try: tp = TS.parse(t)
                         except Exception: continue
                         r = D.range_holds(Q, cls, rg, j, tp)
+                        if r is D.UNK: st['点未定（nf 未建模）'] += 1
                         r3, w = D.range3(Q, j, t, T0); st['range3/' + r3] += 1
                         if r3 == 'in':
                             m = mlir_ok(sl, ports, w)
@@ -79,13 +80,13 @@ def run_file(path, q, kslice, seed):
                                     asg = dict(zip(others, combo)) | {cls[j]: t}
                                     if D.evaluate(Q, [asg[cls[i]] for i in range(len(ports))]):
                                         st['P5 违例'] += 1; note('P5 违例', f'{[n["op"] for n in sl]} 端口{j} {t}'); break
-                        if exact:
+                        if exact and r is not D.UNK:
                             T = [t if cls[i] == cls[j] else T0[i] for i in range(len(ports))]
                             m = mlir_ok(sl, ports, T)
                             if m is None: st['P1 MLIR 不可判'] += 1; continue
                             st['P1 比较'] += 1; st['P1 接受'] += r
                             if r != m: st['P1 不一致'] += 1; note('P1 不一致', f'{[n["op"] for n in sl]} 端口{j} {t} R={r} MLIR={m} T0={T0}')
-                        elif not r:
+                        elif r is False:
                             others = sorted({cls[i] for i in range(len(ports))} - {cls[j]})
                             if len(cands) ** len(others) > 3000: st['P2 未穷举'] += 1; continue
                             st['P2 拒绝检查'] += 1
@@ -111,8 +112,8 @@ if __name__ == '__main__':
         for k, v in ex.items(): exs[k] += v[:2]
     print('── 合计'); [print(f'   {k}: {v}') for k, v in sorted(tot.items())]
     for k, v in exs.items(): print('──', k); [print('    ', x) for x in v[:8]]
-    V.check('P1 精确端口≡MLIR', tot['P1 比较'] > 0 and tot['P1 不一致'] == 0 and tot['推导异常'] == 0 and tot['投影异常'] == 0,
-            f"比较 {tot['P1 比较']}（接受 {tot['P1 接受']}），不一致 {tot['P1 不一致']}，异常 {tot['推导异常']}+{tot['投影异常']}")
+    V.check('P1 精确端口≡MLIR', tot['文件超时/崩溃'] == 0 and tot['P1 比较'] > 0 and tot['P1 不一致'] == 0 and tot['推导异常'] == 0 and tot['投影异常'] == 0,
+            f"比较 {tot['P1 比较']}（接受 {tot['P1 接受']}），不一致 {tot['P1 不一致']}，异常 {tot['推导异常']}+{tot['投影异常']}，文件崩溃 {tot['文件超时/崩溃']}，点未定 {tot['点未定（nf 未建模）']}")
     V.check('P2 上近似可靠', tot['P2 违例'] == 0, f"拒绝检查 {tot['P2 拒绝检查']}，违例 {tot['P2 违例']}，未穷举 {tot['P2 未穷举']}")
     V.check('P4 in可靠', tot['P4 比较'] > 0 and tot['P4 不一致'] == 0, f"比较 {tot['P4 比较']}，不一致 {tot['P4 不一致']}，MLIR 不可判 {tot['P4 MLIR 不可判']}")
     V.check('P5 out可靠', tot['P5 检查'] > 0 and tot['P5 违例'] == 0, f"检查 {tot['P5 检查']}，违例 {tot['P5 违例']}，未穷举 {tot['P5 未穷举']}")

@@ -170,7 +170,7 @@ BUILD = {'$_builder.getIndexType()': ('index',), '$_builder.getI1Type()': ('i', 
          '$_builder.getType<::mlir::shape::ShapeType>()': ('shape.shape',), '$_builder.getType<::mlir::shape::WitnessType>()': ('shape.witness',),
          '$_builder.getI64Type()': ('i', 64, ''), '$_builder.getI32Type()': ('i', 32, ''), '$_builder.getF32Type()': ('f', 'f32')}
 
-def check(S, ins, outs, levels=('ods', 'cpred', 'nf'), attrs=None):
+def check(S, ins, outs, levels=('ods', 'cpred', 'nf'), attrs=None, strict=False):
     """ins/outs：按端口分组的类型列表（[[t…] 每组]）。返回违例列表。"""
     bad = []
     env = {}
@@ -221,6 +221,9 @@ def check(S, ins, outs, levels=('ods', 'cpred', 'nf'), attrs=None):
             if x[5] and attrs is None: continue                  # 无属性信息（如只看类型的查询）：不判，上近似
             try: ok = bool(x[4](*groups, attrs) if x[5] else x[4](*groups))
             except (IndexError, TypeError, KeyError): ok = False   # 端口不满足 ODS 基本约束时规则无定义；此时 ODS 约束本身已拒绝
+            except Exception as e:
+                if type(e).__name__ != 'NFUnknown' or strict: raise
+                continue                                         # 规则未建模的输入（方言自定义类型）：逐点检查不判（上近似）；strict 时上抛，由 odscomp 记为该点 Unknown
         else: ok = True
         if not ok: bad.append(f'{k}({",".join(str(a[1]) for a in x[1])})')
     if S['infer'] and 'ods' in levels and not partial:
