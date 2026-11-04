@@ -12,7 +12,7 @@
 首跑（每函数 4 组输入）：候选 94、执行 36、比较 562、不一致 0；二跑改为至多 16 组取 4 组（事后，只改采样，阈值不变）。
 阈值（运行前写定）：FT 比较 ≥ 300、不一致 0、文件超时/崩溃 0；FT 灵敏度：seed+1 比较 ≥ 50 且发现率 ≥ 50%。
 用法：PYTHONPATH=model python3 model/ftensorjit_test.py [文件数上限] [FT2 程序数]
-第 61 轮 FT2（阈值运行前写定）：浮点 arith 逐元素作用于 tensor 定向，执行 ≥ 150、不一致 0、cmpf pred 变异发现 > 0；通过后 valimport 开放 bf16/f32/f64 元素 tensor 的逐元素 arith（f16 仍未知）。
+第 61 轮 FT2（阈值运行前写定）：浮点 arith 逐元素作用于 tensor 定向，执行 ≥ 150、不一致 0、cmpf pred 变异发现 > 0；第 61b 轮 FT2b（转换 sitofp/uitofp/fptosi/fptoui/bitcast，阈值运行前写定）执行 ≥ 60、不一致 0；通过后 valimport 开放 bf16/f32/f64 元素 tensor 的逐元素 arith（f16 仍未知）。
 """
 import sys, re, glob, random, collections, multiprocessing as mp
 import z3
@@ -334,14 +334,32 @@ def gen_few(rng):
     body = '\n  '.join(L)
     return f'func.func @main(%a: {ty}, %b: {ty}, %s: i1) -> {ty} {{\n  {body}\n  return {vs[-1]} : {ty}\n}}', [ty, ty, 'i1'], [ty]
 
-def FT2(n, seed=61):
+def gen_conv(rng):
+    """第 61b 轮：整数↔浮点转换逐元素作用于 tensor（61 轮开放时 FT2 未覆盖，补证据）。"""
+    sh, e, it = rng.choice([('2x3x', 'f32', 'i32'), ('?x', 'f32', 'i8'), ('', 'f64', 'i64'), ('4x', 'bf16', 'i16'), ('?x', 'f64', 'i32')])
+    ft, iT = f'tensor<{sh}{e}>', f'tensor<{sh}{it}>'
+    L = []; fv = ['%a']; iv = ['%i']; k = [0]
+    def nv():
+        k[0] += 1; return f'%v{k[0]}'
+    for _ in range(rng.randrange(2, 5)):
+        r = rng.random(); o = nv()
+        if r < 0.3: L.append(f'{o} = arith.{rng.choice(["sitofp", "uitofp"])} {rng.choice(iv)} : {iT} to {ft}'); fv.append(o)
+        elif r < 0.6: L.append(f'{o} = arith.{rng.choice(["fptosi", "fptoui"])} {rng.choice(fv)} : {ft} to {iT}'); iv.append(o)
+        elif r < 0.7 and e == 'f32' and it == 'i32': L.append(f'{o} = arith.bitcast {rng.choice(iv)} : {iT} to {ft}'); fv.append(o)
+        elif r < 0.85: L.append(f'{o} = arith.{rng.choice(FBIN)} {rng.choice(fv)}, {rng.choice(fv)} : {ft}'); fv.append(o)
+        else: L.append(f'{o} = arith.addi {rng.choice(iv)}, {rng.choice(iv)} : {iT}'); iv.append(o)
+    rt, rv = (ft, fv[-1]) if rng.random() < 0.5 else (iT, iv[-1])
+    body = '\n  '.join(L)
+    return f'func.func @main(%a: {ft}, %b: {ft}, %s: i1, %i: {iT}) -> {rt} {{\n  {body}\n  return {rv} : {rt}\n}}', [ft, ft, 'i1', iT], [rt]
+
+def FT2(n, seed=61, gen=None):
     import mlir.ir as ir, irimport as I
     from valimport_test import derive_imported
     rng = random.Random(seed); st = collections.Counter(); ex = collections.defaultdict(list)
     def note(k, v):
         if len(ex[k]) < 3: ex[k].append(v)
     for t in range(n):
-        txt, ins, outs = gen_few(rng)
+        txt, ins, outs = (gen or gen_few)(rng)
         try: m = ir.Module.parse(txt, TJ.ctx1()); assert m.operation.verify()
         except Exception: st['不合法（跳过）'] += 1; continue
         fn = I.import_module(m)['regions'][0][0]['ops'][0]
@@ -368,6 +386,11 @@ if __name__ == '__main__':
         for k, v in ex.items(): print('──', k); [print('    ', x) for x in v]
         V.check('FT2 浮点逐元素', st['函数（已执行）'] >= 150 and st['不一致'] == 0 and st['变异 pred 发现'] > 0,
                 f"程序 {st['程序']}，执行 {st['函数（已执行）']}，比较 {st['比较']}（NaN {st['比较/浮点值·NaN']}），不一致 {st['不一致']}，pred 变异发现 {st['变异 pred 发现']}/{st['变异 pred 比较']}")
+        st, ex = FT2(int(sys.argv[2]) // 2, seed=611, gen=gen_conv)
+        print('── FT2b 整数↔浮点转换逐元素:'); [print(f'   {k}: {v}') for k, v in sorted(st.items())]
+        for k, v in ex.items(): print('──', k); [print('    ', x) for x in v]
+        V.check('FT2b 转换逐元素', st['函数（已执行）'] >= 60 and st['不一致'] == 0,
+                f"程序 {st['程序']}，执行 {st['函数（已执行）']}，比较 {st['比较']}，不一致 {st['不一致']}")
         if int(sys.argv[1]) == 0: V.finish(); sys.exit()
     import verdict as V
     lim = int(sys.argv[1]) if len(sys.argv) > 1 else 10 ** 9
