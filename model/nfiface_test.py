@@ -11,7 +11,9 @@
 """
 import sys, re, glob, random, collections, multiprocessing as mp
 
-IFACE_DIAG = {'DPS': re.compile(r'is a tensor or a memref|to be equal to the number of output tensors|to match type of corresponding result')}
+IFACE_DIAG = {'DPS': re.compile(r'is a tensor or a memref|to be equal to the number of output tensors|to match type of corresponding result'),
+              'LinalgOp': re.compile(r'pure tensor or buffer semantics|indexing_map|non-invertible|shape-to-loops|1 region with 1 block|non-induction variable region|bb argument|inferred input/output operand|unexpected result less than 0|operand rank')}
+# 第 70 轮：LinalgOp 变异所有操作数（不只 init）；N2d：declared 已清空的 op 上，完整模型（无预言机）≡ MLIR。
 
 def _variants(t):
     """一个类型的变异：tensor ↔ memref、换形状、无秩。"""
@@ -25,6 +27,12 @@ def _variants(t):
     other = 'memref' if k == 'tensor' else 'tensor'
     out = [f'{other}<{d}{e}>', f'{k}<*x{e}>' if k == 'tensor' else f'memref<*x{e}>', f'{k}<7x{d}{e}>']
     if e != 'f32': out.append(f'{k}<{d}f32>')
+    ds = [x for x in d.split('x') if x]
+    if ds:
+        st = [i for i, x in enumerate(ds) if x != '?']
+        if st: i = st[0]; out.append(f"{k}<{'x'.join(ds[:i] + [str(int(ds[i]) + 1)] + ds[i + 1:])}x{e}>")
+        out.append(f"{k}<{'x'.join(['?'] + ds[1:])}x{e}>")
+        out.append(f"{k}<{'x'.join(ds[:-1])}{'x' if len(ds) > 1 else ''}{e}>")
     return out
 
 def run_file(path, q, seed):
@@ -46,15 +54,18 @@ def run_file(path, q, seed):
             body = fn['regions'][0][0]['ops']
             tyof = {a: t for a, t in fn['regions'][0][0]['args']} | {o: t for n in body for o, t in n['outs']}
             for n in body:
+                at0 = (n.get('props') or {}).get('_attrs') or {}
+                if 'linalg.memoized_indexing_maps' in at0:          # MLIR verify 时写入的缓存：去掉，检验由 yaml 推出的映射（前端的 op 不带它）
+                    n = dict(n); n['props'] = dict(n['props']); n['props']['_attrs'] = {k: v for k, v in at0.items() if k != 'linalg.memoized_indexing_maps'}
                 lk = G.lookup(n['op'])
                 if not lk: continue
                 S = lk[1]
-                atoms = [x for x in S['rel'] if x[0] == 'nf' and str(x[3]).startswith('DPS')]
+                atoms = [(nm, x) for x in S['rel'] if x[0] == 'nf' for nm in IFACE_DIAG if str(x[3]).startswith(nm)]
                 if not atoms: continue
-                x = atoms[0]
+                full = not S['declared'] and not S['unknown']
                 ports = list(dict.fromkeys(n['ins']))
                 if not ports: continue
-                gname = x[1][0][1]
+                gname = 'outputs' if any(nm == 'LinalgOp' for nm, _ in atoms) else atoms[0][1][1][0][1]
                 try:
                     gi0 = G.bind(S, [TS.parse(tyof[v]) for v in n['ins']], S['ins'], D._seg(n))
                 except Exception: continue
@@ -64,37 +75,75 @@ def run_file(path, q, seed):
                 init_vals = n['ins'][k0:k0 + kn]
                 T0 = [tyof[v] for v in ports]
                 cases = [('原类型', T0, None)]
-                for v in init_vals:
+                mut_vals = n['ins'] if any(nm == 'LinalgOp' for nm, _ in atoms) else init_vals
+                for v in list(dict.fromkeys(mut_vals)):
                     j = ports.index(v)
                     for t in _variants(T0[j]): cases.append(('init', T0[:j] + [t] + T0[j + 1:], None))
                 for k, (o, t) in enumerate(n['outs']):
                     for t2 in _variants(t): cases.append(('result', T0, (k, t2)))
+                at1 = (n.get('props') or {}).get('_attrs') or {}
+                for an in ('strides', 'dilations'):
+                    k = None
+                    if an in at1:
+                        m_ = re.search(r'tensor<(\d+)xi64>', at1[an]); k = int(m_.group(1)) if m_ else None
+                    elif any(a[0] == an for a in S['attrs']):
+                        m_ = [a for a in S['attrs'] if a[0] == an]; m2 = re.search(r'\[(\d+)\]', str(m_[0][1])); k = int(m2.group(1)) if m2 else None
+                    if k:
+                        for v in (2, 3): cases.append(('attr', T0, ('attr', an, f'dense<{v}> : tensor<{k}xi64>')))
+                if 'indexing_maps' in at1:
+                    ms = re.findall(r'affine_map<.*?>(?=\s*[,\]])', at1['indexing_maps'])
+                    if len(ms) >= 2: cases.append(('attr', T0, ('attr', 'indexing_maps', '[' + ', '.join(ms[::-1]) + ']')))
+                    if 'iterator_types' in at1:
+                        its = re.findall(r'#linalg\.iterator_type<\w+>', at1['iterator_types'])
+                        if its: cases.append(('attr', T0, ('attr', 'iterator_types', '[' + ', '.join(its[:-1]) + ']')))
                 st['op 实例'] += 1
                 for kind, T, rmut in cases:
                     bs = instantiate([n], ports, T)
                     if bs is None: st['不可实例化'] += 1; continue
                     node = bs[0]['ops'][0]
-                    if rmut is not None:
+                    if rmut is not None and rmut[0] == 'attr':
+                        node['props'] = dict(node['props']); node['props']['_attrs'] = dict(node['props']['_attrs']); node['props']['_attrs'][rmut[1]] = rmut[2]
+                    elif rmut is not None:
                         k, t2 = rmut; node['outs'] = [(o, t2 if i == k else t) for i, (o, t) in enumerate(node['outs'])]
                     try:
                         ins_t = [TS.parse(t) for t in node['props']['_types']]; outs_t = [TS.parse(t) for _, t in node['outs']]
                         gi = G.bind(S, ins_t, S['ins'], D._seg(n)); go = G.bind(S, outs_t, S['outs'])
                     except Exception: st['类型不可解析'] += 1; continue
                     if gi is None or go is None: st['无法绑定'] += 1; continue
-                    mini = dict(S, ins=[(nm, T_, mm, b) for nm, _, mm, b in S['ins']], outs=[(nm, T_, mm, b) for nm, _, mm, b in S['outs']], infer=None, rel=[x])
-                    r_rej = bool(G.check(mini, gi, go))
+                    import attrsig as A, nfrules as NF, composite as CP
+                    try: at = NF.nf_attrs(node, A.from_core(node))
+                    except Exception: at = None
+                    rr = {}
+                    for nm, x in atoms:
+                        mini = dict(S, ins=[(q, T_, mm, b) for q, _, mm, b in S['ins']], outs=[(q, T_, mm, b) for q, _, mm, b in S['outs']], infer=None, rel=[x])
+                        try: rr[nm] = bool(G.check(mini, gi, go, attrs=at, strict=True))
+                        except NF.NFUnknown as e: rr[nm] = None; note('规则未定', f"{nm} {n['op']} {str(e)[:80]}")
+                    if full:
+                        try:
+                            import core as C
+                            old = C.ORACLE_ON; C.ORACLE_ON = False
+                            full_rej = bool(C.typecheck(bs, '(' + ', '.join(T) + ') -> ()'))
+                        except Exception as e: full_rej = None; note('完整模型异常', f"{n['op']} {type(e).__name__}: {str(e)[:80]}")
+                        finally: C.ORACLE_ON = old
                     text = OR.emit_core(bs, '(' + ', '.join(T) + ') -> ()')
                     if text is None: st['不可发射'] += 1; continue
                     tr, diags = OR.get().verify(text)
                     if tr == 'parse': st['MLIR parse'] += 1; continue
-                    if tr == 'crash': st['MLIR 崩溃'] += 1; continue
-                    ok = tr == 'ok'; msg = ' '.join(d[1] for d in diags) if diags else ''
-                    dps = bool(IFACE_DIAG['DPS'].search(msg))
-                    st['比较'] += 1; st['MLIR 接受'] += ok; st['接口诊断'] += dps; st['规则拒绝'] += r_rej
-                    st['变异/' + kind] += 1
-                    if ok and r_rej: st['N2a 误拒'] += 1; note('误拒', f"{n['op']} {kind} {T} {rmut}")
-                    if dps and not r_rej: st['N2b 漏判'] += 1; note('漏判', f"{n['op']} {kind} {T} {rmut} {msg[:90]}")
-                    if not ok and not dps and r_rej: st['规则拒绝/MLIR 别的诊断'] += 1
+                    if tr == 'crash': st['MLIR 崩溃（按拒绝计）'] += 1
+                    ok = tr == 'ok'; msg = ' '.join(d[1] for d in diags) if (diags and tr != 'crash') else ''
+                    st['比较'] += 1; st['MLIR 接受'] += ok; st['变异/' + kind] += 1
+                    for nm, r_rej in rr.items():
+                        dg = bool(IFACE_DIAG[nm].search(msg))
+                        if r_rej is None: st[f'{nm}/规则未定'] += 1; continue
+                        st[f'{nm}/比较'] += 1; st[f'{nm}/接口诊断'] += dg; st[f'{nm}/规则拒绝'] += r_rej; st[f'{nm}/MLIR 接受'] += ok
+                        st['接口诊断'] += dg; st['规则拒绝'] += r_rej
+                        if ok and r_rej: st['N2a 误拒'] += 1; note('误拒', f"{nm} {n['op']} {kind} {T} {rmut}")
+                        if dg and not r_rej: st['N2b 漏判'] += 1; note('漏判', f"{nm} {n['op']} {kind} {T} {rmut} {msg[:90]}")
+                        if not ok and not dg and r_rej: st['规则拒绝/MLIR 别的诊断'] += 1
+                    if full and full_rej is not None:
+                        st['N2d 比较'] += 1; st['N2d MLIR 拒绝'] += not ok
+                        if ok and full_rej: st['N2d 误拒'] += 1; note('N2d 误拒', f"{n['op']} {kind} {T} {rmut}")
+                        if not ok and not full_rej: st['N2d 误收'] += 1; note('N2d 误收', f"{n['op']} {kind} {T} {rmut} {msg[:90]}")
     q.put((st, dict(ex)))
 
 if __name__ == '__main__':
@@ -113,5 +162,7 @@ if __name__ == '__main__':
     V.check('N2a 接口规则无误拒', tot['比较'] > 0 and tot['N2a 误拒'] == 0 and tot['文件超时/崩溃'] == 0,
             f"比较 {tot['比较']}（op 实例 {tot['op 实例']}），MLIR 接受 {tot['MLIR 接受']}，误拒 {tot['N2a 误拒']}，文件崩溃 {tot['文件超时/崩溃']}")
     V.check('N2b 接口诊断必拒', tot['接口诊断'] > 0 and tot['N2b 漏判'] == 0 and tot['MLIR 接受'] > 0 and tot['规则拒绝'] > 0,
-            f"接口诊断 {tot['接口诊断']}，漏判 {tot['N2b 漏判']}，规则拒绝 {tot['规则拒绝']}（其中 MLIR 报别的诊断 {tot['规则拒绝/MLIR 别的诊断']}），MLIR 崩溃 {tot['MLIR 崩溃']}")
+            f"接口诊断 {tot['接口诊断']}，漏判 {tot['N2b 漏判']}，规则拒绝 {tot['规则拒绝']}（其中 MLIR 报别的诊断 {tot['规则拒绝/MLIR 别的诊断']}），MLIR 崩溃 {tot['MLIR 崩溃（按拒绝计）']}")
+    V.check('N2d 清空 op 完整模型≡MLIR', tot['N2d 比较'] > 0 and tot['N2d MLIR 拒绝'] > 0 and tot['N2d 误拒'] == 0 and tot['N2d 误收'] == 0,
+            f"比较 {tot['N2d 比较']}（MLIR 拒绝 {tot['N2d MLIR 拒绝']}），误拒 {tot['N2d 误拒']}，误收 {tot['N2d 误收']}")
     V.finish()

@@ -366,3 +366,188 @@ def apply(S, reg=None):
             if rs is None: continue
             S['rel'] += rs; S['nf_covered'].append(d); S['declared'] = [x for x in S['declared'] if x != d]
     return S
+
+# ───────────────────────── 第 70 轮：LinalgOp::Trait（verifyStructuredOpInterface + IndexingMapOpInterface::verifyImpl），closure §9.10
+# 依据：Linalg/IR/LinalgInterfaces.cpp verifyStructuredOpInterface、Interfaces/IndexingMapOpInterface.cpp verifyImpl、
+#       IR/AffineMap.cpp inversePermutation/concatAffineMaps、tools/mlir-linalg-ods-gen/mlir-linalg-ods-yaml-gen.cpp（命名 op 的 getIndexingMaps）。
+# 映射来源：linalg.generic ← 属性 indexing_maps / iterator_types；opdsl 命名 op ← LinalgNamedStructuredOps.yaml（符号按 index 属性或默认值绑定）。
+# 手写 getIndexingMaps 的 9 个 op（matmul 族、contract、elementwise、transpose、broadcast、reduce、map）暂不套用，条目留在残差。
+import os as _os
+_YAML = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), '..', 'inventory', 'LinalgNamedStructuredOps.yaml')
+
+@functools.lru_cache(None)
+def linalg_yaml():
+    import yaml
+    class L(yaml.SafeLoader): pass
+    def _any(loader, suffix, node):
+        if isinstance(node, yaml.MappingNode): return loader.construct_mapping(node, deep=True)
+        if isinstance(node, yaml.SequenceNode): return loader.construct_sequence(node, deep=True)
+        return loader.construct_scalar(node)
+    L.add_multi_constructor('!', _any)
+    out = {}
+    for doc in yaml.load_all(open(_YAML), Loader=L):
+        if not doc: continue
+        so = doc['structured_op']; nm = doc['metadata']['name']
+        out[nm] = so
+    return out
+
+def _dense_i64(txt, n):
+    """index 属性文本（dense<[2, 2]> : tensor<2xi64> 或 dense<1> : tensor<2xi64>）→ 整数表；读不出 None。"""
+    if txt is None: return None
+    m = _re.match(r'\s*dense<\s*(\[[^\]]*\]|-?\d+)\s*>', txt)
+    if not m: return None
+    v = m.group(1)
+    if v.startswith('['): xs = [int(x) for x in _re.findall(r'-?\d+', v)]
+    else: xs = [int(v)] * n
+    return xs if len(xs) == n else None
+
+def _yaml_provider(nm):
+    """命名 op：返回 f(操作数类型表, attrs) → (映射表, 循环数)；不可套用（映射用到非属性符号等）返回 None。"""
+    import affine as AF
+    so = linalg_yaml().get(nm)
+    if so is None or 'static_indexing_maps' not in (so.get('indexing_maps') or {}): return None
+    maps_txt = so['indexing_maps']['static_indexing_maps']
+    rankpoly = not so.get('iterator_types')
+    nloops_fixed = len(so.get('iterator_types') or [])
+    parsed = [AF.parse_map(t) for t in maps_txt]
+    binds = []                                        # (属性名, 符号位置, 属性下标, 默认值, 长度)
+    for a in so['args']:
+        if a['kind'] != 'index_attr': continue
+        _, _, rs = AF.parse_map(a['index_attr_map'])
+        for idx, r in enumerate(rs):
+            ss = AF.uses_syms(r)
+            if r[0] == 'lin' and len(r[1]) == 1 and not r[2] and list(r[1].values()) == [1] and len(ss) == 1:
+                binds.append((a['name'], ss.pop(), idx, a['default_indices'][idx], len(rs)))
+    bound = {b[1] for b in binds}
+    if not rankpoly and any(AF.uses_syms(e) - bound for _, _, es in parsed for e in es): return None
+    nops = sum(a['kind'] in ('input_tensor', 'output_tensor', 'scalar') for a in so['args'])
+    def prov(ops, attrs):
+        vals = {}
+        for name, pos, idx, dflt, n in binds:
+            if name in attrs:
+                xs = _dense_i64(attrs[name], n)
+                if xs is None: raise NFUnknown(f'{name}={attrs[name]}')
+                vals[pos] = xs[idx]
+            else: vals[pos] = dflt
+        memo = attrs.get('linalg.memoized_indexing_maps')
+        if memo is not None:                                           # getIndexingMaps 先读缓存属性（MLIR 自己在 verify 时写入；带着它的 IR 按缓存的映射判定）
+            try: return [AF.parse_map(x) for x in _split_maps(memo)], nloops_fixed
+            except AF.AffineError as e: raise NFUnknown(str(e))
+        maps = [(nd, 0, [AF.subst_syms(e, vals) for e in es]) for nd, _, es in parsed]
+        return maps, nloops_fixed
+    return prov, rankpoly, nops
+
+class _Crash(Exception):
+    """MLIR 在此输入上断言失败（崩溃）；规范化为拒绝。"""
+
+def _lrank(t):
+    """LinalgOp getRank：VectorType 是元素类型，取 0；tensor/memref 取秩（无秩断言 ⇒ 崩溃）；其余 0。"""
+    if t[0] in ('tensor', 'memref'):
+        if t[1] is None: raise _Crash()
+        return len(t[1])
+    return 0
+def _lshape(t):
+    if t[0] in ('tensor', 'memref'):
+        if t[1] is None: raise _Crash()
+        return [(-1 if d is None else d) for d in t[1]]           # -1 代表 kDynamic
+    return []
+
+def structured_ok(ops, maps, nloops_iter, bbargs):
+    """verifyStructuredOpInterface 在操作数类型 ops、映射 maps（(维数, 符号数, 表达式表)）、迭代器个数、区域入口块参数类型下是否通过。"""
+    import affine as AF
+    is_t = lambda t: t[0] == 'tensor'; is_m = lambda t: t[0] == 'memref'
+    if ops and not ((not any(map(is_m, ops)) and any(map(is_t, ops))) or (not any(map(is_t, ops)) and any(map(is_m, ops)))): return False
+    # IndexingMapOpInterface::verifyImpl
+    if len(maps) != len(ops): return False
+    if any(ns for _, ns, _ in maps): return False                  # 有符号：inversePermutation 断言（崩溃）或“unexpected symbols”，均拒绝
+    nd = max([m[0] for m in maps], default=0)                      # concatAffineMaps：维数取最大
+    allres = [e for _, _, es in maps for e in es]
+    shapes = [_lshape(t) for t in ops]
+    flat = [d for s in shapes for d in s]
+    if nd == 0 and not allres: ranges = []                         # 空映射：inversePermutation 原样返回
+    else:
+        pos = [None] * nd
+        for i, e in enumerate(allres):
+            d = AF.is_dim(e)
+            if d is not None and pos[d] is None: pos[d] = i
+        if any(p is None for p in pos): return False               # 不可逆
+        if len(flat) != len(allres): raise _Crash()                # compose 的值个数与映射结果数不符（秩不符时在后面拒绝，但先求 ranges 会断言）
+        ranges = [flat[p] for p in pos]
+    for (mnd, _, es), s in zip(maps, shapes):
+        if mnd != len(ranges): return False
+        if len(es) != len(s): return False
+    if all(r != -1 for r in ranges):
+        lo = [0] * len(ranges); hi = [r - 1 for r in ranges]
+        for (_, _, es), s in zip(maps, shapes):
+            for k, e in enumerate(es):
+                if s[k] == -1 or s[k] == 0: continue
+                a, b = AF.evaluate(e, lo), AF.evaluate(e, hi)
+                if min(a, b) < 0: return False
+                inf = max(a, b) + 1
+                if AF.is_dim(e) is not None:
+                    if inf != s[k]: return False
+                elif inf > s[k]: return False
+    # verifyStructuredOpInterface 其余部分
+    if any(m[0] != nloops_iter for m in maps): return False
+    if bbargs is None: return False                                # 没有区域或区域不是恰一个块
+    if len(bbargs) != len(ops): return False
+    for t, a in zip(ops, bbargs):
+        el = t[2] if (t[0] == 'memref' or (t[0] == 'tensor' and t[1] is not None)) else t
+        if el != a: return False
+    return True
+
+def _linalg_iface(S):
+    import affine as AF
+    nm = S['op'].split('.', 1)[1]
+    names = [n for n, *_ in S['ins']]
+    if 'inputs' not in names or 'outputs' not in names: return None
+    outs = [n for n, *_ in S['outs']]
+    if S['op'] == 'linalg.generic':
+        def f(I, O, *R_at):
+            attrs = R_at[-1]; ops = list(I) + list(O)
+            if any(t[0] == 'opaque' for t in ops): raise NFUnknown('方言类型')
+            try:
+                maps = [AF.parse_map(x) for x in _split_maps(attrs.get('indexing_maps'))]
+                nit = len(_re.findall(r'iterator_type<', attrs.get('iterator_types') or ''))
+                return structured_ok(ops, maps, nit, _bbargs(attrs))
+            except _Crash: return False
+            except AF.AffineError as e: raise NFUnknown(str(e))
+        return [_r(['inputs', 'outputs'] + outs, 'LinalgOp：纯 tensor/纯 buffer；#indexing_maps = #操作数、可逆、无符号、维数 = 循环数 = #iterator_types、结果数 = 秩；静态形状与循环范围一致；区域入口块参数 = 各操作数的元素类型', f, attrs=True)]
+    p = _yaml_provider(nm)
+    if p is None: return None
+    prov, rankpoly, nops = p
+    def g(I, O, *R_at):
+        attrs = R_at[-1]; ops = list(I) + list(O)
+        if any(t[0] == 'opaque' for t in ops): raise NFUnknown('方言类型')
+        try:
+            if rankpoly:
+                if not O: return False                                     # getDpsInitOperand(0) 越界：断言
+                n = _lrank(O[0])
+                maps = [(n, 0, [] if _lrank(t) == 0 else [AF._lin({('d', i): 1}) for i in range(n)]) for t in ops]
+                return structured_ok(ops, maps, n, _bbargs(attrs))
+            maps, nit = prov(ops, attrs)
+            return structured_ok(ops, maps, nit, _bbargs(attrs))
+        except _Crash: return False
+    return [_r(['inputs', 'outputs'] + outs, f'LinalgOp（{nm}，映射取自 opdsl yaml）：同 linalg.generic 的结构化检查', g, attrs=True)]
+
+def _split_maps(txt):
+    if txt is None: raise NFUnknown('缺 indexing_maps')
+    return _re.findall(r'affine_map<.*?>(?=\s*[,\]])', txt)
+
+def _bbargs(attrs):
+    """区域 0 入口块参数的类型（由 nf_attrs 放入）；区域无块为 None；没有区域信息时未建模。"""
+    if '\x00bbargs' not in attrs: raise NFUnknown('无区域信息')
+    v = attrs['\x00bbargs']
+    return None if v is None else [TS.parse(t) for t in v]
+
+def nf_attrs(n, at):
+    """给 nf 规则用的属性表：在 from_core 的结果上加区域 0 入口块参数类型（只给 nf 规则看，不作为 MLIR 属性）。"""
+    if at is None: return None
+    rs = n.get('regions') or []
+    if not rs: return at
+    at = dict(at)
+    r0 = rs[0]
+    at['\x00bbargs'] = None if len(r0) != 1 else [t for _, t in r0[0].get('args', [])]
+    return at
+
+IFACE['接口 verify: LinalgOp::Trait'] = _linalg_iface
