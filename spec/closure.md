@@ -335,3 +335,36 @@ R_j(t) ≝ ∃ 其余端口. Φ_comp，即用户需求里“签名允许的最�
 - 复跑时“L1 按账目”FAIL（auto 类有分歧 2）。原因是 nf 覆盖后，tensor.cast 和 shape_cast 由 declared 转为 auto，但这一项原先只按 ods+cpred 比较。改为按完整模型比较后 PASS。这是检验口径随机制一起修正，不是放宽：被比较的模型更强，且不允许分歧。
 
 **下一批**（work/resid67.txt）：vector.transfer_read 722、transfer_write 504、tensor.extract_slice 470、insert_slice 339、memref.subview 322、vector.contract 234。修好前 10 个 op 可清空 1321/2968。这些 op 的规则都依赖属性，例如 permutation_map、in_bounds、static_offsets/sizes/strides，还涉及结果类型推断（strided 布局）。
+
+### 9.8 第三批：切片族与 transfer（第 68 轮）
+**覆盖**（依据 MLIR 9bae84b0：Tensor/IR/TensorOps.cpp、Vector/IR/VectorOps.cpp、IR/BuiltinTypes.cpp 的 isRankReducedType / computeRankReductionMask、Interfaces/ViewLikeInterface.cpp、Interfaces/DataLayoutInterfaces.cpp 的默认位宽）：
+
+| op | 规则 | 被覆盖的 declared |
+|---|---|---|
+| tensor.extract_slice | static_* 长度 = rank(source)；动态操作数个数 = kDynamic 个数；静态 offset/size ≥ 0；result 是 tensor<static_sizes × elt(source)> 的降秩（只去静态 1 维，`?` 只与 `?` 匹配，elt 相同，**不比较编码**）；静态维上不越界 | C++ verify()、OffsetSizeAndStrideOpInterface |
+| tensor.insert_slice | 同上，以 dest 为基准、source 为降秩候选；result = dest | 另加 DestinationStyleOpInterface |
+| vector.transfer_read | #indices = rank(base)；base 为 memref 或有秩 tensor；最内维位宽整除（元素为 vector 时按其最内维）；permutation_map 输入维 = rank(base)、无符号、结果数 = rank(vector)（元素为 vector 时减其秩）；结果为不重复的维或常数 0；mask = 由 map 推出的 i1 vector（compressUnusedDims + inversePermutation，0 维时为 vector<1xi1>，带可伸缩标志）；元素为 vector 时不许 mask；\|in_bounds\| = 结果数；padding = elt(base) 且为合法向量元素 | C++ verify()、DestinationStyleOpInterface |
+| vector.transfer_write | 公共部分同上；map 不含常数 0（无广播维）；tensor base ⇔ 有结果且 = base，memref base ⇔ 无结果 | 同上 |
+
+**机制扩展：逐点三值**。nf 规则遇到未建模的输入（方言自定义类型的 DataLayoutTypeInterface 位宽、VectorElementTypeInterface）时抛 NFUnknown。odscomp 中该原子取 UNK，Φ(T) ∈ {接受, 拒绝, 未定}：有原子为假即拒绝，否则有 UNK 即未定（交预言机）。range_holds/range3 不把 UNK 当作“必要条件不成立”，P1 不对 UNK 点作精确比较。逐点检查（odssig.check 非 strict）对未建模点不判（上近似）。已建模：`!llvm.ptr`（任意地址空间，无 DLTI 时 64 位，合法向量元素）。
+
+**检验**：
+
+| 判据 | 结果 |
+|---|---|
+| N1（本批 4 op） | extract_slice 605/接受 101、insert_slice 1124/73、transfer_read+write 9969/228；误拒 0，误收 0。transfer 接受例中含 mask 44、vector 元素 14、可伸缩 30、广播维 28 |
+| N1（累计 23 op） | 比较 57204，接受 2949；误拒 0，误收 0；崩溃 5278（按拒绝计）；消融误收 15875 |
+| odscomp S1–S4（27960 实例） | 全 PASS；S3 误拒 0，残差为空时误收 0；点未定 0 |
+| 残差为空的复合 op | 2590 → 3385 / 5592（46.3% → 60.5%） |
+| projcomp P1/P2/P4/P5 | 全 PASS（P1 8474 比较，不一致 0，点未定 0） |
+| resid_stat（5557） | 残差非空 2968 → 2188；C++ verify 3045 → 2084，接口 verify 1759 → 685 |
+
+**过程（如实记录）**：
+- 首轮回归 odscomp 段 b S3 误拒 1：真实 IR 中 `vector<8x16x!llvm.ptr<1>>` 写入 tensor<?x?xf32>，我的位宽函数不认识 llvm.ptr 而拒绝。补 llvm.ptr，并把其他方言类型改为 NFUnknown（先实现为“不判”）。
+- 复跑后 S3 残差为空误收 1+4、P4 不一致 2+20：变异池里的 `!transform.any_op` 作 padding 触发 NFUnknown，“不判”在 Φ 中等于接受，破坏了“残差为空 ⇒ 精确”。据此把 NFUnknown 改为逐点三值（上文），并把 padding 检查改为先比相等再查合法性（不等即确定拒绝）。之后全部 PASS。
+- 同一次复跑段 a 有一个文件工作进程崩溃（ODS json 缓存被并发进程半写读取），测试只计“文件超时/崩溃 1”而仍 PASS——这是测试缺陷。已修：缓存先写临时文件再原子改名；S1 与 P1 判据加入“文件崩溃 = 0”。此前各轮日志中该计数均为 0。
+- transfer 生成器首版 30k 例超时：改为独立缺陷（in_bounds 长度、索引个数、padding）只在前两种向量上扰动，其余全组合。
+
+**边界**：DataLayout 按默认（无 DLTI）；模块带 dl_spec 时 index/指针位宽可能不同，规则未读取上下文。三值机制在语料上点未定 0，只经构造与上述反例验证，未在语料中被触发。memref.subview（strided 布局推断、affine 布局）未做。
+
+**下一批**（work/resid68.txt）：memref.subview 322、vector.contract 234、vector.to_elements 160、memref.extract_strided_metadata 156、tensor.collapse_shape 152、expand_shape 143、vector.extract 129。前 10 个 op 可清空 890/2188。
