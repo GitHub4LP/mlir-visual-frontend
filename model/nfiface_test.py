@@ -12,6 +12,8 @@
 import sys, re, glob, random, collections, multiprocessing as mp
 
 IFACE_DIAG = {'DPS': re.compile(r'is a tensor or a memref|to be equal to the number of output tensors|to match type of corresponding result'),
+              'ConvolutionOpInterface': re.compile(r'expected op with 2 inputs and 1 output|unexpected input index map for convolutions|output/filter indexing maps to be projected|unexpected loop dimension for convolution|iterators used to access outputs to be parallel|iterators not used to access outputs to be reduction|convolved dim to be non-empty'),
+              'ContractionOpInterface': re.compile(r'expected op with 2 inputs and 1 output|expected at least 1 reduction|indexing maps to be projected permutations|expected add/mul op in the body'),
               'LinalgOp': re.compile(r'pure tensor or buffer semantics|indexing_map|non-invertible|shape-to-loops|1 region with 1 block|non-induction variable region|bb argument|inferred input/output operand|unexpected result less than 0|operand rank')}
 # 第 70 轮：LinalgOp 变异所有操作数（不只 init）；N2d：declared 已清空的 op 上，完整模型（无预言机）≡ MLIR。
 
@@ -89,19 +91,28 @@ def run_file(path, q, seed):
                     elif any(a[0] == an for a in S['attrs']):
                         m_ = [a for a in S['attrs'] if a[0] == an]; m2 = re.search(r'\[(\d+)\]', str(m_[0][1])); k = int(m2.group(1)) if m2 else None
                     if k:
-                        for v in (2, 3): cases.append(('attr', T0, ('attr', an, f'dense<{v}> : tensor<{k}xi64>')))
+                        for v in (0, 2, 3, -1): cases.append(('attr', T0, ('attr', an, f'dense<{v}> : tensor<{k}xi64>')))
                 if 'indexing_maps' in at1:
                     ms = re.findall(r'affine_map<.*?>(?=\s*[,\]])', at1['indexing_maps'])
                     if len(ms) >= 2: cases.append(('attr', T0, ('attr', 'indexing_maps', '[' + ', '.join(ms[::-1]) + ']')))
                     if 'iterator_types' in at1:
                         its = re.findall(r'#linalg\.iterator_type<\w+>', at1['iterator_types'])
                         if its: cases.append(('attr', T0, ('attr', 'iterator_types', '[' + ', '.join(its[:-1]) + ']')))
+                if n.get('regions') and len(n['regions'][0]) == 1:          # 第 71 轮：区域体变异（ContractionOpInterface 依赖区域体）
+                    rops = {o['op'] for o in n['regions'][0][0]['ops']}
+                    for a_, b_ in (('arith.mulf', 'arith.subf'), ('arith.addf', 'arith.subf'), ('arith.muli', 'arith.subi'), ('arith.addi', 'arith.subi'), ('arith.mulf', 'arith.addf')):
+                        if a_ in rops: cases.append(('body', T0, ('body', a_, b_)))
                 st['op 实例'] += 1
                 for kind, T, rmut in cases:
                     bs = instantiate([n], ports, T)
                     if bs is None: st['不可实例化'] += 1; continue
                     node = bs[0]['ops'][0]
-                    if rmut is not None and rmut[0] == 'attr':
+                    if rmut is not None and rmut[0] == 'body':
+                        import copy
+                        node['regions'] = copy.deepcopy(node['regions'])
+                        for o in node['regions'][0][0]['ops']:
+                            if o['op'] == rmut[1]: o['op'] = rmut[2]; break
+                    elif rmut is not None and rmut[0] == 'attr':
                         node['props'] = dict(node['props']); node['props']['_attrs'] = dict(node['props']['_attrs']); node['props']['_attrs'][rmut[1]] = rmut[2]
                     elif rmut is not None:
                         k, t2 = rmut; node['outs'] = [(o, t2 if i == k else t) for i, (o, t) in enumerate(node['outs'])]
