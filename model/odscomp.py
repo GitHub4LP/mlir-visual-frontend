@@ -41,7 +41,7 @@ for _k, _f in G.XF_OP.items():
 
 class Phi:
     def __init__(self, nports):
-        self.n = nports; self.atoms = []; self.residual = []; self.bottom = None; self.outs = {}
+        self.n = nports; self.atoms = []; self.residual = []; self.ground = []; self.bottom = None; self.outs = {}
 
 def _seg(n):
     a = (n['props'].get('_attrs') or {}).get('operandSegmentSizes')
@@ -69,6 +69,12 @@ def _result_exprs(n, S, gi_e):
             out.append(('xf', XF_NAME.get(id(rl[2]), 'xf'), rl[2], src[0]))
     return out
 
+def _resid(P, items, exprs):
+    """节点的残差（C++ verify 等不透明校验）：若该节点全部操作数/结果类型都不含端口变量（定值），
+    其校验结果与端口类型无关，是常量，在复合 op 定义时对实现图校验一次即可消去（第 64 轮）。记入 P.ground；否则记入 P.residual。"""
+    if all(not ports_of(e) for e in exprs): P.ground += items
+    else: P.residual += items
+
 def derive(sl, ports, inner=None):
     """sl：节点表（irimport 形式）；ports：端口值名（按序）。inner：{op 名: (Phi, 端口数)}，复合 op 作节点（嵌套）。"""
     P = Phi(len(ports)); ex = {v: ('p', i) for i, v in enumerate(ports)}
@@ -82,21 +88,22 @@ def derive(sl, ports, inner=None):
                 elif a[0] == 'rel': P.atoms.append(('rel', a[1], a[2], [[sub(e) for e in g] for g in a[3]], [sub(e) for e in a[4]], [sub(e) for e in a[5]]))
                 else: P.atoms.append(('attr', a[1], [sub(e) for e in a[2]], [sub(e) for e in a[3]]))
             P.residual += [f'{n["op"]}⟨{r}⟩' for r in Q.residual]
+            P.ground += [f'{n["op"]}⟨{r}⟩' for r in Q.ground]   # 内层的定值残差在外层仍是定值；内层非定值残差保守地留作残差
             if Q.bottom: P.bottom = P.bottom or Q.bottom
             for (o, _), e in zip(n['outs'], Q.outs_e): ex[o] = sub(e)
             continue
         lk = G.lookup(n['op'])
         if lk is None:
-            P.residual.append(f'{n["op"]}: 无自动签名（交预言机）')
             for o, t in n['outs']: ex[o] = ('k', TS.parse(t))
+            _resid(P, [f'{n["op"]}: 无自动签名（交预言机）'], ins_e + [ex[o] for o, _ in n['outs']])
             continue
         cls, S = lk
-        P.residual += [f'{n["op"]}: {d}' for d in S['declared']] + [f'{n["op"]}: 未导入 {u}' for u in S['unknown']]
         gi = G.bind(S, ins_e, S['ins'], _seg(n))
         re_ = _result_exprs(n, S, gi) if gi is not None else None
         if re_ == 'fail': P.bottom = P.bottom or f'{n["op"]}: 推断规则缺输入'; re_ = None
         outs_e = re_ if re_ is not None and len(re_) == len(n['outs']) else [('k', TS.parse(t)) for _, t in n['outs']]
         for (o, _), e in zip(n['outs'], outs_e): ex[o] = e
+        _resid(P, [f'{n["op"]}: {d}' for d in S['declared']] + [f'{n["op"]}: 未导入 {u}' for u in S['unknown']], ins_e + outs_e)
         go = G.bind(S, outs_e, S['outs'])
         P.atoms.append(('attr', n, ins_e, outs_e))       # 属性层与绑定无关（与 core.typecheck 同）
         if gi is None or go is None: P.residual.append(f'{n["op"]}: 端口组无法绑定')
@@ -158,7 +165,7 @@ def _aexprs(a):
     return a[2] + a[3]
 def simplify(P):
     """返回新 Phi：常量原子求值（假 ⇒ ⊥）；同一表达式上的同名约束去重；全同表达式上的自反关系删去；属性原子不涉及端口的求值。"""
-    Q = Phi(P.n); Q.residual = list(P.residual); Q.bottom = P.bottom; Q.outs_e = getattr(P, 'outs_e', [])
+    Q = Phi(P.n); Q.residual = list(P.residual); Q.ground = list(P.ground); Q.bottom = P.bottom; Q.outs_e = getattr(P, 'outs_e', [])
     seen = set()
     for a in P.atoms:
         es = _aexprs(a)
@@ -195,7 +202,7 @@ def render(P, names):
             rel.append(f'{a[1][0]}({", ".join(show(e, names) for e in es)})')
         else: rel.append(f'attr@{a[1]["op"]}({", ".join(names[i] for i in sorted(ps))})')
     return {'ports': {names[i]: sorted(set(v)) for i, v in unary.items()}, 'relations': list(dict.fromkeys(rel)),
-            'unknown': P.residual, 'bottom': P.bottom}
+            'unknown': P.residual, 'ground': P.ground, 'bottom': P.bottom}
 
 # ───────────────────────── 单端口投影：端口 j 的最大类型范围 R_j(t) ≝ ∃其余端口. Φ（第 63 轮）
 EQ = {'same', 'same_ops'}          # 精确相等（AllTypesMatch、SameTypeOperands）；samec_all 允许动态维兼容，不是相等
