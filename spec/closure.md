@@ -409,3 +409,24 @@ R_j(t) ≝ ∃ 其余端口. Φ_comp，即用户需求里“签名允许的最�
 - 复跑结果（主语料 + corpus_ext/Linalg，op 实例 1648）：N2a 比较 26405，MLIR 接受 4429，误拒 0；N2b 接口诊断 13238，漏判 0；其中 LinalgOp 比较 18276，MLIR 接受 3173，接口诊断 5168，规则拒绝 9542，规则未定 0。N2d 比较 10867（MLIR 拒绝 8896），误拒 0，误收 0。MLIR 崩溃 1200 例按拒绝计入。
 - 回归：odscomp S1–S4（段 a 12375 / 段 b 15585，误拒 0，残差为空时误收 0）、projcomp P1/P2/P4/P5、N1（23 op，57204 比较，0/0）、core T1/T2、L1（误拒 0，按账目分歧 0）、clauses K1–K6/M2.7 全 PASS。回归在 vector 修正之前跑；该修正只影响 linalg op，不在主语料中。
 - 边界：只检验了语料中出现的 indexing map 形状；非线性仿射式（floordiv/mod 含维）的化简只做了部分，可能使“是否单个维”的判断与 MLIR 不同（语料未出现）。Convolution（47）、Contraction（11）接口和手写的 9 个 op 仍在残差。
+
+### 9.11 ConvolutionOpInterface 与 ContractionOpInterface（第 71 轮）
+
+**依据**（MLIR 9bae84b0，Linalg/IR/LinalgInterfaces.cpp）：`isConvolutionInterfaceImpl`、`ConvAccessExprWalker`、`isContractionInterfaceImpl`、`isContractionBody`、`getSourceSkipUnary`、`isPairTemplateImpl`。
+
+**覆盖**：Convolution 47 个，全部为 opdsl yaml op；Contraction 11 个中的 7 个 yaml op（dot、matvec、vecmat、batch_matvec、batch_vecmat、mmt4d、batch_mmt4d）。matmul、batch_matmul、batch_reduce_matmul、contract 的映射来自手写 C++，与 LinalgOp 的同类条目一起留在残差。
+
+**Convolution 规则**：≥2 个输入且 1 个 init；输入映射的每个结果要么是单个维（非卷积维），要么是两个不同维的线性和（卷积维）；任一维第二次出现即失败。这里按 MLIR 构造期化简后的形状判断：strides=0 时 `d1*0 + d4` 化为 `d4`，变成非卷积维。filter 映射与输出映射须是投影置换。输出维与 filter 维按 batch、image、输出通道、depth multiplier、filter 循环、输入通道逐一归类，迭代器种类须相符，且不得重复计入。归类后的循环个数须等于循环数，卷积维集合非空。映射与迭代器来自 yaml，并绑定 strides/dilations；IR 带 memoized 属性时按该属性。
+
+**Contraction 规则**：2 个输入、1 个 init；至少一个 reduction 迭代器；映射全为投影置换；区域体须为 `yield(u5(u1(c) ⊕ u2(u3(a) ⊗ u4(b))))` 形状。(⊗, ⊕) ∈ {(mulf, addf), (muli, addi), (complex.mul, complex.add), (andi, ori)}。u 为单操作数、ODS 判定无内存效应的 op。块恰有 3 个参数，末尾为 terminator（ODS trait；未注册 op 视为可能是 terminator）。区域捕获外部值或含未导入方言的 op 时判未定。
+
+**机制**：`nf_attrs` 另传区域 0 的块本身（`\x00block`）。区域体是实现图的一部分，规则在复合 op 中把它当作固定事实。这条约束是结构约束，与端口类型无关，但同样属于该 op 的合法性条件，因此也规范化进模型。
+
+**检验**（nfiface_test，判据同 §9.10，运行前写定）：新增区域体变异（mulf→subf、addf→subf、muli→subi、addi→subi、mulf→addf），strides/dilations 增加 0 与 −1。全量（op 实例 1648）：
+- N2a 比较 28457，MLIR 接受 5333，误拒 0。
+- N2b 接口诊断 13689，漏判 0。
+- Convolution 比较 5189（MLIR 接受 1257），接口诊断 286，规则拒绝 286；Contraction 比较 522（接受 87），接口诊断 68，规则拒绝 68。
+- N2d（declared 已清空的 op，完整模型 ≡ MLIR）比较 16994（MLIR 拒绝 13263），误拒 0，误收 0。
+- 回归：odscomp 段 a S1–S4、projcomp 段 a P1/P2/P4/P5 全 PASS。
+
+**边界**：两维线性和以外的输入映射形状（三项和、带常数项、非线性式）一律判失败，这与 MLIR 的树形判定一致的前提是构造期化简把两维线性式化成 Add(项, 项)。语料与变异覆盖了 strides 取 0、1、2、3、−1 的情形，其他形状未出现。
