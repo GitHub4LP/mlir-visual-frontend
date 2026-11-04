@@ -118,6 +118,7 @@ def derive(sl, ports, inner=None):
             if x[2] not in ('ods', 'cpred', 'nf'): continue
             try: _at = A_.from_core(n)
             except Exception: _at = None
+            import nfrules as _NF; _at = _NF.nf_attrs(n, _at)
             P.atoms.append(('rel', x, (idx, n['op'], mini, partial, _at), groups, [e for g in gi for e in g], [] if partial else [e for g in go for e in g]))
     P.outs_e = []; P.env = ex
     return P
