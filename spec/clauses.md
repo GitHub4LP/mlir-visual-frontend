@@ -13,7 +13,7 @@
 | ID | 条款 | 实现 | 检验 | 律 | 级 | 状态 | 外部数据 / 缺口 |
 |---|---|---|---|---|---|---|---|
 | M0.1 | 前端合法 ⇒ verifier 接受；有拒绝权的层不误拒 | structure、odssig、attrsig、symtab、oracle | odssig_test:L1 差分; obligations_test:Z2 变异差分; symtab_test:Y1 误拒; modular_test:M3 单元级预言机; attrsig_test:A1 真实属性 | L29, L30, L34a/b, L36a/b, L39, L42 | A | 检验 | M3 19641 误拒 0；Z2 8858；Y1 2108 |
-| M0.2 | 导入语义不变，否则未知 | irimport、valimport | valimport_test:A2 一致; tensorjit_test:T 语料; floatjit_test:F2 语料; ftensorjit_test:FT 语料; ftensorjit_test:FT 灵敏度; ftensorjit_test:FT 求解输入 | L53 | A | 部分 | 1274/1274（第 46 轮复跑）、1030/1030、F2 1781/1781（第 46 轮）；分母缺口：tensor 签名 41/616、浮点 102/204 有事实；FT（第 60/60b 轮）浮点 tensor 签名有事实 94，执行 69，比较 1270/1270，19 个未执行（求解器在界内无解或超时，未细查），JIT 不可用 6 |
+| M0.2 | 导入语义不变，否则未知 | irimport、valimport | valimport_test:A2 一致; tensorjit_test:T 语料; floatjit_test:F2 语料; ftensorjit_test:FT 语料; ftensorjit_test:FT 灵敏度; ftensorjit_test:FT 求解输入 | L53 | A | 部分 | 1274/1274（第 46 轮复跑）、1030/1030、F2 1781/1781（第 46 轮）；分母缺口：tensor 签名 41/616、浮点 102/204 有事实；FT（第 60–60c 轮）浮点 tensor 签名有事实 94，执行 75，比较 1423/1423；守卫恒假 7（MLIR 恒 UB）、界外才有解 4、JIT 不可用 8 |
 | M0.3 | 前端证明的改写 ⇒ MLIR 精化 | transform、core | transform_test:R5 L13/L14 JIT; sem_test:V2 MLIR canonicalize; values_test:V6 canonicalize | L13, L14, L15 | B | 检验 | R5 21971/0 不符 |
 | M0.4 | 强于 MLIR 只在无对应物处，标 D | — | — | L23, L24, L26 | D | 元理论 | 设计选择；L24 的守卫义务另有 B（shape S6） |
 | M0.5 | 外部真值缺陷：按规范建模，A/B 隔断才可归因 | floatjit.barrier、values_test V8/V9 | floatjit_test:barrier(; values_test:V9 index 方言 cmp; values_test:V8 IW=32 | L50, L52 | A | 检验 | 归因 4 类；每类有隔断对照 |
