@@ -163,3 +163,54 @@ MLIR 升级后，IRDL 能力的变化会先在这里报出来。
 
 **仍然开放**：alloca 逃逸未建模（拒发）；MLIR 自己的 inline pass 在非作用域宿主（scf.while）里不包作用域（K4）——前端不使用它，只作参照；D1、D2 只记录，未提 upstream。
 
+
+## 9 复合 op 的显式签名 Φ_comp（第 62 轮，model/odscomp.py，odscomp_test.py）
+
+这是用户核心需求的直接对象：实现图定下来后，复合 op 签名允许的最大类型约束范围与端口间关系由图推出，形式与 MLIR op 签名相同，可呈现、可嵌套。
+此前只有逐点判定（§2：给定端口类型 T，内联后逐节点检查）与端口投影（§7）；第 8 轮的符号签名 compsig 建在人工签名上（误拒 240/1014，L47），只作呈现。
+
+**定义**。Φ_comp(端口) = ∃内部值类型. ⋀_节点 Φ_节点。内部值类型由 ODS 推断规则（复制、TypesMatchWith 变换、builderCall）确定，∃ 消去即代换，
+结果是端口类型变量上的原子合取：端口约束原子、关系原子、属性-类型耦合原子（不透明，逐点求值）。不能表达的部分列为 **Unknown 残差**，不参与求值；
+残差非空时 Φ 是上近似，须标 Unknown 并交预言机（§2 的 Φ_full）终判。嵌套：内层 Φ 的原子与输出表达式经代换搬入外层（组合封闭）。
+
+### 9.1 对账：ODS 约束种类 → Φ_comp 中的处理
+
+| MLIR 机制 | Φ_comp 的处理 | 内部变量消去 | 状态 |
+|---|---|---|---|
+| TypeConstraint（Pred 树 + 内建原子） | 端口约束原子 | 代换 | 已覆盖；未导入的原子（如 `isF16()`、部分 `isa<…>`）⇒ Unknown |
+| AllTypesMatch / AllElementTypesMatch / AllRanksMatch / AllShapesMatch | 关系原子 | 代换 | 已覆盖 |
+| TypesMatchWith（登记的变换：恒等、i1 同形、元素类型、complex 元素、按元素数展开） | 关系原子 + 推断表达式 | 精确（结果类型是端口表达式） | 已覆盖；未登记的变换（lambda、FunctionType 转换）⇒ Unknown |
+| Same* / Elementwise（native trait） | 关系原子 | 代换 | 已覆盖；未导入的 native trait（如 SameVariadic…）⇒ Unknown |
+| ShapedTypeMatchesElementCountAndTypes | 关系原子 | 代换 | 已覆盖 |
+| 无字段 PredOpTrait | 登记模板（tdims、位置式 elt_eq、cond_shape）⇒ 关系原子 | 代换 | 其余 ⇒ Unknown |
+| ODS 自动 inferReturnTypes | 结果表达式 | 精确 | 已覆盖 |
+| 属性约束（attrsig） | 与类型无关的部分是常量原子（化简时求值，假 ⇒ ⊥）；与类型耦合的部分是属性原子 | — | 已覆盖（属性原子不透明，只能逐点求值，不展开为可读关系） |
+| 可变端口组（Variadic/Optional/段属性） | 按实际个数绑定；结果侧无法绑定时与 odssig 同样只查操作数侧 | — | 已覆盖；无法绑定 ⇒ Unknown |
+| C++ verify()/verifyRegions()、接口 verify、C++ inferReturnTypes | 不可表达 | 不可消去 | **Unknown**（主要缺口，见 9.3） |
+| 结构 trait（HasParent、IsolatedFromAbove、终结符…） | 结构层（structure.py/ctxcons.py），不在类型 Φ 内 | — | 本检验的切片不含区域 op，未在此检验 |
+
+约定：结果类型由用户选择、ODS 不推断的节点（如 `arith.trunci` 的目标类型），其结果类型是节点参数，由图固定为字面量（与属性同等）。把它提升为复合 op 的类型参数（compsig 的 `with`）是扩展，不在本轮。
+
+### 9.2 外部检验（阈值运行前写定，见 odscomp_test.py 文件头）
+
+语料 246 文件，分两段（0–124、125–245），每函数 6 个切片，每切片原类型 + 4 个变异；真值是同一提交的 MLIR verifier 对内联结果的判定。
+
+| 判据 | 结果 |
+|---|---|
+| S1 化简 ≡ 原始 | 27960/27960，不一致 0 |
+| S2 Φ ≡ 逐点判定（instantiate + core.typecheck，不开预言机） | 不一致 0/27960，推导异常 0 |
+| S3 对 MLIR：误拒 0；残差为空时误收 0 | 实例 27803（MLIR 接受 12412）；误拒 0；误收 4034，全部在残差非空的复合 op 上 |
+| S4 嵌套 ≡ 展开（前半作内层） | 6840/6840 |
+
+复合 op 5592 个，残差为空 1259（22.5%）；化简把原子数从 44903 减到 26065。
+
+**过程记录（如实）**：首跑 S1 FAIL 55（命名关系的去重键用了全部端口组而非被引用的组，tensor.insert 的两条 TypesMatchWith 被当成同一条）、S2 FAIL 49
+（结果组无法绑定时没有像 odssig 那样只查操作数侧，memref.extract_strided_metadata）。修正后二跑全 PASS，但发现 206 个切片因推导异常被静默排除
+（常量折叠在空端口赋值上求值未引用的组）。修正并把“推导异常 = 0”补进 S2 的判据（事后补的判据，只会更严），三跑即上表。
+
+### 9.3 结论与边界
+
+- 对残差为空的复合 op，Φ_comp 是 MLIR 判定的精确符号形式：在本检验中既不误拒也不误收。对其余 77.5%，Φ_comp 只是上近似，必须显示为 Unknown 并交预言机终判；这时它仍然不误拒。
+- 主要缺口是 C++ verify 与接口 verify（MLIR 本身就没有声明式表达）。按声明范围计：若前端词汇表只用 auto 账目的 op，Φ_comp 精确；用到 declared 的 op，签名必然带 Unknown 残差。这是 MLIR 机制本身的边界，而不是前端模型能补上的。
+- 呈现（render）给出每个端口的一元约束、端口间关系和 Unknown 残差。一元约束只是必要条件：在其余端口未定时，单端口的精确可取范围（∃ 其余端口）仍按 §7 投影处理，相对 Φ_ods 完备的结论只在其余端口已知时成立。
+- 未做：属性原子的可读展开；残差为空时的关系最简式（目前只做去重与自反消去）。
