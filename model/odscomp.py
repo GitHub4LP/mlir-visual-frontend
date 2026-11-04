@@ -127,8 +127,14 @@ def set_outs(P, outs):
     """复合 op 的输出端口（体内值名）→ 输出表达式（嵌套时使用者看到的结果类型）。"""
     P.outs_e = [P.env[o] for o in outs]
 
+class _Unknown:
+    """第 68 轮：三值中的“未定”。nf 规则在该点未建模（NFUnknown）时取此值；布尔上下文中为假（不当作接受）。"""
+    def __bool__(self): return False
+    def __repr__(self): return 'UNK'
+UNK = _Unknown()
+
 def holds(a, T):
-    """单个原子在端口类型 T 下是否成立；表达式求值失败（变换无定义）⇒ 不成立（与 instantiate 返回 None 一致）。"""
+    """单个原子在端口类型 T 下：True / False / UNK（nf 规则在该点未建模）。表达式求值失败（变换无定义）⇒ 不成立（与 instantiate 返回 None 一致）。"""
     import attrsig as A
     if a[0] == 'pred':
         t = ev(a[3], T); return t is not None and bool(a[2](t))
@@ -137,18 +143,27 @@ def holds(a, T):
         gt = [[ev(e, T) for e in g] for g in groups]
         if any(ev(e, T) is None for e in _aexprs(a)): return False      # 只要求被引用的表达式有值（投影时类外端口为 None）
         S1 = dict(mini, rel=[x]); ni = len(mini['ins'])
-        return not G.check(S1, gt[:ni], None if partial else gt[ni:], attrs=at)
+        try: return not G.check(S1, gt[:ni], None if partial else gt[ni:], attrs=at, strict=True)
+        except Exception as e:
+            if type(e).__name__ == 'NFUnknown': return UNK
+            raise
     n, ie, oe = a[1], a[2], a[3]
     it = [ev(e, T) for e in ie]; ot = [ev(e, T) for e in oe]
     if any(t is None for t in it + ot): return False
     return not A.node_check(n, it, ot)
 
 def evaluate(P, T):
-    """Φ(T)：True 接受 / False 拒绝。残差不参与（调用方据 P.residual 标 Unknown）。"""
+    """Φ(T)：True 接受 / False 拒绝 / UNK 该点未定（有原子取 UNK 且无原子为假）；None = 类型文本不可解析。
+    残差不参与（调用方据 P.residual 标 Unknown）。"""
     if P.bottom: return False
     try: Tp = [TS.parse(t) if isinstance(t, str) else t for t in T]
     except Exception: return None
-    return all(holds(a, Tp) for a in P.atoms)
+    unk = False
+    for a in P.atoms:
+        h = holds(a, Tp)
+        if h is False: return False
+        if h is UNK: unk = True
+    return UNK if unk else True
 
 # ───────────────────────── 化简与呈现（只做逐点等价的变换；等价性由 odscomp_test S1 外部检验）
 REFLEXIVE = {'same', 'elt_eq', 'samec_all', 'same_ops', 'elt_ops', 'elt_all', 'shape_ops', 'shape_all'}
@@ -173,7 +188,9 @@ def simplify(P):
         es = _aexprs(a)
         allx = es if a[0] != 'rel' else [e for g in a[3] for e in g] + a[4] + a[5]
         if not any(ports_of(e) for e in allx):               # 不依赖端口 ⇒ 常量（须连未引用的组一起不依赖端口，holds 才能在空 T 上求值）
-            if not holds(a, []): Q.bottom = Q.bottom or f'常量原子为假：{_label(a)}'
+            h = holds(a, [])
+            if h is False: Q.bottom = Q.bottom or f'常量原子为假：{_label(a)}'
+            elif h is UNK: Q.atoms.append(a)                 # 未定的常量原子保留，求值时仍给出 UNK
             continue
         if a[0] == 'pred':
             k = ('pred', a[1], key(a[3]))
@@ -239,7 +256,8 @@ def range_holds(Q, cls, ranges, j, t):
     """R_j(t) 的类内部分：类内端口都取 t，求值只涉及该类的原子。"""
     if Q.bottom: return False
     T = [t if cls[i] == cls[j] else None for i in range(Q.n)]
-    return all(holds(a, T) for a in ranges[j][0])
+    hs = [holds(a, T) for a in ranges[j][0]]
+    return False if any(h is False for h in hs) else UNK if any(h is UNK for h in hs) else True   # UNK 不构成“必要条件不成立”
 
 def render_ranges(Q, names):
     cls, rg = project(Q)
@@ -257,12 +275,12 @@ def range3(Q, j, t, hints, maxw=1024):
     cls, rg = project(Q)
     try: tp = TS.parse(t) if isinstance(t, str) else t
     except Exception: return ('unknown', None)
-    if not range_holds(Q, cls, rg, j, tp): return ('out', None)
+    if range_holds(Q, cls, rg, j, tp) is False: return ('out', None)
     others = sorted({cls[i] for i in range(Q.n)} - {cls[j]})
     rep = {c: next(i for i in range(Q.n) if cls[i] == c) for c in others}
     for k, combo in enumerate(itertools.product((0, 1), repeat=len(others))):
         if k >= maxw: break
         asg = {c: (t if b else hints[rep[c]]) for c, b in zip(others, combo)} | {cls[j]: t}
         T = [asg[cls[i]] for i in range(Q.n)]
-        if evaluate(Q, T): return ('in', T)
+        if evaluate(Q, T) is True: return ('in', T)
     return ('unknown', None)
