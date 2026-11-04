@@ -11,7 +11,8 @@
 第 60b 轮（阈值运行前写定）：随机 16 组全被跳过的函数改由求解器构造输入；FT 求解输入：求解后执行的函数 ≥ 24（47 的一半）且不一致 0。
 首跑（每函数 4 组输入）：候选 94、执行 36、比较 562、不一致 0；二跑改为至多 16 组取 4 组（事后，只改采样，阈值不变）。
 阈值（运行前写定）：FT 比较 ≥ 300、不一致 0、文件超时/崩溃 0；FT 灵敏度：seed+1 比较 ≥ 50 且发现率 ≥ 50%。
-用法：PYTHONPATH=model python3 model/ftensorjit_test.py [文件数上限]
+用法：PYTHONPATH=model python3 model/ftensorjit_test.py [文件数上限] [FT2 程序数]
+第 61 轮 FT2（阈值运行前写定）：浮点 arith 逐元素作用于 tensor 定向，执行 ≥ 150、不一致 0、cmpf pred 变异发现 > 0；通过后 valimport 开放 bf16/f32/f64 元素 tensor 的逐元素 arith（f16 仍未知）。
 """
 import sys, re, glob, random, collections, multiprocessing as mp
 import z3
@@ -299,7 +300,75 @@ def run_file(path, q, seed):
                 st['seed+1 比较'] += 1; st['seed+1 发现'] += not agree(tparse(outs[j])[1], r2[1][j][2][ix], jv)
     q.put((st, dict(ex)))
 
+# ───────────────────────── FT2 定向（第 61 轮）：浮点 arith 逐元素作用于 tensor（生成器只作补充，判定仍是 JIT）
+FBIN = ['addf', 'subf', 'mulf', 'divf', 'remf', 'maximumf', 'minimumf', 'maxnumf', 'minnumf']
+FPRED = ['false', 'oeq', 'ogt', 'oge', 'olt', 'ole', 'one', 'ord', 'ueq', 'ugt', 'uge', 'ult', 'ule', 'une', 'uno', 'true']
+def gen_few(rng):
+    ty = rng.choice(['tensor<2x3xf32>', 'tensor<?x3xf32>', 'tensor<f32>', 'tensor<4xbf16>', 'tensor<?xf64>'])
+    e = tparse(ty)[1]; wide = {'bf16': 'f32', 'f32': 'f64', 'f64': None}[e]
+    L = []; vs = ['%a', '%b']; k = [0]
+    def nv():
+        k[0] += 1; return f'%v{k[0]}'
+    for _ in range(rng.randrange(2, 6)):
+        r = rng.random(); x, y = rng.choice(vs), rng.choice(vs); o = nv()
+        fm = rng.choice(['', '', '', ' fastmath<nnan>', ' fastmath<ninf>'])
+        if r < 0.5: L.append(f'{o} = arith.{rng.choice(FBIN)} {x}, {y}{fm} : {ty}')
+        elif r < 0.6: L.append(f'{o} = arith.negf {x}{fm} : {ty}')
+        elif r < 0.75:
+            c = nv(); L.append(f'{c} = arith.cmpf {rng.choice(FPRED)}, {x}, {y}{fm} : {ty}')
+            L.append(f'{o} = arith.select {c}, {x}, {y} : {re.sub(r"(bf16|f32|f64)>", "i1>", ty)}, {ty}')
+        elif r < 0.82: L.append(f'{o} = arith.select %s, {x}, {y} : {ty}')
+        elif r < 0.9 and wide:
+            w = nv(); wt = ty.replace(e + '>', wide + '>')
+            L.append(f'{w} = arith.extf {x} : {ty} to {wt}'); L.append(f'{o} = arith.truncf {w} : {wt} to {ty}')
+        elif '?' not in ty:
+            c = nv(); dims = tparse(ty)[0]; n = 1
+            for d in dims: n *= d
+            lits = [rng.choice(['1.5', '-0.0', '0.1', '-2.75', '1.0e+30', '3.0']) for _ in range(n)]
+            if dims == [2, 3]: val = 'dense<[[' + ', '.join(lits[:3]) + '], [' + ', '.join(lits[3:]) + ']]>'
+            elif dims: val = 'dense<[' + ', '.join(lits) + ']>'
+            else: val = f'dense<{lits[0]}>'
+            L.append(f'{c} = arith.constant {val} : {ty}'); L.append(f'{o} = arith.addf {x}, {c} : {ty}')
+        else: L.append(f'{o} = arith.subf {x}, {y} : {ty}')
+        vs.append(o)
+    body = '\n  '.join(L)
+    return f'func.func @main(%a: {ty}, %b: {ty}, %s: i1) -> {ty} {{\n  {body}\n  return {vs[-1]} : {ty}\n}}', [ty, ty, 'i1'], [ty]
+
+def FT2(n, seed=61):
+    import mlir.ir as ir, irimport as I
+    from valimport_test import derive_imported
+    rng = random.Random(seed); st = collections.Counter(); ex = collections.defaultdict(list)
+    def note(k, v):
+        if len(ex[k]) < 3: ex[k].append(v)
+    for t in range(n):
+        txt, ins, outs = gen_few(rng)
+        try: m = ir.Module.parse(txt, TJ.ctx1()); assert m.operation.verify()
+        except Exception: st['不合法（跳过）'] += 1; continue
+        fn = I.import_module(m)['regions'][0][0]['ops'][0]
+        S, why = derive_imported(f'ft2_{t}', fn)
+        if S is None: st['未知/' + why[:50]] += 1; note('未知', why); continue
+        st['程序'] += 1; st['程序/' + ins[0]] += 1
+        res = check_fn(S, txt, 'main', ins, outs, rng, st, lambda k, v: note(k, v + '\n' + txt), f'ft2_{t}')
+        if not res or 'cmpf' not in txt: continue
+        S2, _ = derive_imported(f'ft2_{t}_p', fn, 'pred')
+        if S2 is None: continue
+        runs, keys, got = res
+        for (ri, j, kind, ix, mv), jv in zip(keys, got):
+            if kind != 'el': continue
+            r2 = model_run(S2, ins, outs, runs[ri][0], random.Random(0))
+            if r2[0] != 'val' or ix not in r2[1][j][2]: continue
+            st['变异 pred 比较'] += 1; st['变异 pred 发现'] += not agree(tparse(outs[j])[1], r2[1][j][2][ix], jv)
+    return st, ex
+
 if __name__ == '__main__':
+    if len(sys.argv) > 2 and int(sys.argv[2]):
+        import verdict as V
+        st, ex = FT2(int(sys.argv[2]))
+        print('── FT2 浮点逐元素定向:'); [print(f'   {k}: {v}') for k, v in sorted(st.items())]
+        for k, v in ex.items(): print('──', k); [print('    ', x) for x in v]
+        V.check('FT2 浮点逐元素', st['函数（已执行）'] >= 150 and st['不一致'] == 0 and st['变异 pred 发现'] > 0,
+                f"程序 {st['程序']}，执行 {st['函数（已执行）']}，比较 {st['比较']}（NaN {st['比较/浮点值·NaN']}），不一致 {st['不一致']}，pred 变异发现 {st['变异 pred 发现']}/{st['变异 pred 比较']}")
+        if int(sys.argv[1]) == 0: V.finish(); sys.exit()
     import verdict as V
     lim = int(sys.argv[1]) if len(sys.argv) > 1 else 10 ** 9
     tot = collections.Counter(); exs = collections.defaultdict(list); ctxm = mp.get_context('fork')

@@ -64,6 +64,20 @@ def _dense(s, ty):
     m = re.fullmatch(r'dense<(.*)>\s*:\s*(\S+)', s.strip(), re.S)
     if not m or m.group(2) != ty: raise Unknown(f'tensor 常量 {s[:40]}')
     body = m.group(1).strip()
+    et = re.fullmatch(r'tensor<(?:[0-9?]+x)*(\w+)>', ty)
+    if et and et.group(1) in ('bf16', 'f32', 'f64'):        # 第 61 轮：浮点 dense（十进制或十六进制位模式）→ 字面量字符串，core.fpconst 解释
+        if not re.fullmatch(r'[\[\]\s,]*(?:(?:-?(?:\d+\.?\d*(?:[eE][-+]?\d+)?|0x[0-9A-Fa-f]+))[\[\]\s,]*)+', body): raise Unknown(f'tensor 浮点常量形式未建模 {body[:30]}')
+        import json
+        v = json.loads(re.sub(r'-?(?:0x[0-9A-Fa-f]+|\d+\.?\d*(?:[eE][-+]?\d+)?)', lambda q: '"' + q.group(0) + '"', body))
+        if isinstance(v, str): return [v]
+        dims = _rank(ty)
+        def flatf(x, k):
+            if k == len(dims):
+                if not isinstance(x, str) or x.startswith('-0x'): raise Unknown('tensor 常量嵌套与形状不符或负号十六进制')
+                return [x]
+            if not isinstance(x, list) or (dims[k] is not None and len(x) != dims[k]): raise Unknown('tensor 常量嵌套与形状不符')
+            return [y for e in x for y in flatf(e, k + 1)]
+        return flatf(v, 0)
     if not re.fullmatch(r'[\[\]\s,\-\d]+|true|false', body): raise Unknown(f'tensor 常量非整数字面量 {body[:30]}')
     if body in ('true', 'false'): return [1 if body == 'true' else 0]
     import json
@@ -105,8 +119,8 @@ def to_core(blocks, flip=None):
         tys = [t for _, t in n['outs']] + list((n.get('props') or {}).get('_types') or [])
         if op.startswith(('arith.', 'ub.')) and any(re.match(r'(vector|memref)<', t) for t in tys):
             raise Unknown(f'{op}：逐元素作用于 vector/memref 未建模（core 的 arith 只有标量与 ranked tensor 语义）')
-        if op.startswith(('arith.', 'ub.')) and any(t.startswith('tensor<') and not re.fullmatch(r'tensor<(?:(?:\d+|\?)x)*(?:i\d+|index)>', t) for t in tys):
-            raise Unknown(f'{op}：逐元素作用于非整数元素/无秩/带 encoding 的 tensor 未建模')     # 第 33 轮：ranked 整数 tensor 交给 core.elementwise
+        if op.startswith(('arith.', 'ub.')) and any(t.startswith('tensor<') and not re.fullmatch(r'tensor<(?:(?:\d+|\?)x)*(?:i\d+|index|bf16|f32|f64)>', t) for t in tys):
+            raise Unknown(f'{op}：逐元素作用于 f16/其它元素/无秩/带 encoding 的 tensor 未建模')     # 第 33 轮：ranked 整数 tensor 交给 core.elementwise；第 61 轮：bf16/f32/f64 元素经 ftensorjit FT2 JIT 证据开放，f16 无可靠 JIT（35b）仍未知
         for a in list(at):
             if a in STRUCTURAL or (op, a) in IRRELEVANT: continue
             if (op, a) not in TRANSLATED: raise Unknown(f'{op}.{a}：属性未登记（不静默忽略）')
