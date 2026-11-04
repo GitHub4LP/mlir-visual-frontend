@@ -170,7 +170,7 @@ BUILD = {'$_builder.getIndexType()': ('index',), '$_builder.getI1Type()': ('i', 
          '$_builder.getType<::mlir::shape::ShapeType>()': ('shape.shape',), '$_builder.getType<::mlir::shape::WitnessType>()': ('shape.witness',),
          '$_builder.getI64Type()': ('i', 64, ''), '$_builder.getI32Type()': ('i', 32, ''), '$_builder.getF32Type()': ('f', 'f32')}
 
-def check(S, ins, outs, levels=('ods', 'cpred')):
+def check(S, ins, outs, levels=('ods', 'cpred', 'nf')):
     """ins/outs：按端口分组的类型列表（[[t…] 每组]）。返回违例列表。"""
     bad = []
     env = {}
@@ -217,6 +217,7 @@ def check(S, ins, outs, levels=('ods', 'cpred')):
             sh, el = groups; ok = bool(sh) and ranked(sh[0]) and None not in sh[0][1] and len(el) == _numel(sh[0]) and all(t == sh[0][2] for t in el)
         elif k == 'cond_shape':
             c, rr = groups; ok = bool(c) and bool(rr) and (c[0] == ('i', 1, '') or (shaped(c[0]) and shaped(rr[0]) and ranked(c[0]) and ranked(rr[0]) and c[0][1] == rr[0][1]))
+        elif k == 'nf': ok = bool(x[4](*groups))                # 第 66 轮：规范化的 C++ verify 规则（nfrules）
         else: ok = True
         if not ok: bad.append(f'{k}({",".join(str(a[1]) for a in x[1])})')
     if S['infer'] and 'ods' in levels and not partial:
@@ -232,7 +233,8 @@ def check(S, ins, outs, levels=('ods', 'cpred')):
 
 def ledger(dialect, opname):
     """导入账：auto（ODS 自动、无缺口）/ cpred（用到登记的模式）/ declared（有 C++ 校验）/ unknown（有未覆盖条目）"""
-    S = sig(dialect, opname)
+    import nfrules
+    S = nfrules.apply(sig(dialect, opname))
     cls = 'unknown' if S['unknown'] else 'declared' if S['declared'] else 'cpred' if any(x[2] == 'cpred' for x in S['rel']) else 'auto'
     return cls, S
 
