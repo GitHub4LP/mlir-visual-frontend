@@ -538,3 +538,18 @@ FZ2 为首跑之后补的定向检验，非预注册，5/5 通过。
 
 - 仍未执行 19 个：求解器在上述取值界内无解或超时，原因未细查。JIT 不可用 6 个：2 个缓冲化失败；4 个 MLIR 进程崩溃（−11 两个：tensor.splat_dynamic、fold_empty_tensor_with_slice；−9 两个：insert_slice_rank_reducing 及其 dynamic_shape 版），只记录。
 - 求解器构造的输入偏向守卫边界，这正是越界类缺陷所在之处。
+
+### 16.2 第 60c 轮：60b 未执行函数的归因
+
+60b 中有 19 个函数没有执行。在洞上不加取值界求解 守卫 ∧ ¬UB（静态维固定，动态维 ≥ 0，index 在 IW 位范围内），结果分两类：
+- **守卫恒假**：canonicalize.mlir 的 out_of_bounds_extract_slice ×2、out_of_bounds_insert_slice ×3、invalid_slice_ops。这些都是 MLIR 自己的越界测试用例，如 tensor<5> 取尺寸 10、尺寸为 −5。MLIR 对它们恒为 UB，模型判守卫恒假，正确，不可执行比较。
+- **其余 13 个**：要求动态维 > 8（静态部分为 10、15、16、32）。先在 60b 时对此做了一次检查，但当时没有约束静态维的 extent，得到“全部可满足”的假结论；改正约束后才得到上述分类。
+
+改动（事后，只改采样，阈值不变）：动态维上界 8 → 40；测试内对仍未执行的函数做不加界求解，分为“恒假”与“界外才有解”。
+
+| | 执行/候选 | 比较（dim/元素/标量） | 浮点值（NaN） | 不一致 | seed+1 发现 |
+|---|---|---|---|---|---|
+| 60c | 75/94（求解输入 36） | 1423（449/901/73） | 909（147） | 0 | 290/339 |
+
+- 94 = 执行 75 + 守卫恒假 7 + 界外才有解 4 + JIT 不可用 8。
+- JIT 不可用 8 个：2 个缓冲化失败（`_no_canonicalize`）；2 个 cast_retains_buffer_layout*，界放宽后才进入 JIT，harness 管线留下 unrealized_conversion_cast；4 个 MLIR 进程崩溃。只记录。
