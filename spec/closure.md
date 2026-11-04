@@ -384,3 +384,28 @@ R_j(t) ≝ ∃ 其余端口. Φ_comp，即用户需求里“签名允许的最�
 - 结果：op 实例 1648，比较 10788，MLIR 接受 1609，接口诊断 3451，规则拒绝 7748（其中 4297 例 MLIR 先报了别的诊断），误拒 0，漏判 0，文件崩溃 0，MLIR 崩溃 19（不计入比较）。
 
 **边界**：N2b 只在接口 verify 实际运行时检验漏判；MLIR 先因别的原因拒绝时不计。这对 op 判定无影响：那些例子 MLIR 本就拒绝。
+
+### 9.10 LinalgOp::Trait（第 70 轮）
+
+**依据**（MLIR 9bae84b0）：Linalg/IR/LinalgInterfaces.cpp `verifyStructuredOpInterface`、Interfaces/IndexingMapOpInterface.cpp `verifyImpl`、IR/AffineMap.cpp `inversePermutation`/`concatAffineMaps`、LinalgInterfaces.td 的 getRank/getShape 默认实现、tools/mlir-linalg-ods-gen/mlir-linalg-ods-yaml-gen.cpp（命名 op 的 getIndexingMaps / getIteratorTypesArray / 符号绑定）。
+
+**覆盖**：91 个实现 LinalgOp 的 op 中 82 个：linalg.generic（映射取属性 indexing_maps，循环数 = #iterator_types）与 LinalgNamedStructuredOps.yaml 的 81 个 opdsl 命名 op。手写 getIndexingMaps 的 9 个（matmul、batch_matmul、batch_reduce_matmul、contract、elementwise、transpose、broadcast、reduce、map）留在残差。
+
+**规则**（按操作数类型、属性与区域入口块参数，全部为合取）：
+- 纯 tensor 或纯 buffer 语义（有操作数时）：无 memref 且有 tensor，或无 tensor 且有 memref；
+- #映射 = #操作数；拼接后可逆（每个循环维至少一次以单独维出现，取首次出现）；无符号；每个映射维数 = 循环数 = 迭代器个数；结果数 = 操作数秩；
+- getRank/getShape：vector 视为元素类型（秩 0），tensor/memref 取形状，无秩断言（按拒绝），其余秩 0；
+- 循环范围全静态时：每个静态非零维 k 上，映射在 0 点与 (范围−1) 点的值取 min ≥ 0；结果为单个维则 max+1 = 维长，否则 max+1 ≤ 维长；
+- 区域恰一块，入口块参数个数 = #操作数，第 i 个参数 = 第 i 个操作数的元素类型（memref/有秩 tensor 取元素类型，其余取自身）。
+- 命名 op：yaml 的映射以 index 属性（strides、dilations，缺省取默认值）绑定符号后化简；无迭代器的 op 为秩多态：循环数 = rank(init0)，标量（秩 0）用空映射，其余用恒等映射；IR 带 `linalg.memoized_indexing_maps` 时按它（getIndexingMaps 先读缓存）。
+
+**新机制**：model/affine.py：仿射映射解析、构造期化简（线性合并、×1、floordiv/mod 1、系数整除）、求值。区域入口块参数类型由 `nfrules.nf_attrs` 放进只给 nf 规则看的属性表（core.typecheck 与 odscomp 两处调用）。复合 op 中区域是实现图的一部分，其块参数类型固定，因此这条规则把端口类型与内部区域联系起来。
+
+**发现**：MLIR 在 verify 时把 `linalg.memoized_indexing_maps` 写回 op，经 Python 绑定导入的 IR 带着它。检验时去掉此属性，以检验由 yaml 推出的映射（前端构造的 op 不带它）。
+
+**检验**（nfiface_test，判据运行前写定；本轮把变异扩展到所有操作数、维长 +1、首维改动态、降秩，以及属性：strides/dilations 取 2、3，indexing_maps 反序，iterator_types 去一项）：
+- N2a/N2b 同 §9.9；新增 N2d：declared 已清空的 op 上，完整模型（结构 + 属性 + ODS + nf，关闭预言机）与 MLIR 判定一致（误拒 0、误收 0）。
+- 首次全量：N2a FAIL，误拒 2（linalg.fill 的 vector 输入：初版把 vector 按 ShapedType 取秩；LinalgInterfaces.td 规定 vector 是元素类型）。已修正并复跑，结果见本节末尾。
+- 复跑结果（主语料 + corpus_ext/Linalg，op 实例 1648）：N2a 比较 26405，MLIR 接受 4429，误拒 0；N2b 接口诊断 13238，漏判 0；其中 LinalgOp 比较 18276，MLIR 接受 3173，接口诊断 5168，规则拒绝 9542，规则未定 0。N2d 比较 10867（MLIR 拒绝 8896），误拒 0，误收 0。MLIR 崩溃 1200 例按拒绝计入。
+- 回归：odscomp S1–S4（段 a 12375 / 段 b 15585，误拒 0，残差为空时误收 0）、projcomp P1/P2/P4/P5、N1（23 op，57204 比较，0/0）、core T1/T2、L1（误拒 0，按账目分歧 0）、clauses K1–K6/M2.7 全 PASS。回归在 vector 修正之前跑；该修正只影响 linalg op，不在主语料中。
+- 边界：只检验了语料中出现的 indexing map 形状；非线性仿射式（floordiv/mod 含维）的化简只做了部分，可能使“是否单个维”的判断与 MLIR 不同（语料未出现）。Convolution（47）、Contraction（11）接口和手写的 9 个 op 仍在残差。
