@@ -368,3 +368,19 @@ R_j(t) ≝ ∃ 其余端口. Φ_comp，即用户需求里“签名允许的最�
 **边界**：DataLayout 按默认（无 DLTI）；模块带 dl_spec 时 index/指针位宽可能不同，规则未读取上下文。三值机制在语料上点未定 0，只经构造与上述反例验证，未在语料中被触发。memref.subview（strided 布局推断、affine 布局）未做。
 
 **下一批**（work/resid68.txt）：memref.subview 322、vector.contract 234、vector.to_elements 160、memref.extract_strided_metadata 156、tensor.collapse_shape 152、expand_shape 143、vector.extract 129。前 10 个 op 可清空 890/2188。
+
+### 9.9 接口级规则：DestinationStyleOpInterface（第 69 轮）
+
+**为什么按接口推进**：按残差频次逐 op 推进以语料为分母，语料不含的方言（Linalg）永远排不上。改用 ODS 全集作分母：MLIR 9bae84b0 的 650 个 op 中，第 68 轮后仍有 356 个带未规范化的 declared 条目（接口 verify 429 条、C++ verify() 174、C++ inferReturnTypes 19、verifyRegions 7）。接口 verify 高度集中：DestinationStyle 101、TransformOp 92、LinalgOp 91、ConvolutionOp 47、InferTypeOp 20、RegionBranch 15、RegionBranchTerminator 14、ContractionOp 11、CastOp 10，其余各 ≤ 6。一个接口的 verify 是同一段 C++，规范化一次即覆盖全部实现它的 op。
+
+**机制**：`nfrules.IFACE`：declared 条目 → 规则工厂。`apply` 先按 op（REG），再按接口；工厂从 ODS 记录读出 op 特有的参数，读不出则该 op 不套用（条目留在残差）。
+
+**DPS 规则**（依据 Interfaces/DestinationStyleOpInterface.cpp 与 .td 的 getTiedOpResult）：init 组由 `getDpsInitsMutable() { return get<X>Mutable(); }` 读出（101 个 op 中 100 个可读，bufferization.materialize_in_destination 为手写实现，留在残差）。
+- 每个 init 是 tensor 或 memref（含无秩）；
+- tensor 结果个数 = tensor init 个数；
+- 第 i 个 init 若为 tensor，则第 i 个结果存在且与之同类型（按 init 下标取结果，不是按 tensor init 的序号；越界在 MLIR 中是断言，按拒绝）。
+
+**检验**（model/nfiface_test.py，判据运行前写定）。接口规则只覆盖 op 的一部分，不能要求与 MLIR 整体判定等价，因此判据是：N2a MLIR 接受 ⇒ 规则接受（误拒 0）；N2b MLIR 报出该接口的诊断 ⇒ 规则拒绝（漏判 0）；N2c 非空。语料为主语料加 MLIR 的 Linalg 测试（150 个文件，单独存放于 corpus_ext/，不改变既有基线）。在真实 op 上变异 init 端口类型与结果类型（tensor↔memref、无秩、换形状、换元素）。
+- 结果：op 实例 1648，比较 10788，MLIR 接受 1609，接口诊断 3451，规则拒绝 7748（其中 4297 例 MLIR 先报了别的诊断），误拒 0，漏判 0，文件崩溃 0，MLIR 崩溃 19（不计入比较）。
+
+**边界**：N2b 只在接口 verify 实际运行时检验漏判；MLIR 先因别的原因拒绝时不计。这对 op 判定无影响：那些例子 MLIR 本就拒绝。
