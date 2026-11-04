@@ -26,7 +26,7 @@
 | 结构 | 区域种类/个数、终结子、后继、隔离、符号定义者/表/使用者 | ODS trait/interface 闭包（structure、symtab） | 推导：captures、free_syms、needs_ssacfg（L3–L5） | A（原生）/ B（复合） | M1.2 |
 | 类型签名 | 端口约束 Pred 树、多态签名 | tblgen JSON 自动签名（L28/L29） | 显式推导 Φ_comp = ∃内部类型. ⋀节点签名（odscomp，closure §9）：ODS 能声明的部分精确；节点类型含端口变量的 C++/接口 verify 记为 Unknown 残差（交预言机，与该 MLIR op 自身地位相同），不含端口变量的在定义时校验一次即消去；嵌套 ≡ 展开。单端口范围三值 in（附见证）/out/unknown（§9.4） | A / A | M1.3 |
 | 属性 | 参数值域、必需性 | ODS 导入，值是 MLIR Attribute（L34、L35） | 使用点约束的合取（L10） | A / B | M1.4 |
-| declared 义务 | C++ verify、开放接口、区域分支边 | 类型规则逐 op 规范化为约束原语（nfrules，经与 MLIR 精确一致后登记，closure §9.6，第 66 轮起）；尚未规范化的部分交预言机（L43、L44） | 规范化部分进入 Φ_comp；其余透明内联后交预言机 | A | M1.5 |
+| declared 义务 | C++ verify、开放接口、区域分支边 | 类型规则逐 op 规范化为约束原语（nfrules，经与 MLIR 精确一致后登记，closure §9.6，第 66 轮起）；尚未规范化的部分交预言机（L43、L44）；规范化规则在未建模的输入（方言自定义类型的位宽等）上逐点取“未定”，Φ_comp(T) 三值：接受 / 拒绝 / 未定（closure §9.8） | 规范化部分进入 Φ_comp；其余透明内联后交预言机 | A | M1.5 |
 | 值层 | Sem / UB / Poison | 人工覆盖层，经 JIT 差分审计（§3） | 推导（L6） | B（原生，§3 所列子集；复合摘要的毒值依赖第 53 轮升 B，只限确定值方向） | M1.6 |
 | 效应 | MemoryEffects 三元组 | ODS | compose_eff（L7） | B | M1.7 |
 | caps | Speculatable、Pure 等 | 由上面各字段派生，不单独声明；对降低后的 MLIR 而言（含守卫与 L22 义务） | 同左 | B | M1.8 |
