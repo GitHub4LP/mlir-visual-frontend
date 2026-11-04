@@ -24,7 +24,7 @@
 | 字段 | 内容 | 原生 op 的来源 | 复合 op 的来源 | 级 | 条款 |
 |---|---|---|---|---|---|
 | 结构 | 区域种类/个数、终结子、后继、隔离、符号定义者/表/使用者 | ODS trait/interface 闭包（structure、symtab） | 推导：captures、free_syms、needs_ssacfg（L3–L5） | A（原生）/ B（复合） | M1.2 |
-| 类型签名 | 端口约束 Pred 树、多态签名 | tblgen JSON 自动签名（L28/L29） | 有拒绝权的层逐节点判定（L25/L46/L47）；compsig 的符号 Φ 只用于呈现与端口投影（L27） | A / A | M1.3 |
+| 类型签名 | 端口约束 Pred 树、多态签名 | tblgen JSON 自动签名（L28/L29） | 显式推导 Φ_comp = ∃内部类型. ⋀节点签名（odscomp，closure §9）：ODS 能声明的部分精确；节点类型含端口变量的 C++/接口 verify 记为 Unknown 残差（交预言机，与该 MLIR op 自身地位相同），不含端口变量的在定义时校验一次即消去；嵌套 ≡ 展开。单端口范围三值 in（附见证）/out/unknown（§9.4） | A / A | M1.3 |
 | 属性 | 参数值域、必需性 | ODS 导入，值是 MLIR Attribute（L34、L35） | 使用点约束的合取（L10） | A / B | M1.4 |
 | declared 义务 | C++ verify、开放接口、区域分支边 | 只有预言机能裁决（L43、L44） | 透明内联后交预言机 | A | M1.5 |
 | 值层 | Sem / UB / Poison | 人工覆盖层，经 JIT 差分审计（§3） | 推导（L6） | B（原生，§3 所列子集；复合摘要的毒值依赖第 53 轮升 B，只限确定值方向） | M1.6 |
@@ -52,7 +52,7 @@
 - 〔M3.1〕**iN**：位向量。add/sub/mul 回绕；nsw/nuw 溢出产生毒值；divui/divsi/remsi 除以 0 是 UB；毒值进入除数是 UB。
 - 〔M3.2〕**index**：IW 位补码，结果回绕（L17″，A）。目标无关的事实要对 IW ∈ {32, 64} 都成立（L49）。面向 IW≠64 的目标时，先把 index 降为 iIW，再交给 MLIR 变换（L50）。
 - 〔M3.3〕**语义参数**：节点带有值层不读的参数时，值层不给事实（L51）；导入的真实 IR 每个属性须翻译或登记为无关，否则 ⇒ 未知（L53）。
-- 〔M3.4〕**tensor**：⟨extent, 元素, 元素毒值⟩。越界产生毒值而不是 UB（L24，D 级）；降低时对 extract/insert/dim/cast 插守卫，且须证明插守卫后的语义精化 core 语义（guards.plan），切片类与毒值下标判未知（values §13）。逐元素 arith 作用于 ranked 整数 tensor：形状不一致或任一元素 UB ⇒ UB（values §9.1–9.2）。浮点元素 tensor ⇒ 未知。
+- 〔M3.4〕**tensor**：⟨extent, 元素, 元素毒值⟩。越界产生毒值而不是 UB（L24，D 级）；降低时对 extract/insert/dim/cast 插守卫，且须证明插守卫后的语义精化 core 语义（guards.plan），切片类与毒值下标判未知（values §13）。逐元素 arith 作用于 ranked 整数 tensor 与 bf16/f32/f64 tensor（第 61 轮，values §16.3；f16 元素 ⇒ 未知）：形状不一致或任一元素 UB ⇒ UB（values §9.1–9.2）。
 - 〔M3.5〕**浮点**：f16/bf16/f32/f64 按 IEEE-754（z3 FP），NaN 不区分载荷与符号——前提是没有观察 NaN 位的 op：bitcast f→i、copysign 判未知。remf = fmod；fastmath 只建 nnan/ninf，其余判未知；maxnumf/minnumf、truncf roundingmode 判未知（values §10）。
 - 〔M3.6〕**math**：只登记降到正确舍入或精确 LLVM 内建的子集（absf、ceil/floor/trunc/round/roundeven、sqrt、fma、isnan、isfinite、absi、ctlz/cttz/ctpop）；超越函数、copysign、fpowi、isinf/isnormal 判未知（values §11）。
 - 〔M3.7〕**精化判据**：src 不 UB ⇒ tgt 不 UB；src 非毒值 ⇒ tgt 值相同且非毒值。改写、fold、降级都用这同一个判据；外部校准是 MLIR 自己的变换（canonicalize、int-range-optimizations、sccp）在模型下必须是精化，且该变换本身要有 JIT 对照（L52）。
@@ -82,7 +82,8 @@
 - 〔M5.4〕后端诊断通过 Location（节点 id）回映到节点（L31）。
 
 ## 6 当前已知的不足（非规范；按 clauses.md 的“缺口/部分”行处理）
+- 复合 op 签名：语料中残差为空（符号形式精确）的只有 27.3%（closure §9.5），其余依赖组成 op 的 C++/接口 verify，只能由预言机判定；要再前进，就得逐个 op 手写 C++ 语义，工作量没有上界，所以不做。单端口 out 的检验只在类型池上做了穷举。
 - 值层复合摘要的毒值依赖（L6）第 53 轮升 B：毒值实参下的确定值经 JIT 外部化（values §14）；“是毒值/UB”方向是精化自由度，执行测不出，不能单独作为变换依据；caps（M1.8）的外部参照是 MLIR LICM 判定 + 分歧处 JIT A/B（values §12），毒值 tensor 操作数处偏保守。
 - M5.3：alloca 逃逸未建模（拒发）；多块循环体不处理（报原因）；M5.1 的白名单差分（第 56 轮）只用整数 arith、scf.for 与不透明调用的程序族；tensor 管线只有 bufferize 一条。
-- 值层未覆盖：浮点 tensor、memref 内容、cf 多块、scf.while、func.call、complex、超越函数（均判未知）。
+- 值层未覆盖：f16 元素 tensor、memref 内容、cf 多块、scf.while、func.call、complex、超越函数（均判未知）。
 - 递归、方言注册与版本、transform 方言、DataFlow、bytecode、WASM：coverage 里是 ✗。
