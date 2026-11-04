@@ -7,6 +7,7 @@
   - 浮点标量输入：floatjit.rand_in；结果经 bitcast 为位模式比较；NaN 只比较“是 NaN”（载荷不可观测，values §10）。
   - f16 预先排除（本机 aarch64 上 LLVM f16 往返误编译，第 35b 轮），单列计数。
   - 灵敏度：模型侧输入 seed+1（元素位模式整体偏移），元素比较须发现。
+第 60c 轮：60b 的 19 个未执行中 6 个守卫恒假（out_of_bounds_*、invalid_slice_ops，MLIR 恒 UB，正确），13 个要求动态维 > 8；动态维上界 8 → 40（事后，只改采样），阈值不变。
 第 60b 轮（阈值运行前写定）：随机 16 组全被跳过的函数改由求解器构造输入；FT 求解输入：求解后执行的函数 ≥ 24（47 的一半）且不一致 0。
 首跑（每函数 4 组输入）：候选 94、执行 36、比较 562、不一致 0；二跑改为至多 16 组取 4 组（事后，只改采样，阈值不变）。
 阈值（运行前写定）：FT 比较 ≥ 300、不一致 0、文件超时/崩溃 0；FT 灵敏度：seed+1 比较 ≥ 50 且发现率 ≥ 50%。
@@ -175,7 +176,7 @@ def C64(v): v %= 1 << 64; return v - (1 << 64) if v >= 1 << 63 else v
 def agree(t, mv, jv): return FJ.agree(t, mv, jv % (1 << 64)) if t in FPT else mv[1] % (1 << BW(t)) == jv % (1 << BW(t))
 
 SOLVE = True
-def solve_inputs(S, ins, rng, k=4):
+def solve_inputs(S, ins, rng, k=4, dmax=40, bounded=True):
     """守卫 ∧ ¬UB 在洞上求解：动态维 ∈ [0, 8]、index/整数标量符号化；tensor 元素公式与浮点标量取随机具体值。返回至多 k 组输入（逐次阻塞已得解）。"""
     import core as C
     base = mk_inputs(rng, ins); pairs = []; syms = []        # syms：(参数号, 维号|None, z3 变量)
@@ -195,8 +196,8 @@ def solve_inputs(S, ins, rng, k=4):
     for _, f in S.guards: so.add(z3.substitute(f, pairs))
     so.add(z3.Not(z3.substitute(S.ubf, pairs)))
     for a, d, v in syms:
-        if d is not None: so.add(v >= 0, v <= 8)
-        elif z3.is_int(v): so.add(v >= -4, v <= 64)
+        if d is not None: so.add(v >= 0, *([v <= dmax] if bounded else []))
+        elif z3.is_int(v): so.add(*([v >= -4, v <= 64] if bounded else [v >= -(1 << 63), v < (1 << 63)]))
     out = []
     for _ in range(k):
         if so.check() != z3.sat: break
@@ -225,6 +226,8 @@ def check_fn(S, ftxt, fname, ins, outs, rng, st, note, tag):
             if r[0] == 'skip': st['求解输入/仍被跳过·' + r[1]] += 1; continue
             runs.append((xs, r[1]))
         if runs: st['求解输入/函数'] += 1
+        elif solve_inputs(S, ins, rng, 1, bounded=False): st['未执行/界外才有解'] += 1
+        else: st['未执行/守卫∧¬UB 恒假（MLIR 恒 UB）'] += 1
     if not runs: st['未执行/所有输入被跳过'] += 1
     if not runs: return None
     queries = []
