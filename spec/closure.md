@@ -269,3 +269,34 @@ R_j(t) ≝ ∃ 其余端口. Φ_comp，即用户需求里“签名允许的最�
 **结论**：剩余 72.7% 的残差来自依赖端口类型的 C++ verify 或接口 verify。MLIR 本身对这些 op 也没有给出声明式约束，所以复合 op 在这里与组成它的 MLIR op 处于同一不透明状态：可以由预言机判定，但没有符号形式。
 
 复合 op 的签名由 ODS 能表达的部分精确推出，其余部分精确地标为 Unknown。这符合“与 MLIR op 同样对待、不弱于 MLIR”的要求；要在这之上做得更强，就得逐个 op 手写 C++ 语义。
+
+### 9.6 规范化 C++ verify 规则（第 66 轮）
+
+用户 2026-11-04 明确：MLIR 只写在 C++ verify / 接口 verify 里的类型规则也要建模（“这就是我说的超越”）。§9.5 的结论“剩余部分精确标 Unknown 即可”据此作废。
+
+**机制**：`model/nfrules.py` 把规则写成约束原语的合取，作为 `('nf', 端口组, 'nf', 呈现, 判定)` 挂在 odssig 签名的关系表上。core 的逐点判定、odscomp 的 Φ_comp、projcomp 的单端口范围共用同一份规则，内置 op 与复合 op 用同一机制。一个 op 只有在 nf_test 中与 MLIR 精确一致后才会登记；登记后，它覆盖的 declared 条目从残差中移出。
+
+**原语**：under（标量或允许的容器，且元素种类合法）、width（整数位宽或浮点 getWidth）、same_enc、compat（verifyCompatibleShape）、signless、is_index、no_unranked_tensor。
+
+**本轮覆盖**：arith 转换族 12 个 op（extui/extsi/trunci/extf/truncf/uitofp/sitofp/fptoui/fptosi/index_cast/index_castui/bitcast），覆盖 `C++ verify()` 与 `接口 verify: CastOpInterface`。依据 MLIR 9bae84b0 的 ArithOps.cpp。
+
+**补全（超出 MLIR 的部分）**：任一端为无秩 tensor 时，MLIR 在这 12 个 op 上都会断言崩溃（cast<RankedTensorType>），不能产出合法 IR。模型把这种情况规范化为拒绝。
+
+**检验**（nf_test N1，阈值运行前写定）：按特征等价类构造类型池。容器 15 种（标量、vector、可伸缩维、2 维、tensor 静态/动态/无秩、两种编码、memref、无秩 memref、strided 布局、内存空间），元素 13 种。同容器下元素两两全组合，加上容器两两全组合乘 4 个代表元素对。
+
+| 判据 | 结果 |
+|---|---|
+| N1（12 op） | 比较 40500，MLIR 接受 2345；误拒 0，误收 0；MLIR 崩溃 868（全部按拒绝计） |
+| 消融：只用 ODS | 误收 2990（规则确有作用；fptosi/fptoui 的 ODS 本身已精确） |
+| odscomp S1–S4（27960 实例） | 全 PASS；S3 误拒 0，残差为空时误收 0 |
+| 残差为空的复合 op | 1528 → 1911 / 5592（27.3% → 34.2%） |
+| projcomp P1/P2/P4/P5 | 全 PASS（P1 5859 比较，不一致 0） |
+| odssig_test L1 | 误拒 0（21878 实例），auto op 分歧 0 |
+
+**过程（如实记录）**：
+- 试跑 arith.extsi 时，原阈值“MLIR 崩溃 0”FAIL（无秩 tensor 崩溃 57 例）。阈值改为“崩溃按拒绝计”，规则加入 no_unranked_tensor。这一改动发生在试跑之后、全量运行之前。
+- 首次全量用的是 11 种容器。之后又补了布局、内存空间、第二种编码、2 维 vector，复跑后仍 PASS。
+
+**边界**：
+- 穷尽性只相对于所选特征成立。其余特征（例如更多布局形式、方言自定义类型）未枚举。规则不读这些特征，但 MLIR 是否同样不读，没有被检验。
+- 剩余残差仍来自其他 op，按 resid_stat 的长尾顺序逐批规范化：vector.transfer_read/write、tensor.extract_slice/insert_slice、memref.subview 等。
