@@ -967,7 +967,8 @@ def typecheck(blocks, ftype=None, symbols=None, name='f', mod_attrs=None, unreg=
                 gi, go = G.bind(S, ins, S['ins'], seg), G.bind(S, outs_, S['outs'])
                 if gi is not None:
                     try: _at = A.from_core(n)
-                    except Exception: _at = None                  # 符号属性等：需要属性的规范化规则不判（上近似）
+                    except Exception: _at = None
+                    import nfrules as _NF; _at = _NF.nf_attrs(n, _at)        # 第 70 轮：区域入口块参数类型（LinalgOp 规则）                  # 符号属性等：需要属性的规范化规则不判（上近似）
                     out.extend((n['id'], f'ods: {m}') for m in G.check(S, gi, go, attrs=_at))
                 out.extend((n['id'], f'attr: {m}') for m in A.node_check(n, ins, outs_))      # 第 13 轮：属性层（attrsig.py），与自动签名同级
                 if gi is None or go is None: TC_STATS['无法绑定'] += 1
