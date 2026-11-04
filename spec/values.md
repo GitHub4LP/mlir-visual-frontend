@@ -553,3 +553,18 @@ FZ2 为首跑之后补的定向检验，非预注册，5/5 通过。
 
 - 94 = 执行 75 + 守卫恒假 7 + 界外才有解 4 + JIT 不可用 8。
 - JIT 不可用 8 个：2 个缓冲化失败（`_no_canonicalize`）；2 个 cast_retains_buffer_layout*，界放宽后才进入 JIT，harness 管线留下 unrealized_conversion_cast；4 个 MLIR 进程崩溃。只记录。
+
+### 16.3 第 61 轮：浮点 arith 逐元素作用于 tensor
+
+**改动**（model/valimport.py）：bf16、f32、f64 元素的 ranked tensor 开放 arith 逐元素语义（core.elementwise 本来就与元素类型无关，此前由 valimport 的类型闸门判未知）；浮点 dense 常量（十进制或十六进制位模式，splat 或嵌套）翻译为逐元素字面量，由 core.fpconst 解释，负号十六进制判未知。**f16 仍判未知**：本机没有可靠的 f16 JIT（第 35b 轮 LLVM 缺陷），没有外部证据就不开放。
+
+**FT2 定向**（阈值在运行前写定：执行 ≥ 150、不一致 0、cmpf pred 变异发现 > 0）。生成器覆盖 addf/subf/mulf/divf/remf/maximumf/minimumf/maxnumf/minnumf、negf、cmpf（16 个谓词）+ select、标量条件 select、extf∘truncf、dense 常量；可选 fastmath nnan/ninf；类型 tensor<2x3xf32>、<?x3xf32>、<f32>、<4xbf16>、<?xf64>。
+
+| | 程序/执行 | 比较（dim/元素） | NaN | 不一致 | pred 变异发现 |
+|---|---|---|---|---|---|
+| FT2，seed 61，300 个生成 | 181/181 | 2846（916/1930） | 311 | 0 | 256/773 |
+
+- 判未知 119 个：maxnumf/minnumf 带 fastmath。这是标量层原有的限制（属性未登记），与 tensor 无关。
+- **语料复跑**：有事实的候选从 94 增加到 120，执行从 75 增加到 100，比较 2235/2235（浮点值 1441），不一致 0；seed+1 发现 357/476。
+
+**对前端**：MLIR 的 Elementwise 机制对浮点元素同样成立，前端可以把标量浮点运算提升到 tensor 上，且语义与标量版逐元素一致（形状不一致 ⇒ UB，任一元素的标量 UB ⇒ 整体 UB）。f16 tensor 运算要标为未知。
