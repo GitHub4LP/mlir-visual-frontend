@@ -941,13 +941,13 @@ def typecheck(blocks, ftype=None, symbols=None, name='f', mod_attrs=None, unreg=
             r = len(ins) - 2; ins = ins + [('index',)] * (2 * r); seg = [1, 1, r, r, r]
         return [(n['id'], f'{src}（人工签名，未经预言机）: {msg}') for src, msg in TSg.check(n['op'], ins, outs_, TSg.LEVELS, seg)]
     import nfrules as _NF0; _consts = {}
-    def walk(bs):
+    def walk(bs, parent=None):                                       # 第 75 轮：parent = 父信息（顶层为 None：父未定）
         for b in bs:
             for v, t in b['args']: tys[v] = t; _consts.pop(v, None)
             for n in b['ops']:
                 for o, t in n['outs']: tys[o] = t; _consts.pop(o, None)        # 值名只在函数内唯一：先清掉同名旧常量
                 _NF0.note_const(n, _consts)
-                for r in n['regions']: walk(r)
+                for r in n['regions']: walk(r, _NF0.parent_info(n))
                 if n['op'] in ('func.return', 'func.call', 'scf.yield'): continue      # 由结构层（structure.py R1–R8）负责
                 TC_STATS['节点'] += 1
                 lk = G.lookup(n['op'])
@@ -970,7 +970,7 @@ def typecheck(blocks, ftype=None, symbols=None, name='f', mod_attrs=None, unreg=
                 if gi is not None:
                     try: _at = A.from_core(n)
                     except Exception: _at = None
-                    import nfrules as _NF; _at = _NF.nf_attrs(n, _at, _consts)        # 第 70 轮：区域入口块参数类型（LinalgOp 规则）                  # 符号属性等：需要属性的规范化规则不判（上近似）
+                    import nfrules as _NF; _at = _NF.nf_attrs(n, _at, _consts, parent)        # 第 70 轮：区域入口块参数类型（LinalgOp 规则）                  # 符号属性等：需要属性的规范化规则不判（上近似）
                     out.extend((n['id'], f'ods: {m}') for m in G.check(S, gi, go, attrs=_at))
                 out.extend((n['id'], f'attr: {m}') for m in A.node_check(n, ins, outs_))      # 第 13 轮：属性层（attrsig.py），与自动签名同级
                 if gi is None or go is None: TC_STATS['无法绑定'] += 1

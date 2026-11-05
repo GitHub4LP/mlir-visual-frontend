@@ -472,3 +472,26 @@ R_j(t) ≝ ∃ 其余端口. Φ_comp，即用户需求里“签名允许的最�
 - 新增合成网格 `model/winograd_test.py`（N2f，完整模型无预言机 ≡ MLIR）：比较 3000（softmax 690、filter 753、input 799、output 758），MLIR 接受 531、拒绝 2469，误拒 0、误收 0、崩溃 0。filter 的接受只有 35，覆盖偏薄。
 - **N1 不适用于 linalg**：N1 网格只变异端口类型，不生成区域与必需属性，14 个 linalg 候选上 MLIR 接受均为 0，map 的 65 例“误收”实为“requires one region”的结构性拒绝。`nf_test` 默认集合改为排除 linalg；linalg 以 N2a/N2b/N2d/N2e/N2f 检验。
 - linalg 方言仍有 declared 的 op：fill（FillOpInterface）、index、yield。
+
+### 9.15 含区域节点的复合 op；linalg.yield / linalg.index（第 75 轮）
+**发现的缺口**：第 62–74 轮的 Φ_comp 检验（odscomp_test、projcomp_test）沿用 compcorpus_test.slices，切片排除了所有带区域的 op；odscomp.derive 也不看区域内的 op。所以此前的 Φ_comp 结论只对“无区域节点”的复合 op 成立，linalg 各轮的 nf 规则只在单 op（N2*）上检验过，未进入复合 op。
+
+**改动**：
+- odscomp.derive 递归处理区域：区域内 op 的原子并入 Φ_comp；区域内用到的外部值（捕获）作为端口；块参数与区域内结果取图上写定的类型（常量）。因此**最大性只对顶层推导成立**，区域内类型随端口推导尚未建模（列为下一步）。
+- 定值残差的判断连同捕获一起看（odscomp.captures）：父 op 的不透明校验（如 tensor.generate/tensor.pad 的 verifyRegions 检查 yield 类型）会读到捕获值的类型。首轮 R2 的 7 例“残差为空误收”全部来自这一点，已修复。
+- 化简去重键加入 nf 规则身份：同一 op 上引用相同端口组的不同 nf 规则此前会被合并（首轮 R1 化简不一致 337 例）。只影响 simplify/呈现，不影响 evaluate(Φ)。
+- composite.instantiate 更新区域内 op 的操作数类型表（捕获值类型随端口变）。
+- core.typecheck 与 derive 都向 nf 规则传父信息 parent_info（父 op 名、区域数、区域 0 非空）；复合 op 体顶层的父未定 ⇒ NFUnknown。
+- nf 规则（依据 LinalgOps.cpp YieldOp::verify、verifyYield、IndexOp::verify）：
+  - linalg.yield / linalg.index 自身：父 op 恰一个非空区域且实现 LinalgOp。
+  - 父 op 上新增原子 LinalgBody（91 个 LinalgOp 全部挂上；inits = 最后一个操作数组 outputs/init/inits）：体内 yield 值个数 = #inits，第 k 个值类型 = inits[k] 的元素类型（memref/有秩 tensor）或其本身；体内 index 的 dim < getNumLoops（generic：#iterator_types；map/transpose/broadcast：rank(init)；reduce：rank(inputs[0])；yaml 与手写 op 取各自迭代器表）。yield 用了区域外的值、区域块数 ≠ 1 ⇒ NFUnknown。
+  - RegionBranchTerminatorOpInterface 的 verify 只有 static_assert 与 success()，运行期无约束，规范化为空规则。
+- linalg 方言仍有 declared 的 op 只剩 fill（FillOpInterface）。
+
+**检验**（新 `model/regcomp_test.py`，判据运行前写定；语料 corpus 246 文件 + corpus_ext/Linalg 150 文件，两段 `6 4 200 0`、`6 4 1000 200`）：
+- R1 Φ≡逐点（含区域）：实例 5565 + 13310，不一致 0，化简不一致 0，推导异常 0，文件崩溃 0；点未定 49 + 512。
+- R2 对 MLIR：实例 5545 + 12735（MLIR 接受 2754 + 5474；含 linalg 体 1125 + 11122），误拒 0，残差为空误收 0，残差非空误收 504 + 748；点未定 49 + 444。
+- R3：复合 op 1113 + 2662，残差为空 117 + 1402。残差来源前列：scf.for（C++ verify、verifyRegions、RegionBranchOpInterface、LoopLikeOpInterface）、linalg.fill（FillOpInterface）、tensor.pad、tensor.empty、scf.forall/parallel、vector.mask、memref.subview。
+- 首轮（修复前）R1 化简不一致 32 + 305、R2 残差为空误收 4 + 3，见上；判据未改。
+
+**下一步**：按残差前列规范化 scf.for/forall/parallel/if/while 的区域约束（块参数、iter_args、yield 与结果类型的关系），并让区域内类型随端口推导（最大性扩展到区域）；linalg.fill；tensor.pad/empty。
