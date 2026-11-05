@@ -16,6 +16,8 @@ IFACE_DIAG = {'DPS': re.compile(r'is a tensor or a memref|to be equal to the num
               'ContractionOpInterface': re.compile(r'expected op with 2 inputs and 1 output|expected at least 1 reduction|indexing maps to be projected permutations|expected add/mul op in the body'),
               'LinalgHand': re.compile(r'arity of mapper|to match bbArg type|to match shape of output|same shapes|dimensions for reduction|after reduction|init dimensions|mismatching number of operands and block arguments|does not match corresponding block argument|permutation is not valid|does not match init rank|size of permutation|doesn.t match dim\(input|added dimensions|is out of range|should match init dim|Unexpected dim expression|Invalid broadcast|Unexpected result dim expression|exceeds 3|Invalid batch dimension|expects [23] dims|Invalid output map|must have 3 affine maps|not a projected permutation|ranks of shaped operand|non-shaped type|iteration spaces of provided|not used to access any operand|neither a contracting dim|contracting dimension|pure tensor or buffer semantics|indexing_map|non-invertible|shape-to-loops|1 region with 1 block|bb argument|operand rank'),
               'LinalgCxx': re.compile(r'Unexpected dim expression|Invalid broadcast|Unexpected result dim expression|exceeds 3|Invalid batch dimension|expects [23] dims|Invalid output map|must have 3 affine maps|not a projected permutation|ranks of shaped operand|non-shaped type|iteration spaces of provided|not used to access any operand|neither a contracting dim|contracting dimension'),
+              'linalg.pack': re.compile(r'invalid zero tile factor|invalid inner_dims_pos|invalid outer_dims_perm|must be a permutation or empty|tiling factors must|packed rank !=|mismatch in inner tile sizes|for the packed domain value|expected padding_value has|Only full tiles are supported'),
+              'linalg.unpack': re.compile(r'invalid zero tile factor|invalid inner_dims_pos|invalid outer_dims_perm|must be a permutation or empty|tiling factors must|packed rank !=|mismatch in inner tile sizes|for the packed domain value'),
               'LinalgOp': re.compile(r'pure tensor or buffer semantics|indexing_map|non-invertible|shape-to-loops|1 region with 1 block|non-induction variable region|bb argument|inferred input/output operand|unexpected result less than 0|operand rank')}
 # 第 70 轮：LinalgOp 变异所有操作数（不只 init）；N2d：declared 已清空的 op 上，完整模型（无预言机）≡ MLIR。
 
@@ -67,7 +69,14 @@ def run_file(path, q, seed):
                 atoms = [(nm, x) for x in S['rel'] if x[0] == 'nf' for nm in IFACE_DIAG if str(x[3]).startswith(nm)]
                 if not atoms: continue
                 full = not S['declared'] and not S['unknown']
-                ports = list(dict.fromkeys(n['ins']))
+                pre = []                                                       # 第 73 轮：pack/unpack 的常量 tile 操作数连同其 arith.constant 一起实例化
+                if n['op'] in ('linalg.pack', 'linalg.unpack'):
+                    defs = {o: m for m in body for o, _ in m['outs']}
+                    for v in n['ins']:
+                        m = defs.get(v)
+                        if m is not None and m['op'] == 'arith.constant' and m not in pre: pre.append(m)
+                pouts = {o for m in pre for o, _ in m['outs']}
+                ports = [v for v in dict.fromkeys(n['ins']) if v not in pouts]
                 if not ports: continue
                 hand = any(nm == 'LinalgHand' for nm, _ in atoms) and not any(nm == 'LinalgOp' for nm, _ in atoms)
                 gname = 'outputs' if any(nm == 'LinalgOp' for nm, _ in atoms) else (names0 := [q for q, *_ in S['ins']])[-1] if hand else atoms[0][1][1][0][1]
@@ -80,7 +89,10 @@ def run_file(path, q, seed):
                 init_vals = n['ins'][k0:k0 + kn]
                 T0 = [tyof[v] for v in ports]
                 cases = [('原类型', T0, None)]
-                mut_vals = n['ins'] if any(nm in ('LinalgOp', 'LinalgHand') for nm, _ in atoms) else init_vals
+                mut_vals = n['ins'] if any(nm in ('LinalgOp', 'LinalgHand', 'linalg.pack', 'linalg.unpack') for nm, _ in atoms) else init_vals
+                mut_vals = [v for v in mut_vals if v in ports]
+                for k_, m in enumerate(pre):
+                    for cv in (0, 1, 3, 5): cases.append(('const', T0, ('const', k_, cv)))
                 for v in list(dict.fromkeys(mut_vals)):
                     j = ports.index(v)
                     for t in _variants(T0[j]): cases.append(('init', T0[:j] + [t] + T0[j + 1:], None))
@@ -111,7 +123,7 @@ def run_file(path, q, seed):
                     if 'iterator_types' in at1:
                         its = re.findall(r'#linalg\.iterator_type<\w+>', at1['iterator_types'])
                         if its: cases.append(('attr', T0, ('attr', 'iterator_types', '[' + ', '.join(its[:-1]) + ']')))
-                for an in ('dimensions', 'permutation'):                       # 第 72 轮：手写 op 的数组属性变异
+                for an in ('dimensions', 'permutation', 'inner_dims_pos', 'outer_dims_perm', 'static_inner_tiles'):                       # 第 72 轮：手写 op 的数组属性变异
                     if an in at1:
                         v0 = re.findall(r'-?\d+', at1[an].split(':', 1)[1]) if ':' in at1[an] else []
                         vs = [v0[::-1], v0[:-1], v0 + ['0'], ['5'] + v0[1:], [v0[0]] * len(v0) if v0 else ['0']]
@@ -125,10 +137,13 @@ def run_file(path, q, seed):
                         if a_ in rops: cases.append(('body', T0, ('body', a_, b_)))
                 st['op 实例'] += 1
                 for kind, T, rmut in cases:
-                    bs = instantiate([n], ports, T)
+                    bs = instantiate(pre + [n], ports, T)
                     if bs is None: st['不可实例化'] += 1; continue
-                    node = bs[0]['ops'][0]
-                    if rmut is not None and rmut[0] == 'bbarg':
+                    node = bs[0]['ops'][len(pre)]
+                    if rmut is not None and rmut[0] == 'const':
+                        c_ = bs[0]['ops'][rmut[1]]; c_['props'] = dict(c_['props']); c_['props']['_attrs'] = dict(c_['props']['_attrs'])
+                        c_['props']['_attrs']['value'] = f"{rmut[2]} : {c_['outs'][0][1]}"
+                    elif rmut is not None and rmut[0] == 'bbarg':
                         import copy
                         node['regions'] = copy.deepcopy(node['regions'])
                         b0 = node['regions'][0][0]; b0['args'] = [(b0['args'][0][0], rmut[1])] + b0['args'][1:]
@@ -147,7 +162,9 @@ def run_file(path, q, seed):
                     except Exception: st['类型不可解析'] += 1; continue
                     if gi is None or go is None: st['无法绑定'] += 1; continue
                     import attrsig as A, nfrules as NF, composite as CP
-                    try: at = NF.nf_attrs(node, A.from_core(node))
+                    consts = {}
+                    for c_ in bs[0]['ops'][:len(pre)]: NF.note_const(c_, consts)
+                    try: at = NF.nf_attrs(node, A.from_core(node), consts)
                     except Exception: at = None
                     rr = {}
                     for nm, x in atoms:
