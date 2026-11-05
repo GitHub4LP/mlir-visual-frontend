@@ -430,3 +430,17 @@ R_j(t) ≝ ∃ 其余端口. Φ_comp，即用户需求里“签名允许的最�
 - 回归：odscomp 段 a S1–S4、projcomp 段 a P1/P2/P4/P5 全 PASS。
 
 **边界**：两维线性和以外的输入映射形状（三项和、带常数项、非线性式）一律判失败，这与 MLIR 的树形判定一致的前提是构造期化简把两维线性式化成 Add(项, 项)。语料与变异覆盖了 strides 取 0、1、2、3、−1 的情形，其他形状未出现。
+
+### 9.12 手写 getIndexingMaps 的 9 个 LinalgOp（第 72 轮）
+依据 MLIR 9bae84b0 `Linalg/IR/LinalgOps.cpp` 与 `LinalgStructuredOps.td`。实现在 `model/nfrules.py` 第 72 轮两节。
+- **map / reduce / transpose / broadcast**：C++ verify 与 LinalgOp::Trait 合成一条规则（`LinalgHand`）。映射由类型与属性构造：map 取恒等；reduce 的 inputs 取恒等，inits 去掉 dimensions；transpose 取 [perm 的逆, 恒等]；broadcast 取 [恒等去掉 dimensions, 恒等]。C++ 部分包括：块参数个数与类型、形状逐维相等、dimensions 的范围、isPermutationVector。MLIR 先跑接口 verify，再跑 op verify，两者为合取，断言（无秩、越界、dimensions 重复）按拒绝计。
+- **matmul / batch_matmul / batch_reduce_matmul / contract / elementwise**：映射取自 indexing_maps。缺省时，matmul 族用 C++ 默认映射，elementwise 为空数组，contract 为必需属性。迭代器：matmul 族固定；contract 由输出映射推出（出现在输出的维为 parallel）；elementwise 取 rank(init0) 个 parallel，按 ShapedType 计秩，vector 计其秩。LinalgOp 与 ContractionOpInterface 复用 §9.10/§9.11 的结构化检查与区域体检查。
+- **C++ verify（`LinalgCxx`）**：matmul 族只在映射不同于默认映射时检查：输入映射结果须取自默认映射结果；广播映射须保留 k 维，batch 变体另有 batch/m/n 组合；batch 变体的输出映射结果数固定，且依次为 batch/m/n 的函数。contract：前三个映射为投影置换；结果数等于 shaped 秩（vector 计秩，非 shaped 为 0）；维数一致；每个维至少被访问一次；只出现在一个输入中的维也须出现在输出中；至少一个收缩维。isFunctionOfDim 按表达式中出现的维判定。
+- 至此 LinalgOp::Trait 覆盖 91/91（generic、81 个 yaml op、9 个手写 op），ContractionOpInterface 覆盖 11/11（7 个 yaml op 加 4 个手写 op）。linalg 方言仍有 9 个 op 留有 declared：fill（FillOpInterface）、index、pack、unpack、softmax、3 个 winograd、yield。
+- **检验**（nfiface_test 全量，分两段：[0,260) 与 [260,∞)。判据与第 69–71 轮相同，运行前写定。新增变异：dimensions/permutation 取反序、去尾、加 0、首项改 5、全取首项；首个块参数改类型；逐个映射取反序、去首、去尾、换成首映射）：
+  - N2a：比较 5862+28729，MLIR 接受 968+5319，误拒 0，文件崩溃 0。
+  - N2b：接口诊断 2977+16636，漏判 0。MLIR 崩溃 154+1541 例，按拒绝计。
+  - N2d（declared 已清空的 op，完整模型无预言机 ≡ MLIR）：比较 3878+23662，MLIR 拒绝 3276+19085，误拒 0，误收 0。
+  - 分项：LinalgHand 比较 1763，规则拒绝 1232；LinalgCxx 比较 8759，规则拒绝 1409；ContractionOpInterface 比较 9281。
+  - 首跑 N2b 有 346 例漏判，原因在检验：LinalgCxx 只覆盖 C++ verify，却按 LinalgOp 的诊断计数。诊断分组改正后复跑通过。规则本身没有改动。
+- 局限：只验证了语料与上述变异中出现过的映射形状；elementwise 的 kind 与输入个数（arity）的关系由区域体与解析器保证，本规则未单列；诊断匹配仍依赖正则。
