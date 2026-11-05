@@ -14,6 +14,8 @@ import sys, re, glob, random, collections, multiprocessing as mp
 IFACE_DIAG = {'DPS': re.compile(r'is a tensor or a memref|to be equal to the number of output tensors|to match type of corresponding result'),
               'ConvolutionOpInterface': re.compile(r'expected op with 2 inputs and 1 output|unexpected input index map for convolutions|output/filter indexing maps to be projected|unexpected loop dimension for convolution|iterators used to access outputs to be parallel|iterators not used to access outputs to be reduction|convolved dim to be non-empty'),
               'ContractionOpInterface': re.compile(r'expected op with 2 inputs and 1 output|expected at least 1 reduction|indexing maps to be projected permutations|expected add/mul op in the body'),
+              'LinalgHand': re.compile(r'arity of mapper|to match bbArg type|to match shape of output|same shapes|dimensions for reduction|after reduction|init dimensions|mismatching number of operands and block arguments|does not match corresponding block argument|permutation is not valid|does not match init rank|size of permutation|doesn.t match dim\(input|added dimensions|is out of range|should match init dim|Unexpected dim expression|Invalid broadcast|Unexpected result dim expression|exceeds 3|Invalid batch dimension|expects [23] dims|Invalid output map|must have 3 affine maps|not a projected permutation|ranks of shaped operand|non-shaped type|iteration spaces of provided|not used to access any operand|neither a contracting dim|contracting dimension|pure tensor or buffer semantics|indexing_map|non-invertible|shape-to-loops|1 region with 1 block|bb argument|operand rank'),
+              'LinalgCxx': re.compile(r'Unexpected dim expression|Invalid broadcast|Unexpected result dim expression|exceeds 3|Invalid batch dimension|expects [23] dims|Invalid output map|must have 3 affine maps|not a projected permutation|ranks of shaped operand|non-shaped type|iteration spaces of provided|not used to access any operand|neither a contracting dim|contracting dimension'),
               'LinalgOp': re.compile(r'pure tensor or buffer semantics|indexing_map|non-invertible|shape-to-loops|1 region with 1 block|non-induction variable region|bb argument|inferred input/output operand|unexpected result less than 0|operand rank')}
 # 第 70 轮：LinalgOp 变异所有操作数（不只 init）；N2d：declared 已清空的 op 上，完整模型（无预言机）≡ MLIR。
 
@@ -67,7 +69,8 @@ def run_file(path, q, seed):
                 full = not S['declared'] and not S['unknown']
                 ports = list(dict.fromkeys(n['ins']))
                 if not ports: continue
-                gname = 'outputs' if any(nm == 'LinalgOp' for nm, _ in atoms) else atoms[0][1][1][0][1]
+                hand = any(nm == 'LinalgHand' for nm, _ in atoms) and not any(nm == 'LinalgOp' for nm, _ in atoms)
+                gname = 'outputs' if any(nm == 'LinalgOp' for nm, _ in atoms) else (names0 := [q for q, *_ in S['ins']])[-1] if hand else atoms[0][1][1][0][1]
                 try:
                     gi0 = G.bind(S, [TS.parse(tyof[v]) for v in n['ins']], S['ins'], D._seg(n))
                 except Exception: continue
@@ -77,7 +80,7 @@ def run_file(path, q, seed):
                 init_vals = n['ins'][k0:k0 + kn]
                 T0 = [tyof[v] for v in ports]
                 cases = [('原类型', T0, None)]
-                mut_vals = n['ins'] if any(nm == 'LinalgOp' for nm, _ in atoms) else init_vals
+                mut_vals = n['ins'] if any(nm in ('LinalgOp', 'LinalgHand') for nm, _ in atoms) else init_vals
                 for v in list(dict.fromkeys(mut_vals)):
                     j = ports.index(v)
                     for t in _variants(T0[j]): cases.append(('init', T0[:j] + [t] + T0[j + 1:], None))
@@ -95,9 +98,27 @@ def run_file(path, q, seed):
                 if 'indexing_maps' in at1:
                     ms = re.findall(r'affine_map<.*?>(?=\s*[,\]])', at1['indexing_maps'])
                     if len(ms) >= 2: cases.append(('attr', T0, ('attr', 'indexing_maps', '[' + ', '.join(ms[::-1]) + ']')))
+                    if hand or n['op'] in ('linalg.matmul', 'linalg.batch_matmul', 'linalg.batch_reduce_matmul', 'linalg.contract', 'linalg.elementwise'):
+                        for k_, m_ in enumerate(ms):                       # 第 72 轮：逐个映射的结果变异（转置/去首/去尾/换成首映射）
+                            mm = re.fullmatch(r'affine_map<(\(.*?\)(?:\[.*?\])?\s*->\s*)\((.*)\)>', m_.strip())
+                            if not mm: continue
+                            rs = [x.strip() for x in mm.group(2).split(',') if x.strip()]
+                            for rs2 in (rs[::-1], rs[1:], rs[:-1]):
+                                if rs2 == rs: continue
+                                ms2 = list(ms); ms2[k_] = f'affine_map<{mm.group(1)}({", ".join(rs2)})>'
+                                cases.append(('attr', T0, ('attr', 'indexing_maps', '[' + ', '.join(ms2) + ']')))
+                            if k_: ms2 = list(ms); ms2[k_] = ms[0]; cases.append(('attr', T0, ('attr', 'indexing_maps', '[' + ', '.join(ms2) + ']')))
                     if 'iterator_types' in at1:
                         its = re.findall(r'#linalg\.iterator_type<\w+>', at1['iterator_types'])
                         if its: cases.append(('attr', T0, ('attr', 'iterator_types', '[' + ', '.join(its[:-1]) + ']')))
+                for an in ('dimensions', 'permutation'):                       # 第 72 轮：手写 op 的数组属性变异
+                    if an in at1:
+                        v0 = re.findall(r'-?\d+', at1[an].split(':', 1)[1]) if ':' in at1[an] else []
+                        vs = [v0[::-1], v0[:-1], v0 + ['0'], ['5'] + v0[1:], [v0[0]] * len(v0) if v0 else ['0']]
+                        for v in vs: cases.append(('attr', T0, ('attr', an, 'array<i64' + (': ' + ', '.join(v) if v else '') + '>')))
+                if hand and n.get('regions') and len(n['regions'][0]) == 1 and n['regions'][0][0]['args']:
+                    a0t = n['regions'][0][0]['args'][0][1]
+                    cases.append(('bbarg', T0, ('bbarg', 'f64' if a0t != 'f64' else 'i32')))
                 if n.get('regions') and len(n['regions'][0]) == 1:          # 第 71 轮：区域体变异（ContractionOpInterface 依赖区域体）
                     rops = {o['op'] for o in n['regions'][0][0]['ops']}
                     for a_, b_ in (('arith.mulf', 'arith.subf'), ('arith.addf', 'arith.subf'), ('arith.muli', 'arith.subi'), ('arith.addi', 'arith.subi'), ('arith.mulf', 'arith.addf')):
@@ -107,7 +128,11 @@ def run_file(path, q, seed):
                     bs = instantiate([n], ports, T)
                     if bs is None: st['不可实例化'] += 1; continue
                     node = bs[0]['ops'][0]
-                    if rmut is not None and rmut[0] == 'body':
+                    if rmut is not None and rmut[0] == 'bbarg':
+                        import copy
+                        node['regions'] = copy.deepcopy(node['regions'])
+                        b0 = node['regions'][0][0]; b0['args'] = [(b0['args'][0][0], rmut[1])] + b0['args'][1:]
+                    elif rmut is not None and rmut[0] == 'body':
                         import copy
                         node['regions'] = copy.deepcopy(node['regions'])
                         for o in node['regions'][0][0]['ops']:
