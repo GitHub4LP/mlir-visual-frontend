@@ -78,7 +78,9 @@ def _resid(P, items, exprs):
 def derive(sl, ports, inner=None):
     """sl：节点表（irimport 形式）；ports：端口值名（按序）。inner：{op 名: (Phi, 端口数)}，复合 op 作节点（嵌套）。"""
     P = Phi(len(ports)); ex = {v: ('p', i) for i, v in enumerate(ports)}
+    import nfrules as _NF0; _consts = {}
     for idx, n in enumerate(sl):
+        _NF0.note_const(n, _consts)
         ins_e = [ex[v] for v in n['ins']]
         if inner and n['op'] in inner:                  # 嵌套：内层 Φ 的原子经代换搬入（组合封闭）
             Q = inner[n['op']]
@@ -118,7 +120,7 @@ def derive(sl, ports, inner=None):
             if x[2] not in ('ods', 'cpred', 'nf'): continue
             try: _at = A_.from_core(n)
             except Exception: _at = None
-            import nfrules as _NF; _at = _NF.nf_attrs(n, _at)
+            import nfrules as _NF; _at = _NF.nf_attrs(n, _at, _consts)
             P.atoms.append(('rel', x, (idx, n['op'], mini, partial, _at), groups, [e for g in gi for e in g], [] if partial else [e for g in go for e in g]))
     P.outs_e = []; P.env = ex
     return P
