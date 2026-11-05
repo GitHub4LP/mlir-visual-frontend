@@ -75,10 +75,69 @@ def _resid(P, items, exprs):
     if all(not ports_of(e) for e in exprs): P.ground += items
     else: P.residual += items
 
+def captures(n):
+    """第 75 轮：n 的区域内用到、但不在区域内定义的值（捕获）。父 op 的不透明校验（verifyRegions 等）可能读到它们的类型，
+    所以判断残差是否定值时必须连同捕获一起看。"""
+    defined, out = set(), []
+    def walk(m):
+        for r in m.get('regions') or []:
+            for b in r:
+                for a, _ in b['args']: defined.add(a)
+                for k in b['ops']:
+                    for v in k['ins']:
+                        if v not in defined and v not in out: out.append(v)
+                    walk(k)
+                    for o, _ in k['outs']: defined.add(o)
+    walk(n)
+    return [v for v in out if v not in defined]
+
 def derive(sl, ports, inner=None):
     """sl：节点表（irimport 形式）；ports：端口值名（按序）。inner：{op 名: (Phi, 端口数)}，复合 op 作节点（嵌套）。"""
     P = Phi(len(ports)); ex = {v: ('p', i) for i, v in enumerate(ports)}
     import nfrules as _NF0; _consts = {}
+    def _node(n, idx, ins_e, parent, nested):
+        if nested and n['op'] in ('func.return', 'func.call', 'scf.yield'):      # 与 core.typecheck 相同：由结构层负责（类型关系在父 op 的残差里）
+            for o, t in n['outs']: ex[o] = ('k', TS.parse(t))
+            return
+        lk = G.lookup(n['op'])
+        if lk is None:
+            for o, t in n['outs']: ex[o] = ('k', TS.parse(t))
+            _resid(P, [f'{n["op"]}: 无自动签名（交预言机）'], ins_e + [ex[o] for o, _ in n['outs']] + [ex[v] for v in captures(n) if v in ex])
+            return
+        cls, S = lk
+        gi = G.bind(S, ins_e, S['ins'], _seg(n))
+        re_ = (_result_exprs(n, S, gi) if gi is not None else None) if not nested else None
+        if re_ == 'fail': P.bottom = P.bottom or f'{n["op"]}: 推断规则缺输入'; re_ = None
+        outs_e = re_ if re_ is not None and len(re_) == len(n['outs']) else [('k', TS.parse(t)) for _, t in n['outs']]
+        for (o, _), e in zip(n['outs'], outs_e): ex[o] = e
+        _resid(P, [f'{n["op"]}: {d}' for d in S['declared']] + [f'{n["op"]}: 未导入 {u}' for u in S['unknown']], ins_e + outs_e + [ex[v] for v in captures(n) if v in ex])   # 第 75 轮：区域捕获的值也算节点的输入
+        go = G.bind(S, outs_e, S['outs'])
+        P.atoms.append(('attr', n, ins_e, outs_e))       # 属性层与绑定无关（与 core.typecheck 同）
+        if gi is None or go is None: P.residual.append(f'{n["op"]}: 端口组无法绑定')
+        if gi is None: return
+        partial = go is None                          # 结果组无法绑定：与 odssig.check 的部分模式相同，只查操作数一侧
+        for (nm, p, m, b), es in zip(S['ins'] + ([] if partial else S['outs']), gi + ([] if partial else go)):
+            if m == 'one' and len(es) != 1 or m == 'optional' and len(es) > 1: P.bottom = P.bottom or f'{n["op"]}.{nm}: 个数'
+            for e in es: P.atoms.append(('pred', b, p, e, (idx, nm)))
+        mini = dict(S, ins=[(nm, _T, m, b) for nm, _, m, b in S['ins']], outs=[(nm, _T, m, b) for nm, _, m, b in S['outs']], infer=None)
+        groups = gi + ([] if partial else go)
+        for x in S['rel']:
+            if x[2] not in ('ods', 'cpred', 'nf'): continue
+            try: _at = A_.from_core(n)
+            except Exception: _at = None
+            import nfrules as _NF; _at = _NF.nf_attrs(n, _at, _consts, parent)
+            P.atoms.append(('rel', x, (idx, n['op'], mini, partial, _at), groups, [e for g in gi for e in g], [] if partial else [e for g in go for e in g]))
+    def _regions(n, idx):
+        # 第 75 轮：区域内的 op 也进入 Φ_comp。块参数与区域内结果取图上写定的类型（常量）；区域内用到的外部值（捕获）就是端口或外层值。
+        pinfo = _NF0.parent_info(n)
+        for r in n.get('regions') or []:
+            for b in r:
+                for a, t in b['args']: ex[a] = ('k', TS.parse(t)); _consts.pop(a, None)
+                for m in b['ops']:
+                    for o, _ in m['outs']: _consts.pop(o, None)
+                    _NF0.note_const(m, _consts)
+                    _node(m, idx, [ex[v] for v in m['ins']], pinfo, True)
+                    _regions(m, idx)
     for idx, n in enumerate(sl):
         _NF0.note_const(n, _consts)
         ins_e = [ex[v] for v in n['ins']]
@@ -94,34 +153,8 @@ def derive(sl, ports, inner=None):
             if Q.bottom: P.bottom = P.bottom or Q.bottom
             for (o, _), e in zip(n['outs'], Q.outs_e): ex[o] = sub(e)
             continue
-        lk = G.lookup(n['op'])
-        if lk is None:
-            for o, t in n['outs']: ex[o] = ('k', TS.parse(t))
-            _resid(P, [f'{n["op"]}: 无自动签名（交预言机）'], ins_e + [ex[o] for o, _ in n['outs']])
-            continue
-        cls, S = lk
-        gi = G.bind(S, ins_e, S['ins'], _seg(n))
-        re_ = _result_exprs(n, S, gi) if gi is not None else None
-        if re_ == 'fail': P.bottom = P.bottom or f'{n["op"]}: 推断规则缺输入'; re_ = None
-        outs_e = re_ if re_ is not None and len(re_) == len(n['outs']) else [('k', TS.parse(t)) for _, t in n['outs']]
-        for (o, _), e in zip(n['outs'], outs_e): ex[o] = e
-        _resid(P, [f'{n["op"]}: {d}' for d in S['declared']] + [f'{n["op"]}: 未导入 {u}' for u in S['unknown']], ins_e + outs_e)
-        go = G.bind(S, outs_e, S['outs'])
-        P.atoms.append(('attr', n, ins_e, outs_e))       # 属性层与绑定无关（与 core.typecheck 同）
-        if gi is None or go is None: P.residual.append(f'{n["op"]}: 端口组无法绑定')
-        if gi is None: continue
-        partial = go is None                          # 结果组无法绑定：与 odssig.check 的部分模式相同，只查操作数一侧
-        for (nm, p, m, b), es in zip(S['ins'] + ([] if partial else S['outs']), gi + ([] if partial else go)):
-            if m == 'one' and len(es) != 1 or m == 'optional' and len(es) > 1: P.bottom = P.bottom or f'{n["op"]}.{nm}: 个数'
-            for e in es: P.atoms.append(('pred', b, p, e, (idx, nm)))
-        mini = dict(S, ins=[(nm, _T, m, b) for nm, _, m, b in S['ins']], outs=[(nm, _T, m, b) for nm, _, m, b in S['outs']], infer=None)
-        groups = gi + ([] if partial else go)
-        for x in S['rel']:
-            if x[2] not in ('ods', 'cpred', 'nf'): continue
-            try: _at = A_.from_core(n)
-            except Exception: _at = None
-            import nfrules as _NF; _at = _NF.nf_attrs(n, _at, _consts)
-            P.atoms.append(('rel', x, (idx, n['op'], mini, partial, _at), groups, [e for g in gi for e in g], [] if partial else [e for g in go for e in g]))
+        _node(n, idx, ins_e, None, False)
+        _regions(n, idx)
     P.outs_e = []; P.env = ex
     return P
 _T = lambda t: True
@@ -201,8 +234,8 @@ def simplify(P):
             seen.add(k)
         elif a[0] == 'rel':
             if a[1][0] in REFLEXIVE and len({key(e) for e in es}) <= 1: continue
-            k = ('rel', a[1][0], tuple(a[1][1]), id(a[1][3]) if a[1][0] == 'match' else None, a[2][3],
-                 tuple(sorted(a[2][4].items())) if a[1][0] == 'nf' and a[1][5] and a[2][4] else None, tuple(tuple(key(e) for e in g) for g in _relgroups(a)))
+            k = ('rel', a[1][0], tuple(a[1][1]), id(a[1][3]) if a[1][0] == 'match' else id(a[1][4]) if a[1][0] == 'nf' else None, a[2][3],
+                 tuple((k_, repr(v_)) for k_, v_ in sorted(a[2][4].items())) if a[1][0] == 'nf' and a[1][5] and a[2][4] else None, tuple(tuple(key(e) for e in g) for g in _relgroups(a)))
             if k in seen: continue
             seen.add(k)
         Q.atoms.append(a)
