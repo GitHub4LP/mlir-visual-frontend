@@ -517,3 +517,32 @@ R_j(t) ≝ ∃ 其余端口. Φ_comp，即用户需求里“签名允许的最�
 
 **下一步**：scf.forall / scf.parallel / scf.reduce（含 Graph 区域 in_parallel）；区域内类型随端口推导；linalg.fill；tensor.pad/empty。
 
+
+### §9.17 第 77 轮：区域类型流（最大性延伸到区域内）
+
+**问题。** 第 75–76 轮里，区域内的块参数和 op 结果取图上写定的类型，所以最大类型约束只在顶层是推导出来的。以 `scf.for` 为例，写定 iter_arg 为 f32，复合 op 就只接受 f32，尽管 MLIR 对任何满足边等式的类型都接受。
+
+**机制（model/regionflow.py）。** 区域 op 的类型流由一张控制流入口边表给出（依据 9bae84b0 SCF.cpp 的 getSuccessorRegions / getEntrySuccessorOperands / inferReturnTypes，以及 LinalgInterfaces.cpp 的 bbArg 规则）：
+- scf.for：块参数 = (typeof lb, inits)，结果 = inits；
+- scf.if / execute_region / index_switch：结果 = 第一个区域的 yield；
+- scf.while：before 参数 = inits，after 参数与结果都等于 condition 的值；
+- LinalgOp：第 k 个块参数 = elt(第 k 个操作数)。
+
+每个后继输入只取一条前驱边作为**定义**，其余边仍由 nf 规则作为**约束**检查，判定层不变。区域内的 op 与顶层一样按 ODS 推断前推结果，没有推断规则的 op 取字面量。MLIR 要求这些等式成立，所以被接受的类型指派都满足它们。用等式定义内部类型不会丢掉任何可接受的端口类型；可靠性仍由不变的判定层保证。
+
+**符号与具体共用一张表。** odscomp.derive 把 nf 规则读到的区域信息（块参数、块内结果、终结子操作数）记成表达式快照 `\x00inst`，odscomp.holds 在端口类型下把它具体化，再用 core 的同一函数 `nfrules.region_keys` 计算。composite.instantiate 按同一张表实例化，兄弟区域的同名值各有作用域。第 76 轮的 `\x00tterm_e` 由此取代。区域内类型依赖端口时，体内 op 未清空的 C++ verify 计入残差（非定值）。
+
+**检验（model/regflow_test.py，判据先写定）。**
+- **F1 单调**（旧接受 ⇒ 新接受）：PASS，实例 5565 + 13310，违例 0。
+  - 首跑报 6 例违例，原因是测试把“Φ 真但残差非空”算成了旧接受，与写定判据不符，已改正。6 例全是 linalg.reduce：旧签名没有把块参数与输入元素类型联系起来，按 Unknown 处理；新签名正确拒绝。
+- **F2 随机变异增益 ≥ 50**：**FAIL**。增益 24，其中残差为空 18，MLIR 全部接受，误收 0。随机变异很少碰到可传播的类型改变，判据保留原样。
+- **F4 一致替换元素类型**：在 F2 失败后补写，F2 不改。两段合计实例 436，增益 137，误收 0，误拒 0。
+  - 按段：第一段 131 PASS；第二段（主要是 Linalg 补充语料）只有 6，按段判 FAIL。原因是 linalg op 的 tensor 结果取字面量（DPS 结果未建模），传播在 linalg 结果处中断。
+- **F3**：增益实例中，旧实例化被 MLIR 拒绝的有 18 例，说明旧签名确实不是最大的。
+- **回归**（最终代码）：regcomp R1/R2、odscomp S1–S4、projcomp P1/P2/P4/P5、scf N2g-a/b/d、nfiface N2a/b/d、core_test、odssig L1、clauses 均 PASS。
+  - nfiface N2d 首跑误收 1 例：linalg.generic 体内的 vector.outerproduct 的 C++ verify 现在会随端口变化。测试改为把这类实例（体内有 op 的 C++ verify 未清空、且其类型被改变）记作残差非空。这是语义变化后对测量的修正。
+
+**未做。**
+- DPS 结果 = init（DestinationStyleOpInterface）。这是 F4 第二段增益少的原因，作为下一个机制。
+- scf.forall / parallel / reduce。
+- 多块区域只取入口块。
