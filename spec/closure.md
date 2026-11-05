@@ -546,3 +546,37 @@ R_j(t) ≝ ∃ 其余端口. Φ_comp，即用户需求里“签名允许的最�
 - DPS 结果 = init（DestinationStyleOpInterface）。这是 F4 第二段增益少的原因，作为下一个机制。
 - scf.forall / parallel / reduce。
 - 多块区域只取入口块。
+
+### §9.18 第 78 轮：C++ verify 与属性谓词的批量规范化（解释执行 9bae84b0 源码）
+
+**问题。** 第 66–77 轮的 nf 规则是逐 op 手写的。全量盘点（650 个 op）：declared 残差原有 662 条，第 77 轮后剩 335 条，其中 153 个 op 的 C++ verify()、Transform 接口 92 条、InferType 37 条。已关闭的部分主要靠“一个接口一条规则”（DPS、LinalgOp、Conv、Contraction）。逐 op 手写与需求（建模应当批量）不符。
+
+**机制（model/cppverify.py）。** verify() 用的是一小套词汇：取端口类型、getRank/getShape/getElementType/getDimSize、个数比较、isa/cast、早返回 emitOpError。把它当作一门语言：
+- 解析 C++ 子集（声明、if/else、for/range-for/while、return、lambda、模板 isa/cast、花括号初始化）；
+- 在 typesig 类型项与 MLIR 属性值上求值；ODS 访问器按 ODS 名字生成，属性 getter 按 ODS returnType 转换；op 的内联方法（extraClassDeclaration）、类外方法和方言 .cpp 中的辅助函数递归解释，方言常量取自 .td；
+- 三值：`return emitOpError/failure` ⇒ 拒绝（带出消息），`return success` ⇒ 接受，路径上遇到不支持的构造 ⇒ CppUnknown（作 NFUnknown，不猜）；cast 失败按断言崩溃计为拒绝；
+- 静态完备：函数体与所有调到的方法/辅助函数可解析且名字都在词汇内 ⇒ 该 op 的 'C++ verify()' 移出残差；不完备的 op 规则仍生效（只在走到的路径上判定）。
+- 查询不带属性时（x[5] = 'opt'）仍求值，只有真正读到属性才 Unknown。
+
+同一解释器也用于 **ODS 属性谓词原子**（attrsig）：此前用正则表逐条登记，未登记的原子算 Unknown；现在原子作为 C++ 表达式（$_self 为属性）求值。另修正别名命名空间（`::mlir::linalg::IteratorTypeAttr` 实为 utils 命名空间，attrName linalg.iterator_type）。
+
+**账目修正。** 属性谓词里仍无法求值的原子以前只在 attrsig 导入账中，**没有进 op 残差**，“残差为空”因此偏宽（例：linalg.winograd_* 的 fmr、conv/pooling 的 strides/dilations、linalg.generic 的 iterator_types，共 60 个 op 被算作残差为空）。现在计入 S['unknown']。属性原子解释执行后，带未知属性原子的 op 从 93 个降到 6 个（6 条：gpu 的 hasTrait/接口 2 类 3 条、linalg.reduce dimensions 的 adjacent_find、transform 的 all_of lambda、affine.linearize_index 的 pred-ref）。
+
+**结果。** C++ verify() 的 188 个 op 中静态完备 43 个（含已有手写规则的 memref.load/store、scf.for、linalg.softmax/transpose，可作交叉检验）；declared 残差 335 → 298。Transform 方言的 .cpp 未下载，30 个 op 无源码。
+
+**检验（model/cppverify_test.py，判据先写定）。** 单个顶层 op，变异端口类型、结果类型、整数数组/整数属性；全语料 + Linalg 补充语料分 5 段：
+- **C1 误拒 0**：比较 45170（op 实例 6409，MLIR 接受 13123），误拒 0。PASS。
+- **C2 完备 op 漏判 0**：完备 op 上来自其 verify 的诊断 1213（按段 258/374/559/18/4；后两段单段未达非空阈值 100，按段 FAIL，合计满足），漏判 0。
+  - 首跑 C2 报 8 例漏判（memref.dma_wait），实为 ODS 生成的“must be variadic of index”被字面量子串误配。判据改为“去掉 `'op' op ` 前缀后以 verify 字面量开头”。这是在看到结果后对测量的修正，如实记录。
+- **C3 完备 op 未定 0**：PASS（经修正：complex.constant 的 attr.getType、vector.shuffle 的 kPoisonIndex、arith.constant 的 SplatElementsAttr/TypedAttr、vector.extract 以名字传函数）。变异属性在 MLIR Python 中不可解析的 41 例跳过（不在 IR 域内）。
+- **C5 残差为空 ⇒ 完整模型≡MLIR**：比较 34856（MLIR 拒绝 23726），误拒 0，误收 0。
+  - 首跑发现 **既有缺口**：①vector.broadcast 手写规则把标量源限于 i/f/index，`!llvm.ptr` 源误拒（已按 isBroadcastableTo 改为“标量 = 元素类型”）；②winograd fmr 属性变异 34 例误收（属性原子未建模却算残差为空，见账目修正）。
+  - 解释器自身的错误：getI1SameShape 被我硬编码、丢了张量编码，odscomp S3 首跑因此误拒 1 例；改为解释源码里的函数（cloneWith 作类型原语），不再硬编码方言内已有的函数。
+- 不完备 op：比较 26215，判定 1335（拒绝 1283），其余 Unknown；拒绝时消息与 MLIR 一致 2043/2043。
+
+**回归（最终代码）。** odscomp S1–S4、regcomp R1/R2、projcomp P1/P2/P4/P5、nfiface N2a/b/d、scf N2g-a/b/d、core_test、odssig L1（L1 误收 4964 → 4667）、attrsig A1/A2、clauses 均 PASS；其余见本轮回复。
+
+**未做/边界。**
+- 词汇外的长尾：AffineMap、getMixedSizes（OffsetSizeAndStride）、switch/枚举、父 op 与区域访问、DataLayout、std::tie。下一步按“一个构造解锁多个 op”的次序扩充。
+- 已有手写规则尚未用解释器替换；替换前需逐 op 证明等价（同一检验）。
+- 单 op 检验跳过带区域的 op；区域 op 由 regcomp/scf 检验覆盖。

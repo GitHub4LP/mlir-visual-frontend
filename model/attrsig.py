@@ -78,6 +78,11 @@ def specialized_enums():
 def _dialect_isa(cpp):
     """方言属性类的 isa。在导入时解析（解析不了 ⇒ Unknown，进导入账），不在求值时才发现。"""
     nm = attrdefs().get(cpp)
+    if nm is None:                       # 第 78 轮：别名命名空间（::mlir::linalg::IteratorTypeAttr 实为 ::mlir::utils::IteratorTypeAttr，attrName linalg.iterator_type）
+        m_ = re.fullmatch(r'(?:::)?mlir::(\w+)::(\w+)', cpp)
+        if m_:
+            hits = {v for k, v in attrdefs().items() if k.endswith('::' + m_.group(2)) and v.split('.')[0] == m_.group(1)}
+            if len(hits) == 1: nm = hits.pop()
     if nm is not None:
         dia, _, mn = nm.partition('.')
         def f(a):
@@ -146,6 +151,10 @@ class _Atoms(dict):
                 if f == UPPER: self.upper.add(k); return lambda a: True
                 return f
         t = O.ATOM.get(k)                    # 类型原子：$_self 已被换成类型
+        if t is None and '$_self' in k:      # 第 78 轮：其余属性原子是 C++ 表达式，交 cppverify 的解释器（同一套 C++ 子集语义），静态不完备才算 Unknown
+            import cppverify as CV
+            f = CV.compile_attr_atom(k)
+            if f is not None: return f
         return t
     def __contains__(self, k): return self.get(k) is not None
     def __getitem__(self, k):
