@@ -181,7 +181,9 @@ def run_op(op, q):
 
 if __name__ == '__main__':
     import verdict as V, nfrules as N
-    ops = sys.argv[1:] or sorted(N.CANDIDATES)
+    # 第 74 轮：N1 的网格只变异端口类型，不生成区域、indexing_maps 与必需属性；linalg op 在此网格上 MLIR 一律拒绝（接受 0，如“requires one region”），
+    # 比较没有区分力，且 linalg.map 的结构性拒绝会被记成 nf 误收。linalg 由 nfiface_test N2a/N2b/N2d、packconst_test N2e、winograd_test N2f 检验。
+    ops = sys.argv[1:] or sorted(o for o in N.CANDIDATES if not o.startswith('linalg.'))
     q = mp.Queue(); ps = [mp.Process(target=run_op, args=(o, q)) for o in ops]
     for p in ps: p.start()
     res = {}
