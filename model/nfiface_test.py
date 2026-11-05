@@ -18,6 +18,8 @@ IFACE_DIAG = {'DPS': re.compile(r'is a tensor or a memref|to be equal to the num
               'LinalgCxx': re.compile(r'Unexpected dim expression|Invalid broadcast|Unexpected result dim expression|exceeds 3|Invalid batch dimension|expects [23] dims|Invalid output map|must have 3 affine maps|not a projected permutation|ranks of shaped operand|non-shaped type|iteration spaces of provided|not used to access any operand|neither a contracting dim|contracting dimension'),
               'linalg.pack': re.compile(r'invalid zero tile factor|invalid inner_dims_pos|invalid outer_dims_perm|must be a permutation or empty|tiling factors must|packed rank !=|mismatch in inner tile sizes|for the packed domain value|expected padding_value has|Only full tiles are supported'),
               'linalg.unpack': re.compile(r'invalid zero tile factor|invalid inner_dims_pos|invalid outer_dims_perm|must be a permutation or empty|tiling factors must|packed rank !=|mismatch in inner tile sizes|for the packed domain value'),
+              'linalg.softmax': re.compile(r'incompatible output shape|incorrect dimension specified|input and output have same element type'),   # 第 74 轮
+              'winograd': re.compile(r'expect filter height|expect filter width|expect either filter height|the output shape is not expected|expect input height|expect input width'),
               'LinalgOp': re.compile(r'pure tensor or buffer semantics|indexing_map|non-invertible|shape-to-loops|1 region with 1 block|non-induction variable region|bb argument|inferred input/output operand|unexpected result less than 0|operand rank')}
 # 第 70 轮：LinalgOp 变异所有操作数（不只 init）；N2d：declared 已清空的 op 上，完整模型（无预言机）≡ MLIR。
 
@@ -89,7 +91,7 @@ def run_file(path, q, seed):
                 init_vals = n['ins'][k0:k0 + kn]
                 T0 = [tyof[v] for v in ports]
                 cases = [('原类型', T0, None)]
-                mut_vals = n['ins'] if any(nm in ('LinalgOp', 'LinalgHand', 'linalg.pack', 'linalg.unpack') for nm, _ in atoms) else init_vals
+                mut_vals = n['ins'] if any(nm in ('LinalgOp', 'LinalgHand', 'linalg.pack', 'linalg.unpack', 'linalg.softmax', 'winograd') for nm, _ in atoms) else init_vals
                 mut_vals = [v for v in mut_vals if v in ports]
                 for k_, m in enumerate(pre):
                     for cv in (0, 1, 3, 5): cases.append(('const', T0, ('const', k_, cv)))
@@ -123,6 +125,10 @@ def run_file(path, q, seed):
                     if 'iterator_types' in at1:
                         its = re.findall(r'#linalg\.iterator_type<\w+>', at1['iterator_types'])
                         if its: cases.append(('attr', T0, ('attr', 'iterator_types', '[' + ', '.join(its[:-1]) + ']')))
+                if 'dimension' in at1 and n['op'] == 'linalg.softmax':               # 第 74 轮：softmax 的 dimension 与 winograd 的 fmr 变异
+                    for v in (-1, 0, 1, 2, 3, 5): cases.append(('attr', T0, ('attr', 'dimension', f'{v} : i64')))
+                if 'fmr' in at1:
+                    for v in (0, 1, 2): cases.append(('attr', T0, ('attr', 'fmr', f'{v} : i32')))   # 通用形式 fmr = N : i32（F_2_3/F_4_3/F_2_5）
                 for an in ('dimensions', 'permutation', 'inner_dims_pos', 'outer_dims_perm', 'static_inner_tiles'):                       # 第 72 轮：手写 op 的数组属性变异
                     if an in at1:
                         v0 = re.findall(r'-?\d+', at1[an].split(':', 1)[1]) if ':' in at1[an] else []
@@ -204,7 +210,10 @@ if __name__ == '__main__':
     lim = int(sys.argv[1]) if len(sys.argv) > 1 else 10 ** 9
     start = int(sys.argv[2]) if len(sys.argv) > 2 else 0
     tot = collections.Counter(); exs = collections.defaultdict(list); ctxm = mp.get_context('fork')
-    for i, path in enumerate((sorted(glob.glob('corpus/*/*.mlir')) + sorted(glob.glob('corpus_ext/*/*.mlir')))[start:lim], start):
+    import os
+    files = (sorted(glob.glob('corpus/*/*.mlir')) + sorted(glob.glob('corpus_ext/*/*.mlir')))[start:lim]
+    if os.environ.get('NFI_FILES'): files = [f for f in files if any(k in f for k in os.environ['NFI_FILES'].split(','))]   # 定向复跑
+    for i, path in enumerate(files, start):
         q = ctxm.Queue(); p = ctxm.Process(target=run_file, args=(path, q, i)); p.start()
         try: st, ex = q.get(timeout=600)
         except Exception: p.kill(); tot['文件超时/崩溃'] += 1; continue
