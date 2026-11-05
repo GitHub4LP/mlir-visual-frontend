@@ -141,6 +141,10 @@ def sig(dialect, opname):
     S['infer'] = _ods_infer(d, r, S)
     S['infer_cpp'] = infer_iface and S['infer'] is None
     if S['infer_cpp']: S['declared'].append('C++ inferReturnTypes')
+    # 第 78 轮：属性谓词中仍无法求值的原子也是残差（此前只在 attrsig 导入账里，未进 op 残差，“残差为空”因此偏宽）
+    import attrsig as _AS
+    for e in _AS.attr_args(opname) or []:
+        if e['unknown'] is not None: S['unknown'].append(f"属性约束 {e['name']}: {str(e['unknown'])[:60]}")
     return S
 
 def _ods_infer(d, r, S):
@@ -218,7 +222,8 @@ def check(S, ins, outs, levels=('ods', 'cpred', 'nf'), attrs=None, strict=False)
         elif k == 'cond_shape':
             c, rr = groups; ok = bool(c) and bool(rr) and (c[0] == ('i', 1, '') or (shaped(c[0]) and shaped(rr[0]) and ranked(c[0]) and ranked(rr[0]) and c[0][1] == rr[0][1]))
         elif k == 'nf':                                          # 第 66 轮：规范化的 C++ verify 规则（nfrules）；x[5]：需要属性
-            if x[5] and attrs is None: continue                  # 无属性信息（如只看类型的查询）：不判，上近似
+            if x[5] is True and attrs is None: continue          # 无属性信息（如只看类型的查询）：不判，上近似
+            # 第 78 轮：x[5] == 'opt'（cppverify）：无属性信息也调用，规则只在真正读到属性时才 NFUnknown
             try: ok = bool(x[4](*groups, attrs) if x[5] else x[4](*groups))
             except (IndexError, TypeError, KeyError): ok = False   # 端口不满足 ODS 基本约束时规则无定义；此时 ODS 约束本身已拒绝
             except Exception as e:
