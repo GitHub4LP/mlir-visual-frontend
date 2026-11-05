@@ -557,7 +557,7 @@ def parent_info(n):
     rs = n.get('regions') or []
     return (n['op'], len(rs), bool(rs and rs[0]))
 
-def nf_attrs(n, at, consts=None, parent=False):
+def nf_attrs(n, at, consts=None, parent=False, vty=None, vex=None):
     """给 nf 规则用的属性表：在 from_core 的结果上加区域 0 入口块参数类型（只给 nf 规则看，不作为 MLIR 属性）。
     consts（值名 → 整数常量）给出时，加 '\x00consts'：各操作数的常量值（非常量为 None）。
     parent（第 75 轮）：父信息 parent_info(父)，None = 父未定（复合 op 体的顶层）；不给（False）则不加。"""
@@ -569,6 +569,32 @@ def nf_attrs(n, at, consts=None, parent=False):
     rs = n.get('regions') or []
     if not rs: return at
     at = dict(at)
+    if vty is not None or vex is not None:                    # 第 76 轮：各区域各块的入口参数类型、末 op、末 op 操作数（scf 区域规则）
+        at['\x00regs'] = _regs_info(rs)
+        # 终结子操作数：先在本块（块参数、本块 op 的结果）、再在同区域其他块里找（兄弟区域会复用值名，不能用平铺的值表）；都不是 ⇒ 捕获，取外层
+        def _loc(r, b):
+            d = {}
+            for b2 in [x for x in r if x is not b] + [b]:
+                for a, t in b2.get('args', []): d[a] = t
+                for k in b2['ops']:
+                    for o, t in k['outs']: d[o] = t
+            return d
+        def _p(t):
+            try: return TS.parse(t)
+            except Exception: return None
+        tt, te = [], []
+        for r in rs:
+            rt, re_ = [], []
+            for b in r:
+                vs = list(b['ops'][-1]['ins']) if b['ops'] else []; d = _loc(r, b)
+                if vty is not None:
+                    ts = [_p(d[v]) if v in d else (_p(vty(v)) if vty(v) is not None else None) for v in vs]
+                    rt.append(None if any(t is None for t in ts) else ts)
+                else:
+                    re_.append([(lambda t: None if t is None else ('k', t))(_p(d[v])) if v in d else vex(v) for v in vs])
+            tt.append(rt); te.append(re_)
+        if vty is not None: at['\x00tterm'] = tt
+        else: at['\x00tterm_e'] = te                         # odscomp.holds 在端口类型下求值为 '\x00tterm'
     r0 = rs[0]
     at['\x00nb0'] = len(r0)
     at['\x00bbargs'] = None if len(r0) != 1 else [t for _, t in r0[0].get('args', [])]
@@ -1236,3 +1262,105 @@ def apply(S, reg=None):
             and S['ins'] and S['ins'][-1][0] in ('outputs', 'init', 'inits'):
         S = dict(S); S['rel'] = S['rel'] + [_body_rule(S)]
     return S
+
+
+# ───────────────────────── 第 76 轮：scf 区域 op 的 C++ verify / verifyRegions / LoopLikeOpInterface / RegionBranchOpInterface / InferTypeOpInterface，closure §9.16
+# 依据（9bae84b0）：SCF/IR/SCF.cpp ForOp::verify/verifyRegions/getSuccessorRegions/getEntrySuccessorOperands、IfOp::verify/inferReturnTypes/getSuccessorRegions、
+#   WhileOp::verify/getSuccessorRegions/getEntrySuccessorOperands/getYieldOp、ConditionOp::getMutableSuccessorOperands、ExecuteRegionOp::verify/getSuccessorRegions、
+#   IndexSwitchOp::verify/getSuccessorRegions；Interfaces/LoopLikeInterface.cpp verifyLoopLikeOpInterface；
+#   Interfaces/ControlFlowInterfaces.cpp verifyTypesAlongControlFlowEdges（areTypesCompatible 缺省 = 类型相等；RegionSuccessor(Region*) 的输入为空）；
+#   InferTypeOpInterface.cpp verifyInferredResultTypes（isCompatibleReturnTypes 缺省 = 逐个相等）。
+# 区域信息由 nf_attrs 放入：'\x00regs'（各区域各块：入口参数类型、末 op 名）与 '\x00tterm'（各块末 op 的操作数类型；捕获值在 Φ_comp 中是端口表达式，求值后给出）。
+# 断言崩溃（getInductionVar 取不到块参数、cast<YieldOp> 失败、front() 取空区域）按拒绝计。
+def _regs_info(rs):
+    out = []
+    for r in rs:
+        rr = []
+        for b in r:
+            try: args = [TS.parse(t) for _, t in b.get('args', [])]
+            except Exception: args = None
+            rr.append({'args': args, 'last': b['ops'][-1]['op'] if b['ops'] else None})
+        out.append(rr)
+    return out
+
+def _sregs(attrs):
+    if attrs is None or '\x00regs' not in attrs or '\x00tterm' not in attrs: raise NFUnknown('无区域信息')
+    return attrs['\x00regs'], attrs['\x00tterm']
+def _args(b):
+    if b['args'] is None: raise NFUnknown('块参数类型不可解析')
+    return b['args']
+def _tt(tt, ri, bi):
+    t = tt[ri][bi]
+    if t is None: raise NFUnknown('终结子操作数类型未定')
+    return list(t)
+
+@functools.lru_cache(None)
+def _is_rbt(op):
+    """块末 op 是否实现 RegionBranchTerminatorOpInterface（含 ReturnLike）。ODS 没有的 op ⇒ 未定。"""
+    if op in ('scf.yield', 'scf.condition'): return True
+    lk = G_lookup(op)
+    if lk is None: raise NFUnknown(f'{op} 是否 RegionBranchTerminator 未知')
+    S = lk[1]
+    return any('RegionBranchTerminatorOpInterface' in d for d in S['declared'] + S.get('nf_covered', []))
+
+def _scf_for(S):
+    def f(LB, I, R, attrs):
+        regs, tt = _sregs(attrs)
+        if len(regs) != 1 or len(regs[0]) != 1: return False
+        b = regs[0][0]; a = _args(b)
+        if not a or len(LB) != 1 or a[0] != LB[0]: return False          # verifyRegions：归纳变量类型 = 边界类型（无块参数 ⇒ 断言崩溃）
+        if b['last'] != 'scf.yield': return False                         # getYieldedValues：cast<YieldOp>(terminator)
+        Y = _tt(tt, 0, 0)
+        return list(I) == list(R) == a[1:] == Y                            # verify/verifyRegions/LoopLike/RegionBranch 四条边：个数与类型逐个相等
+    return [_r(['lowerBound', 'initArgs', 'results'], 'scf.for：块参数 = (typeof(lowerBound), iter…)，inits、iter_args、yield、results 个数相同且类型逐个相等', f, attrs=True)]
+
+def _scf_if(S):
+    def f(R, attrs):
+        regs, tt = _sregs(attrs)
+        if len(regs) != 2: return False
+        th, el = regs
+        if not th or th[0]['last'] != 'scf.yield' or _tt(tt, 0, 0) != list(R): return False   # InferTypeOpInterface：then 的 yield 类型 = 结果类型
+        if R and not el: return False                                      # verify；RegionBranch 父→父边（else 为空）
+        for ri, reg in enumerate(regs):
+            for bi, b in enumerate(reg):
+                if b['last'] is not None and _is_rbt(b['last']) and _tt(tt, ri, bi) != list(R): return False   # 区域→父边
+        return True
+    return [_r(['results'], 'scf.if：then 以 scf.yield 结尾且其类型 = results；results 非空 ⇒ else 非空；各区域的 RegionBranch 终结子操作数类型 = results', f, attrs=True)]
+
+def _scf_while(S):
+    def f(I, R, attrs):
+        regs, tt = _sregs(attrs)
+        if len(regs) != 2 or len(regs[0]) != 1 or len(regs[1]) != 1: return False
+        bb, ab = regs[0][0], regs[1][0]
+        if bb['last'] != 'scf.condition' or ab['last'] != 'scf.yield': return False   # verify（LoopLike 的 getYieldOp 在其前，cast 失败也是拒绝）
+        C = _tt(tt, 0, 0)
+        if not C: return False
+        C = C[1:]; B, A, Y = _args(bb), _args(ab), _tt(tt, 1, 0)
+        return list(I) == B and C == list(R) and C == A and Y == B         # 父→before、condition→父、condition→after、yield→before
+    return [_r(['inits', 'results'], 'scf.while：inits = before 块参数；scf.condition 的值 = results = after 块参数；after 的 yield = before 块参数（个数与类型）', f, attrs=True)]
+
+def _scf_exec(S):
+    def f(R, attrs):
+        regs, tt = _sregs(attrs)
+        if len(regs) != 1 or not regs[0]: return False                      # verify：区域至少一个块
+        if _args(regs[0][0]): return False                                  # verify：入口块无参数
+        for bi, b in enumerate(regs[0]):
+            if b['last'] is not None and _is_rbt(b['last']) and _tt(tt, 0, bi) != list(R): return False
+        return True
+    return [_r([None], 'scf.execute_region：区域非空、入口块无参数；各块的 RegionBranch 终结子操作数类型 = results', f, attrs=True)]
+
+def _scf_switch(S):
+    def f(R, attrs):
+        regs, tt = _sregs(attrs)
+        cs = ints(attrs.get('cases'))
+        if cs is None: raise NFUnknown('cases')
+        if len(cs) != len(regs) - 1 or len(set(cs)) != len(cs): return False
+        for ri, reg in enumerate(regs):
+            if not reg or reg[0]['last'] != 'scf.yield' or _tt(tt, ri, 0) != list(R): return False   # front().back() 取空 ⇒ 崩溃
+        return True
+    return [_r(['results'], 'scf.index_switch：#cases = #case 区域，cases 无重复；每个区域以 scf.yield 结尾且其类型 = results', f, attrs=True)]
+
+_SCF_COV = {'C++ verify()', 'C++ verifyRegions()', '接口 verify: LoopLikeOpInterface::Trait', '接口 verify: RegionBranchOpInterface::Trait',
+            '接口 verify: InferTypeOpInterface::Trait', 'C++ inferReturnTypes'}
+for _op, _mk in [('scf.for', _scf_for), ('scf.if', _scf_if), ('scf.while', _scf_while), ('scf.execute_region', _scf_exec), ('scf.index_switch', _scf_switch)]:
+    CANDIDATES[_op] = (_SCF_COV, _mk); REG[_op] = CANDIDATES[_op]
