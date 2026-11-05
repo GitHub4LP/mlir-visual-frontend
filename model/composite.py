@@ -30,7 +30,7 @@ def infer_types(n, ins_t):
     return out
 
 def _retype_regions(m, tys):
-    """区域内 op 的操作数类型表按当前值类型更新（块参数与区域内结果保持图上写定的类型）。"""
+    """区域内 op 的操作数类型表按当前值类型更新（块参数与区域内结果保持图上写定的类型）。第 77 轮起只在区域类型流关闭时使用。"""
     env = dict(tys)
     def walk(n):
         for r in n.get('regions') or []:
@@ -42,12 +42,73 @@ def _retype_regions(m, tys):
                     walk(k)
     walk(m)
 
+class _Fail(Exception): pass
+
+def _inst_node(m, tys, top):
+    """第 77 轮（closure §9.17）：节点 m（已深拷贝）在值类型表 tys 下实例化，含区域。
+    区域 op 按 regionflow 的入口边定义块参数与结果类型；区域内的 op 与顶层一样按 ODS 推断前推结果（无规则 ⇒ 字面量）。
+    与 odscomp.derive 同一规则（Φ ≡ 逐点）。tys 原地更新为 m 的结果类型；兄弟区域的同名值各自作用域。"""
+    import typesig as TS, regionflow as RF
+    try: ins_t = [TS.parse(tys[v]) for v in m['ins']]
+    except Exception: raise _Fail()
+    if 'props' not in m: m['props'] = {}
+    if 'props' in m: m['props']['_types'] = [tys[v] for v in m['ins']]
+    fl = RF.flow(m) if m.get('regions') else None
+    terms = {}
+    for ri, r in enumerate(m.get('regions') or []):
+        pre = dict(fl[0].get(ri, [])) if fl else {}
+        env = dict(tys)                                   # 同区域的块共用（多块区域里后面的块可用前面块定义的值）
+        for bi, b in enumerate(r):
+            if bi == 0 and pre:
+                args = []
+                for k, (a, t) in enumerate(b['args']):
+                    if k in pre:
+                        x = _src_t(pre[k], ins_t, terms)
+                        if x is None: raise _Fail()
+                        t = TS.show(x)
+                    args.append((a, t))
+                b['args'] = args
+            for a, t in b['args']: env[a] = t
+        for bi, b in enumerate(r):
+            for k_ in b['ops']: _inst_node(k_, env, False)
+            if b['ops']:
+                try: terms[(ri, bi)] = [TS.parse(env[v]) for v in b['ops'][-1]['ins']]
+                except Exception: terms[(ri, bi)] = None
+    if fl and fl[1]:
+        outs = []
+        for k, (o, t) in enumerate(m['outs']):
+            src = dict(fl[1]).get(k)
+            if src is not None:
+                x = _src_t(src, ins_t, terms)
+                if x is None: raise _Fail()
+                t = TS.show(x)
+            outs.append((o, t))
+        m['outs'] = outs
+    elif m['op'] not in ('func.return', 'scf.yield', 'scf.condition'):
+        inf = infer_types(m, ins_t)
+        if inf == 'fail': raise _Fail()
+        if inf is not None:
+            if len(inf) != len(m['outs']): raise _Fail()
+            m['outs'] = [(o, TS.show(t)) for (o, _), t in zip(m['outs'], inf)]
+    for o, t in m['outs']: tys[o] = t
+
+def _src_t(src, ins_t, terms):
+    import regionflow as RF
+    if src[0] == 'elt': return RF.elt(_src_t(src[1], ins_t, terms))
+    if src[0] == 'opd': return ins_t[src[1]] if src[1] < len(ins_t) else None
+    t = terms.get((src[1], 0))
+    return t[src[2]] if t is not None and src[2] < len(t) else None
+
 def instantiate(sl, ports, T):
     """端口类型 T（字符串）→ 复合 op 体的 core 块（内部类型前推）。推断失败 ⇒ None。"""
-    import typesig as TS, structure as ST, copy
+    import typesig as TS, structure as ST, copy, regionflow as RF
     tys = dict(zip(ports, T)); nodes = []
     for n in sl:
         m = copy.deepcopy(n)
+        if RF.ENABLED:
+            try: _inst_node(m, tys, True)
+            except _Fail: return None
+            nodes.append(m); continue
         try: ins_t = [TS.parse(tys[v]) for v in m['ins']]
         except Exception: return None
         inf = infer_types(m, ins_t)
