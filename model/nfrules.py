@@ -552,16 +552,25 @@ def note_const(n, consts):
     m = _re.fullmatch(r'\s*(-?\d+)\s*:\s*(index|i\d+)\s*', v or '')
     if m: consts[n['outs'][0][0]] = int(m.group(1))
 
-def nf_attrs(n, at, consts=None):
+def parent_info(n):
+    """第 75 轮：子 op 的 verify 读父 op 时用到的父信息：(op 名, 区域数, 区域 0 非空)。"""
+    rs = n.get('regions') or []
+    return (n['op'], len(rs), bool(rs and rs[0]))
+
+def nf_attrs(n, at, consts=None, parent=False):
     """给 nf 规则用的属性表：在 from_core 的结果上加区域 0 入口块参数类型（只给 nf 规则看，不作为 MLIR 属性）。
-    consts（值名 → 整数常量）给出时，加 '\x00consts'：各操作数的常量值（非常量为 None）。"""
+    consts（值名 → 整数常量）给出时，加 '\x00consts'：各操作数的常量值（非常量为 None）。
+    parent（第 75 轮）：父信息 parent_info(父)，None = 父未定（复合 op 体的顶层）；不给（False）则不加。"""
     if at is None: return None
     if consts is not None:
         at = dict(at); at['\x00consts'] = tuple(consts.get(v) for v in n.get('ins', []))
+    if parent is not False:
+        at = dict(at); at['\x00parent'] = parent
     rs = n.get('regions') or []
     if not rs: return at
     at = dict(at)
     r0 = rs[0]
+    at['\x00nb0'] = len(r0)
     at['\x00bbargs'] = None if len(r0) != 1 else [t for _, t in r0[0].get('args', [])]
     at['\x00block'] = None if len(r0) != 1 else r0[0]          # 第 71 轮：区域体（ContractionOpInterface）
     return at
@@ -1144,3 +1153,86 @@ for _op, _mk in [('linalg.softmax', _softmax_rules), ('linalg.winograd_filter_tr
                  ('linalg.winograd_input_transform', _wi_rules), ('linalg.winograd_output_transform', _wo_rules)]:
     CANDIDATES[_op] = ({'C++ verify()'}, _mk); REG[_op] = CANDIDATES[_op]
 UNKNOWN_COVERS = {'linalg.softmax': {'PredOpTrait: input and output have same element type'}}
+
+# ───────────────────────── 第 75 轮：读父 op 的 verify（linalg.yield / linalg.index）与 LinalgOp 的体约束，closure §9.15
+# 依据：Linalg/IR/LinalgOps.cpp YieldOp::verify、verifyYield、IndexOp::verify；ControlFlowInterfaces.td RegionBranchTerminatorOpInterface 的 verify。
+# 子 op 一侧只看父的结构（区域数、区域非空、父是否实现 LinalgOp），这是常量；与父操作数类型有关的部分（yield 值个数与类型、index 的 dim 与循环数）
+# 写成父 op 上的原子“LinalgBody”，参数是父的操作数，体内 yield/index 的类型与属性取图上写定的值。两者合起来与 MLIR 的两个 verify 等价。
+# RegionBranchTerminatorOpInterface 的 verify 只有 static_assert 加 success()，运行期没有约束。
+IFACE['接口 verify: RegionBranchTerminatorOpInterface::Trait'] = lambda S: []
+
+@functools.lru_cache(None)
+def _is_linalg(op):
+    lk = G_lookup(op)
+    if lk is None: return False
+    S = lk[1]
+    return any('LinalgOp::Trait' in d for d in S['declared'] + S.get('nf_covered', []))
+def G_lookup(op):
+    import odssig as _G
+    return _G.lookup(op)
+
+def _parent_linalg(attrs):
+    if '\x00parent' not in attrs or attrs['\x00parent'] is None: raise NFUnknown('父 op 未定')
+    op, nreg, nonempty = attrs['\x00parent']
+    return nreg == 1 and nonempty and _is_linalg(op)
+
+def _yield_rules(S):
+    def f(V, attrs): return _parent_linalg(attrs)
+    return [_r(['values'], 'linalg.yield：父 op 恰一个区域且非空，且实现 LinalgOp（值的个数与类型由父 op 的 LinalgBody 原子检查）', f, attrs=True)]
+def _index_rules(S):
+    def f(R, attrs): return _parent_linalg(attrs)
+    return [_r(['result'], 'linalg.index：父 op 实现 LinalgOp（dim < 循环数由父 op 的 LinalgBody 原子检查）', f, attrs=True)]
+CANDIDATES['linalg.yield'] = ({'C++ verify()'}, _yield_rules); REG['linalg.yield'] = CANDIDATES['linalg.yield']
+CANDIDATES['linalg.index'] = ({'C++ verify()'}, _index_rules); REG['linalg.index'] = CANDIDATES['linalg.index']
+
+def _nloops(op, I, O, attrs):
+    """LinalgOp::getNumLoops = #getIteratorTypesArray()。"""
+    if op == 'linalg.generic': return len(_re.findall(r'iterator_type<', attrs.get('iterator_types') or ''))
+    if op in ('linalg.map', 'linalg.transpose', 'linalg.broadcast'):
+        if not O: raise _Crash()
+        return len(_shp(O[0]))
+    if op == 'linalg.reduce':
+        if not I: raise _Crash()
+        return len(_shp(I[0]))
+    p = _yaml_provider(op.split('.', 1)[1]) if op.split('.', 1)[1] in linalg_yaml() else None
+    if p is not None:
+        prov, rankpoly, nops = p
+        if rankpoly:
+            if not O: raise _Crash()
+            return _lrank(O[0])
+        return prov(list(I) + list(O), attrs)[1]
+    return len(_hand_maps(op, I, O, attrs)[1])
+
+def _body_rule(S):
+    op = S['op']; names = [n for n, *_ in S['ins']]; outs = [n for n, *_ in S['outs']]
+    def f(*a):
+        attrs = a[-1]; G_ = a[:len(names)]
+        I = [t for g in G_[:-1] for t in g]; O = list(G_[-1])
+        if '\x00nb0' not in attrs: raise NFUnknown('无区域信息')
+        if attrs['\x00nb0'] != 1: raise NFUnknown('区域块数 ≠ 1')
+        blk = attrs['\x00block']
+        local = {v: t for v, t in blk['args']}
+        for m in blk['ops']:
+            if m['op'] == 'linalg.yield':
+                if len(m['ins']) != len(O): return False
+                for v, init in zip(m['ins'], O):
+                    if v not in local: raise NFUnknown('yield 用了区域外的值')
+                    el = init[2] if (init[0] == 'memref' or (init[0] == 'tensor' and init[1] is not None)) else init
+                    if TS.parse(local[v]) != el: return False
+            elif m['op'] == 'linalg.index':
+                d = ints(((m.get('props') or {}).get('_attrs') or {}).get('dim'))
+                if not d: raise NFUnknown('index.dim')
+                try: nl = _nloops(op, I, O, attrs)
+                except (_Crash, IndexError): return False
+                if nl <= d[0]: return False
+            for o, t in m['outs']: local[o] = t
+        return True
+    return _r(names + outs, f'LinalgBody（{op}）：体内 linalg.yield 的值个数 = #inits，第 k 个值的类型 = inits[k] 的元素类型（memref/有秩 tensor）或其本身；体内 linalg.index 的 dim < 循环数', f, attrs=True)
+
+_apply0 = apply
+def apply(S, reg=None):
+    S = _apply0(S, reg)
+    if ENABLED and (reg is None or reg is REG) and any('LinalgOp::Trait' in d for d in S.get('nf_covered', [])) \
+            and S['ins'] and S['ins'][-1][0] in ('outputs', 'init', 'inits'):
+        S = dict(S); S['rel'] = S['rel'] + [_body_rule(S)]
+    return S
