@@ -125,7 +125,7 @@ def derive(sl, ports, inner=None):
             if x[2] not in ('ods', 'cpred', 'nf'): continue
             try: _at = A_.from_core(n)
             except Exception: _at = None
-            import nfrules as _NF; _at = _NF.nf_attrs(n, _at, _consts, parent)
+            import nfrules as _NF; _at = _NF.nf_attrs(n, _at, _consts, parent, vex=ex.get)   # 第 76 轮：终结子操作数的表达式（捕获值为端口表达式）
             P.atoms.append(('rel', x, (idx, n['op'], mini, partial, _at), groups, [e for g in gi for e in g], [] if partial else [e for g in go for e in g]))
     def _regions(n, idx):
         # 第 75 轮：区域内的 op 也进入 Φ_comp。块参数与区域内结果取图上写定的类型（常量）；区域内用到的外部值（捕获）就是端口或外层值。
@@ -146,7 +146,7 @@ def derive(sl, ports, inner=None):
             sub = lambda e: ins_e[e[1]] if e[0] == 'p' else e if e[0] == 'k' else (e[0], e[1], e[2], sub(e[3]))
             for a in Q.atoms:
                 if a[0] == 'pred': P.atoms.append(('pred', a[1], a[2], sub(a[3]), a[4]))
-                elif a[0] == 'rel': P.atoms.append(('rel', a[1], a[2], [[sub(e) for e in g] for g in a[3]], [sub(e) for e in a[4]], [sub(e) for e in a[5]]))
+                elif a[0] == 'rel': P.atoms.append(('rel', a[1], _sub_at(a[2], sub), [[sub(e) for e in g] for g in a[3]], [sub(e) for e in a[4]], [sub(e) for e in a[5]]))
                 else: P.atoms.append(('attr', a[1], [sub(e) for e in a[2]], [sub(e) for e in a[3]]))
             P.residual += [f'{n["op"]}⟨{r}⟩' for r in Q.residual]
             P.ground += [f'{n["op"]}⟨{r}⟩' for r in Q.ground]   # 内层的定值残差在外层仍是定值；内层非定值残差保守地留作残差
@@ -169,6 +169,22 @@ class _Unknown:
     def __repr__(self): return 'UNK'
 UNK = _Unknown()
 
+def _tterm_e(a):
+    """第 76 轮：nf 规则读到的终结子操作数表达式（scf 区域规则）。"""
+    at = a[2][4] if a[0] == 'rel' else None
+    if not at or '\x00tterm_e' not in at: return []
+    return [e for r in at['\x00tterm_e'] for vs in r for e in vs if e is not None]
+def _sub_at(info, sub):
+    at = info[4]
+    if not at or '\x00tterm_e' not in at: return info
+    at = dict(at); at['\x00tterm_e'] = [[[None if e is None else sub(e) for e in vs] for vs in r] for r in at['\x00tterm_e']]
+    return info[:4] + (at,) + info[5:]
+def _at_eval(at, T):
+    if not at or '\x00tterm_e' not in at: return at
+    at = dict(at)
+    at['\x00tterm'] = [[(lambda ts: None if any(t is None for t in ts) else ts)([None if e is None else ev(e, T) for e in vs]) for vs in r] for r in at['\x00tterm_e']]
+    return at
+
 def holds(a, T):
     """单个原子在端口类型 T 下：True / False / UNK（nf 规则在该点未建模）。表达式求值失败（变换无定义）⇒ 不成立（与 instantiate 返回 None 一致）。"""
     import attrsig as A
@@ -179,7 +195,7 @@ def holds(a, T):
         gt = [[ev(e, T) for e in g] for g in groups]
         if any(ev(e, T) is None for e in _aexprs(a)): return False      # 只要求被引用的表达式有值（投影时类外端口为 None）
         S1 = dict(mini, rel=[x]); ni = len(mini['ins'])
-        try: return not G.check(S1, gt[:ni], None if partial else gt[ni:], attrs=at, strict=True)
+        try: return not G.check(S1, gt[:ni], None if partial else gt[ni:], attrs=_at_eval(at, T), strict=True)
         except Exception as e:
             if type(e).__name__ == 'NFUnknown': return UNK
             raise
@@ -214,7 +230,7 @@ def _relgroups(a):
     return out
 def _aexprs(a):
     if a[0] == 'pred': return [a[3]]
-    if a[0] == 'rel': return [e for g in _relgroups(a) for e in g]
+    if a[0] == 'rel': return [e for g in _relgroups(a) for e in g] + _tterm_e(a)
     return a[2] + a[3]
 def simplify(P):
     """返回新 Phi：常量原子求值（假 ⇒ ⊥）；同一表达式上的同名约束去重；全同表达式上的自反关系删去；属性原子不涉及端口的求值。"""
@@ -222,7 +238,7 @@ def simplify(P):
     seen = set()
     for a in P.atoms:
         es = _aexprs(a)
-        allx = es if a[0] != 'rel' else [e for g in a[3] for e in g] + a[4] + a[5]
+        allx = es if a[0] != 'rel' else [e for g in a[3] for e in g] + a[4] + a[5] + _tterm_e(a)
         if not any(ports_of(e) for e in allx):               # 不依赖端口 ⇒ 常量（须连未引用的组一起不依赖端口，holds 才能在空 T 上求值）
             h = holds(a, [])
             if h is False: Q.bottom = Q.bottom or f'常量原子为假：{_label(a)}'

@@ -495,3 +495,25 @@ R_j(t) ≝ ∃ 其余端口. Φ_comp，即用户需求里“签名允许的最�
 - 首轮（修复前）R1 化简不一致 32 + 305、R2 残差为空误收 4 + 3，见上；判据未改。
 
 **下一步**：按残差前列规范化 scf.for/forall/parallel/if/while 的区域约束（块参数、iter_args、yield 与结果类型的关系），并让区域内类型随端口推导（最大性扩展到区域）；linalg.fill；tensor.pad/empty。
+
+### 9.16 scf 区域 op 的规范化：for / if / while / execute_region / index_switch（第 76 轮）
+**改动**：
+- nfrules 新增 5 条 op 规则，覆盖这些 op 的全部 declared 条目（C++ verify、verifyRegions、LoopLikeOpInterface、RegionBranchOpInterface、InferTypeOpInterface、C++ inferReturnTypes）。依据 9bae84b0：SCF.cpp 各 op 的 verify/verifyRegions/getSuccessorRegions/getEntrySuccessorOperands、IfOp::inferReturnTypes、ConditionOp::getMutableSuccessorOperands；LoopLikeInterface.cpp verifyLoopLikeOpInterface；ControlFlowInterfaces.cpp verifyTypesAlongControlFlowEdges（areTypesCompatible 缺省为相等；RegionSuccessor(Region*) 输入为空，ControlFlowInterfaces.h）；verifyInferredResultTypes。
+  - scf.for：块参数 = (typeof(lowerBound), iter…)；inits、iter_args、yield 操作数、results 个数相同、类型逐个相等（四条控制流边 + verify/verifyRegions/LoopLike 合起来）；体末不是 scf.yield ⇒ 拒绝（cast 断言）。
+  - scf.if：then 以 scf.yield 结尾且类型 = results（InferType）；results 非空 ⇒ else 非空；各区域 RegionBranch 终结子操作数 = results。
+  - scf.while：before 末为 scf.condition、after 末为 scf.yield；inits = before 块参数；condition 的值 = results = after 块参数；after 的 yield = before 块参数。
+  - scf.execute_region：区域非空、入口块无参数；各块 RegionBranch 终结子（scf.yield/condition 或 ODS 声明该接口的 op；ODS 未知 ⇒ NFUnknown）操作数 = results。
+  - scf.index_switch：#cases = #case 区域、无重复；各区域末为 scf.yield 且类型 = results。
+- 区域信息：nf_attrs 增加 `\x00regs`（各区域各块的入口参数类型、末 op 名）与终结子操作数类型。终结子操作数先在本块、再在同区域其他块解析（兄弟区域复用值名，不能用平铺值表），否则为捕获值：core.typecheck 取值表类型；odscomp.derive 取端口表达式 `\x00tterm_e`，holds 在端口类型下求值。odscomp 的 _aexprs、simplify 的常量判定、嵌套代换都纳入这些表达式。
+- 区域内块参数与区域内结果仍取写定类型；最大性仍只对顶层成立（未变）。
+- 结构层 R8（structure.py，人工写的 scf.for/if 边类型检查）与新规则重叠，暂留，不作为依据。
+
+**检验**（新 `model/scf_test.py`，判据运行前写定；corpus 246 文件中 234 个顶层 scf 实例，变异端口/结果/块参数类型、结果/块参数/终结子个数、cases）：
+- N2g-a PASS：比较 4266，MLIR 接受 267，误拒 0，规则未定 0。
+- N2g-b PASS：scf 诊断 1812，漏判 0；规则拒绝 2608（其中 MLIR 报别的诊断或崩溃 796），MLIR 崩溃 12。**首跑 FAIL（漏判 15）**：测试按 op 名匹配诊断，把落在区域内同名嵌套 op 上的诊断算给了外层 op；改为按诊断位置（节点 id）匹配，这是按写定判据（“在该 scf op 上”）修正实现，判据未改。嵌套 op 上的 scf 诊断 21 例本测试未另行检验。
+- N2g-d PASS：无残差实例上完整模型（无预言机）≡ MLIR，比较 3426（MLIR 拒绝 3214），误拒 0，误收 0。接受样本只有 212，偏少。
+- 回归（最终代码）：regcomp R1/R2 PASS（实例 5565 + 13310；R2 误拒 0，残差为空误收 0，残差非空误收 310 + 718，按 Unknown 计；点未定 44 + 444/512）；odscomp S1–S4 PASS（12375 + 15585；S3 误拒 0、残差为空误收 0）；projcomp P1/P2/P4/P5 PASS；core_test T1/T2 PASS。
+- R3：复合 op 残差为空 602/1113（原 117）、1500/2662（原 1402）。残差前列：linalg.fill、tensor.pad、scf.forall、scf.parallel、tensor.empty、vector.mask、memref.subview。
+
+**下一步**：scf.forall / scf.parallel / scf.reduce（含 Graph 区域 in_parallel）；区域内类型随端口推导；linalg.fill；tensor.pad/empty。
+
