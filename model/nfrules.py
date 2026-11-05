@@ -131,7 +131,7 @@ def _tcast(S):        # tensor.CastOp::areCastCompatible：同元素类型 ∧ v
 def broadcastable(s, d):
     """vector::isBroadcastableTo(s, d)。"""
     if d[0] != 'vector': return False
-    if not TS.shaped(s) and s[0] in ('i', 'f', 'index') and s == d[2]: return True
+    if not TS.shaped(s): return s == d[2]                 # 第 78 轮：标量源只要求等于元素类型（!llvm.ptr 等也可，C5 发现的误拒）
     if s[0] != 'vector': return False
     sr, dr = len(s[1]), len(d[1])
     if sr > dr: return False
@@ -1259,8 +1259,17 @@ def _body_rule(S):
     return _r(names + outs, f'LinalgBody（{op}）：体内 linalg.yield 的值个数 = #inits，第 k 个值的类型 = inits[k] 的元素类型（memref/有秩 tensor）或其本身；体内 linalg.index 的 dim < 循环数', f, attrs=True)
 
 _apply0 = apply
+CPPVERIFY = True          # 第 78 轮：C++ verify 解释执行（cppverify.py），对全部仍含 'C++ verify()' 残差的 op 一次生效
 def apply(S, reg=None):
     S = _apply0(S, reg)
+    if ENABLED and CPPVERIFY and (reg is None or reg is REG) and 'C++ verify()' in S['declared']:
+        import cppverify as _CV
+        got = _CV.rule(S)
+        if got is not None:
+            r, complete = got
+            S = dict(S); S['rel'] = S['rel'] + [r]
+            if complete:
+                S['nf_covered'] = S.get('nf_covered', []) + ['C++ verify()']; S['declared'] = [d for d in S['declared'] if d != 'C++ verify()']
     if ENABLED and (reg is None or reg is REG) and any('LinalgOp::Trait' in d for d in S.get('nf_covered', [])) \
             and S['ins'] and S['ins'][-1][0] in ('outputs', 'init', 'inits'):
         S = dict(S); S['rel'] = S['rel'] + [_body_rule(S)]
