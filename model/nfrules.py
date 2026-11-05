@@ -699,3 +699,264 @@ def _contr_iface(S):
 
 IFACE['接口 verify: ConvolutionOpInterface::Trait'] = _conv_iface
 IFACE['接口 verify: ContractionOpInterface::Trait'] = _contr_iface
+
+
+# ───────────────────────── 第 72 轮：手写 getIndexingMaps 的 linalg.map / reduce / transpose / broadcast（C++ verify + LinalgOp::Trait 一并规范化），closure §9.12
+# 依据：Linalg/IR/LinalgOps.cpp MapOp/ReduceOp/TransposeOp/BroadcastOp 的 verify、getIndexingMaps、getIteratorTypesArray；Utils/IndexingUtils.cpp isPermutationVector。
+# 端口约束 TensorOrMemref（含无秩）：getRank/getShape 在无秩上断言 ⇒ 拒绝。MLIR 先跑接口 verify 再跑 op verify，两者是合取；任一处断言都按拒绝。
+def _ident(n, drop=()):
+    import affine as AF
+    return (n, 0, [AF._lin({('d', i): 1}) for i in range(n) if i not in set(drop)])
+def _shp(t):
+    if t[0] not in ('tensor', 'memref') or t[1] is None: raise _Crash()
+    return tuple(t[1])
+def _elt(t): return t[2]
+def _hand(S, cxx, maps_of):
+    """cxx(ops 分组, attrs, bbargs) → bool；maps_of(ops 分组, attrs) → (maps, 循环数)。两者合取，再加 structured_ok。"""
+    groups = [nm for nm, *_ in S['ins']]; outs = [n for n, *_ in S['outs']]
+    def f(*args):
+        attrs = args[-1]; G_ = args[:len(groups)]
+        ops = [t for g in G_ for t in g]
+        bb = _bbargs(attrs)
+        try:
+            if not cxx(G_, attrs, bb): return False
+            maps, nl = maps_of(G_, attrs)
+            return structured_ok(ops, maps, nl, bb)
+        except (_Crash, IndexError): return False
+    return f, groups + outs
+
+def _map_rules(S):
+    def cxx(G_, attrs, bb):
+        I, Init = G_
+        if len(Init) != 1 or bb is None: return False
+        if len(I) + 1 != len(bb): return False
+        if any(b != _elt(t) for b, t in zip(bb, I)): return False
+        return all(_shp(t) == _shp(Init[0]) for t in I)
+    def maps_of(G_, attrs):
+        I, Init = G_; r = len(_shp(Init[0]))
+        return [_ident(r)] * (len(I) + 1), r
+    f, refs = _hand(S, cxx, maps_of)
+    return [_r(refs, 'LinalgHand（linalg.map）：#块参数 = #inputs+1，块参数 = inputs 元素类型；各 input 形状 = init 形状；映射取恒等（秩 = rank(init)），再做 LinalgOp 结构化检查', f, attrs=True)]
+
+def _reduce_rules(S):
+    def dims(attrs):
+        d = ints(attrs.get('dimensions'))
+        if d is None: raise _Crash()
+        return d
+    def cxx(G_, attrs, bb):
+        I, Ini = G_
+        if not I or not Ini: return False
+        s0, o0 = _shp(I[0]), _shp(Ini[0])
+        if any(_shp(t) != s0 for t in I[1:]) or any(_shp(t) != o0 for t in Ini[1:]): return False
+        d = dims(attrs)
+        if any(x < 0 or x >= len(s0) for x in d): return False
+        red = tuple(v for i, v in enumerate(s0) if i not in set(d))
+        if len(red) != len(o0) or red != o0: return False
+        if bb is None or len(bb) != len(I) + len(Ini): return False
+        if any(b != _elt(t) for b, t in zip(bb, I)): return False
+        return all(b == _elt(t) for b, t in zip(bb[len(bb) - len(Ini):], Ini))
+    def maps_of(G_, attrs):
+        I, Ini = G_; n = len(_shp(I[0]))
+        return [_ident(n)] * len(I) + [_ident(n, dims(attrs))] * len(Ini), n
+    f, refs = _hand(S, cxx, maps_of)
+    return [_r(refs, 'LinalgHand（linalg.reduce）：inputs 形状相同、inits 形状相同；dimensions ⊂ [0, rank)；去掉归约维后 = init 形状；#块参数 = #操作数，块参数 = 各操作数元素类型；映射 inputs 恒等、inits 去归约维', f, attrs=True)]
+
+def _perm_ok(p): return all(0 <= v < len(p) for v in p) and len(set(p)) == len(p)
+def _transpose_rules(S):
+    def cxx(G_, attrs, bb):
+        (A,), (B,) = G_
+        p = ints(attrs.get('permutation'))
+        if p is None or not _perm_ok(p): return False
+        a, b = _shp(A), _shp(B)
+        if len(a) != len(b) or len(p) != len(a): return False
+        return all(a[p[i]] == b[i] for i in range(len(a)))
+    def maps_of(G_, attrs):
+        import affine as AF
+        (A,), (B,) = G_
+        p = ints(attrs.get('permutation')); n = len(p); r = len(_shp(B))
+        inv = [None] * n
+        for k, v in enumerate(p): inv[v] = k
+        return [(n, 0, [AF._lin({('d', inv[j]): 1}) for j in range(n)]), _ident(r)], r
+    def f0(*a):
+        if any(len(g) != 1 for g in a[:2]): return False
+        return f(*a)
+    f, refs = _hand(S, cxx, maps_of)
+    return [_r(refs, 'LinalgHand（linalg.transpose）：permutation 是排列；rank(input) = rank(init) = #permutation；dim(init,i) = dim(input,perm[i])；映射 [perm 的逆, 恒等]', f0, attrs=True)]
+
+def _broadcast_rules(S):
+    def cxx(G_, attrs, bb):
+        (A,), (B,) = G_
+        d = ints(attrs.get('dimensions'))
+        if d is None: return False
+        a, b = _shp(A), _shp(B)
+        if len(a) + len(d) != len(b): return False
+        if any(x < 0 or x >= len(b) for x in d): return False
+        dm = [i for i in range(len(b)) if i not in d]
+        return all(a[k] == b[i] for k, i in enumerate(dm))       # 输入维下标越界（dimensions 有重复）：IndexError ⇒ 拒绝
+    def maps_of(G_, attrs):
+        (A,), (B,) = G_; r = len(_shp(B))
+        return [_ident(r, ints(attrs.get('dimensions'))), _ident(r)], r
+    def f0(*a):
+        if any(len(g) != 1 for g in a[:2]): return False
+        return f(*a)
+    f, refs = _hand(S, cxx, maps_of)
+    return [_r(refs, 'LinalgHand（linalg.broadcast）：rank(input) + #dimensions = rank(init)；dimensions ⊂ [0, rank(init))；其余维一一相等；映射 [恒等去 dimensions, 恒等]', f0, attrs=True)]
+
+_HAND_COVERS = {'C++ verify()', '接口 verify: LinalgOp::Trait'}
+for _op, _mk in (('linalg.map', _map_rules), ('linalg.reduce', _reduce_rules), ('linalg.transpose', _transpose_rules), ('linalg.broadcast', _broadcast_rules)):
+    CANDIDATES[_op] = (_HAND_COVERS, _mk); REG[_op] = CANDIDATES[_op]
+
+# ───────────────────────── 第 72 轮（续）：matmul / batch_matmul / batch_reduce_matmul / contract / elementwise（映射取自属性或 C++ 默认值）
+# 依据：LinalgOps.cpp MatmulOp/BatchMatmulOp/BatchReduceMatmulOp/ContractOp/ElementwiseOp 的 getDefaultIndexingMaps、getIteratorTypesArray、
+#       verify（verifyExtendedMatmulSemantic、verifyInputMaps、verifyOutputMap、isValidLhsRhsBroadcastMap、ContractOp::verify）；
+#       LinalgStructuredOps.td（indexing_maps：matmul 族缺省为默认映射，contract 必需，elementwise 缺省为空数组）。
+_DEF_MAPS = {'linalg.matmul': ['(d0, d1, d2) -> (d0, d2)', '(d0, d1, d2) -> (d2, d1)', '(d0, d1, d2) -> (d0, d1)'],
+             'linalg.batch_matmul': ['(d0, d1, d2, d3) -> (d0, d1, d3)', '(d0, d1, d2, d3) -> (d0, d3, d2)', '(d0, d1, d2, d3) -> (d0, d1, d2)'],
+             'linalg.batch_reduce_matmul': ['(d0, d1, d2, d3) -> (d0, d1, d3)', '(d0, d1, d2, d3) -> (d0, d3, d2)', '(d0, d1, d2, d3) -> (d1, d2)']}
+_ITERS = {'linalg.matmul': ['parallel', 'parallel', 'reduction'], 'linalg.batch_matmul': ['parallel'] * 3 + ['reduction'],
+          'linalg.batch_reduce_matmul': ['reduction', 'parallel', 'parallel', 'reduction']}
+HAND5 = ('linalg.matmul', 'linalg.batch_matmul', 'linalg.batch_reduce_matmul', 'linalg.contract', 'linalg.elementwise')
+
+def _fdims(e):
+    """AffineExpr::isFunctionOfDim 所看的维集合。"""
+    if e[0] == 'lin': return {k[1] for k, v in e[1].items() if k[0] == 'd' and v}
+    return _fdims(e[2]) | _fdims(e[3])
+
+def _srank(t):
+    """ShapedType 的秩（vector 计其秩）；无秩断言 ⇒ 崩溃；非 shaped ⇒ cast 断言 ⇒ 崩溃。"""
+    if t[0] in ('tensor', 'memref', 'vector'):
+        if t[1] is None: raise _Crash()
+        return len(t[1])
+    raise _Crash()
+
+def _hand_maps(op, I, O, attrs):
+    """(映射表, 迭代器表)。"""
+    import affine as AF
+    txt = attrs.get('indexing_maps')
+    try:
+        if txt is None:
+            if op in _DEF_MAPS: maps = [AF.parse_map(m) for m in _DEF_MAPS[op]]
+            elif op == 'linalg.elementwise': maps = []
+            else: raise _Crash()                                   # contract 缺必需属性（ODS 层拒绝）
+        else: maps = [AF.parse_map(x) for x in _split_maps(txt)]
+    except AF.AffineError as e: raise NFUnknown(str(e))
+    if op in _ITERS: return maps, _ITERS[op]
+    if op == 'linalg.elementwise':
+        if not O: raise _Crash()
+        return maps, ['parallel'] * _srank(O[0])
+    # contract：输出映射（最后一个）出现的维为 parallel，其余 reduction；输出映射不是投影置换 ⇒ 断言
+    if not maps: raise _Crash()
+    nd, ns, es = maps[-1]
+    ds = [AF.is_dim(e) for e in es]
+    if None in ds: raise _Crash()
+    return maps, ['parallel' if i in ds else 'reduction' for i in range(nd)]
+
+def _hand_linalg(S):
+    op = S['op']; outs = [n for n, *_ in S['outs']]
+    def f(I, O, *R_at):
+        attrs = R_at[-1]; ops = list(I) + list(O)
+        if any(t[0] == 'opaque' for t in ops): raise NFUnknown('方言类型')
+        try:
+            maps, its = _hand_maps(op, I, O, attrs)
+            return structured_ok(ops, maps, len(its), _bbargs(attrs))
+        except _Crash: return False
+    return [_r(['inputs', 'outputs'] + outs, f'LinalgOp（{op}，映射取自 indexing_maps 或 C++ 默认映射）：同 linalg.generic 的结构化检查', f, attrs=True)]
+
+def _hand_contr(S):
+    op = S['op']; outs = [n for n, *_ in S['outs']]
+    def f(I, O, *R_at):
+        attrs = R_at[-1]
+        if len(I) != 2 or len(O) != 1: return False
+        try: maps, its = _hand_maps(op, I, O, attrs)
+        except _Crash: return False
+        if not any(t == 'reduction' for t in its): return False
+        if not all(_proj_perm(m) for m in maps): return False
+        b = _blk(attrs)
+        return b is not None and contraction_body(b)
+    return [_r(['inputs', 'outputs'] + outs, f'ContractionOpInterface（{op}）：同 yaml 命名 op，映射/迭代器取自 indexing_maps 与 C++', f, attrs=True)]
+
+def _matmul_cxx(op):
+    import affine as AF
+    def f(I, O, *R_at):
+        attrs = R_at[-1]
+        try: maps, _ = _hand_maps(op, I, O, attrs)
+        except _Crash: return False
+        dflt = [AF.parse_map(m) for m in _DEF_MAPS[op]]
+        if maps == dflt: return True                               # hasUserDefinedMaps 为假
+        def subset(m, d):
+            dd = {AF.is_dim(e) for e in d[2]}
+            return all(AF.is_dim(e) is not None and AF.is_dim(e) in dd for e in m[2])
+        if op == 'linalg.matmul':
+            for k in (0, 1):
+                if k >= len(maps): return False                    # 越界访问：未定义行为，按拒绝
+                m = maps[k]
+                if not subset(m, dflt[k]): return False
+                if len(m[2]) < len(dflt[k][2]):
+                    if len(m[2]) != 1: return False                # 断言 numResults == 1
+                    if (m[0] - 1) not in _fdims(m[2][0]): return False
+            return True
+        if len(maps) != 3: return False
+        for k in (0, 1, 2):
+            m = maps[k]; es = m[2]
+            if k == 2:
+                want = 3 if op == 'linalg.batch_matmul' else 2
+                if len(es) != want: return False
+                tgt = (0, 1, 2) if op == 'linalg.batch_matmul' else (1, 2)
+                if not all(t in _fdims(e) for t, e in zip(tgt, es)): return False
+                continue
+            if not subset(m, dflt[k]): return False
+            if len(es) > 3: return False
+            if len(es) < len(dflt[k][2]):
+                if len(es) == 1: ok = 3 in _fdims(es[0])
+                elif len(es) == 2:
+                    a, b = _fdims(es[0]), _fdims(es[1])
+                    ok = ((0 in a or 1 in a) and 3 in b) if k == 0 else ((0 in a and 3 in b) or (3 in a and 2 in b))
+                else: ok = False
+                if not ok: return False
+            elif 0 not in _fdims(es[0]): return False
+        return True
+    return f
+
+def _contract_cxx(I, O, *R_at):
+    import affine as AF
+    attrs = R_at[-1]
+    txt = attrs.get('indexing_maps')
+    if txt is None: return False
+    try: maps = [AF.parse_map(x) for x in _split_maps(txt)]
+    except AF.AffineError as e: raise NFUnknown(str(e))
+    ops = list(I) + list(O)
+    nd = -1; inn = out = None
+    for m, t, isin in zip(maps, ops, (True, True, False)):
+        if not _proj_perm(m): return False
+        if t[0] in ('tensor', 'memref', 'vector'):
+            if t[1] is None: return False                          # 无秩 getRank 断言
+            if len(m[2]) != len(t[1]): return False
+        elif m[2]: return False
+        if nd == -1: nd = m[0]; inn = [0] * nd; out = [0] * nd
+        elif nd != m[0]: return False
+        for e in m[2]:
+            if isin: inn[AF.is_dim(e)] += 1
+            else: out[AF.is_dim(e)] += 1
+    has = False
+    for i in range(max(nd, 0)):
+        has |= inn[i] == 2 and out[i] == 0
+        if inn[i] == 0 and out[i] == 0: return False
+        if inn[i] == 1 and out[i] != 1: return False
+    return has
+
+def _hand_cxx_rules(S):
+    op = S['op']; outs = [n for n, *_ in S['outs']]
+    if op == 'linalg.contract':
+        return [_r(['inputs', 'outputs'] + outs, 'LinalgCxx C++ verify（linalg.contract）：前三个映射为投影置换，结果数 = 对应操作数的 shaped 秩（非 shaped 为 0），维数一致；每个迭代维至少被访问一次；只出现在一个输入中的维须出现在输出中；至少一个收缩维（两输入都有、输出没有）', _contract_cxx, attrs=True)]
+    return [_r(['inputs', 'outputs'] + outs, f'LinalgCxx C++ verify（{op}）：indexing_maps 不同于默认映射时，输入映射结果须取自默认映射结果；广播映射须保留 k 维（batch 变体另有 batch/m/n 组合）；batch 变体输出映射结果数固定且依次含 batch/m/n', _matmul_cxx(op), attrs=True)]
+
+for _op in ('linalg.matmul', 'linalg.batch_matmul', 'linalg.batch_reduce_matmul', 'linalg.contract'):
+    CANDIDATES[_op] = ({'C++ verify()'}, _hand_cxx_rules); REG[_op] = CANDIDATES[_op]
+
+_linalg_iface0, _contr_iface0 = _linalg_iface, _contr_iface
+def _linalg_iface(S):
+    return _hand_linalg(S) if S['op'] in HAND5 else _linalg_iface0(S)
+def _contr_iface(S):
+    return _hand_contr(S) if S['op'] in HAND5 else _contr_iface0(S)
+IFACE['接口 verify: LinalgOp::Trait'] = _linalg_iface
+IFACE['接口 verify: ContractionOpInterface::Trait'] = _contr_iface
