@@ -360,6 +360,8 @@ def apply(S, reg=None):
         S['rel'] += mk(S)
         S['nf_covered'] = S['nf_covered'] + [d for d in S['declared'] if d in covers]
         S['declared'] = [d for d in S['declared'] if d not in covers]
+        uc = UNKNOWN_COVERS.get(S['op'], set())       # 第 74 轮：nf 原子同时实现了 ODS 无法解析的 PredOpTrait
+        S['nf_covered'] += [u for u in S['unknown'] if u in uc]; S['unknown'] = [u for u in S['unknown'] if u not in uc]
     if reg is REG:
         for d in [d for d in S['declared'] if d in IFACE]:
             rs = IFACE[d](S)
@@ -1053,3 +1055,92 @@ def _unpack_rules(S):
 
 CANDIDATES['linalg.pack'] = ({'C++ verify()'}, _pack_rules); REG['linalg.pack'] = CANDIDATES['linalg.pack']
 CANDIDATES['linalg.unpack'] = ({'C++ verify()'}, _unpack_rules); REG['linalg.unpack'] = CANDIDATES['linalg.unpack']
+
+# ───────────────────────── 第 74 轮：linalg.softmax 与 winograd_{filter,input,output}_transform 的 C++ verify，closure §9.14
+# 依据：Linalg/IR/LinalgOps.cpp SoftmaxOp::verify、Winograd*TransformOp::verify、getFmrFromWinogradConv2DFmr；LinalgOps.td 各 get*Dim()；LinalgEnums.td WinogradConv2DFmr。
+# softmax 端口 AnyShaped（含 vector、无秩）：getShape/getRank 在无秩上断言 ⇒ 拒绝。PredOpTrait TCopVTEtIsSameAs<0,1>（elt(input)=elt(output)）一并写成 nf 原子。
+# winograd 端口为 4/6 秩 tensor（ODS 已保证）。verifyCompatibleShape：逐维相等或任一动态。C++ 的整数除法向零截断。
+_FMR = {'F_2_3': (2, 3), 'F_4_3': (4, 3), 'F_2_5': (2, 5)}
+def _fmr(attrs):
+    v = attrs.get('fmr')
+    if v is None: raise NFUnknown('fmr 缺失')
+    m = _re.search(r'F_\d_\d', str(v))
+    if m and m.group(0) in _FMR: return _FMR[m.group(0)]
+    d = _re.fullmatch(r'\s*(\d+)\s*(:\s*i32)?\s*', str(v))
+    if d and int(d.group(1)) in (0, 1, 2): return list(_FMR.values())[int(d.group(1))]
+    raise NFUnknown(f'fmr={v}')
+def _shpv(t):
+    if t[0] not in ('tensor', 'memref', 'vector') or t[1] is None: raise _Crash()
+    return tuple(t[1])
+def _cmp_shape(a, b): return len(a) == len(b) and all(x is None or y is None or x == y for x, y in zip(a, b))
+def _tdiv(a, b): q = abs(a) // abs(b); return q if (a >= 0) == (b > 0) else -q
+
+def _softmax_rules(S):
+    def f(I, O, R, attrs):
+        if len(I) != 1 or len(O) != 1: return False
+        try:
+            if not _cmp_shape(_shpv(I[0]), _shpv(O[0])): return False
+            dim = ints(attrs.get('dimension'))
+            if not dim: raise NFUnknown('dimension')
+            return 0 <= dim[0] < len(_shpv(I[0]))
+        except _Crash: return False
+    def e(I, O): return len(I) == len(O) == 1 and TS.shaped(I[0]) and TS.shaped(O[0]) and I[0][2] == O[0][2]
+    return [_r(['input', 'output'], 'elt(input) = elt(output)（TCopVTEtIsSameAs<0,1>）', e),
+            _r(['input', 'output', 'result'], 'linalg.softmax：input/output 有秩且逐维相容；0 ≤ dimension < rank(input)', f, attrs=True)]
+
+def _wf_rules(S):
+    def f(*a):
+        try: return g(*a)
+        except _Crash: return False
+    def g(F, O, R, attrs):
+        if len(F) != 1 or len(O) != 1: return False
+        m, r = _fmr(attrs); fs = _shpv(F[0])        # F,H,W,C = 0,1,2,3
+        h, w = fs[1], fs[2]
+        if h not in (r, 1) or w not in (r, 1) or (h == 1 and w == 1): return False   # 动态（kDynamic）≠ r 且 ≠ 1 ⇒ 拒绝
+        exp = (m + r - 1 if h == r else 1, m + r - 1 if w == r else 1, fs[3], fs[0])
+        return _cmp_shape(exp, _shpv(O[0]))
+    return [_r(['filter', 'output', 'result'], 'winograd：filter_transform：filter H,W ∈ {r,1} 且不同时为 1（动态拒绝）；output 相容于 (H=r?α:1, W=r?α:1, C, F)，α=m+r-1', f, attrs=True)]
+
+def _wi_rules(S):
+    def f(*a):
+        try: return g(*a)
+        except _Crash: return False
+    def g(I, O, R, attrs):
+        if len(I) != 1 or len(O) != 1: return False
+        m, r = _fmr(attrs); a = m + r - 1
+        ins, outs = _shpv(I[0]), _shpv(O[0])        # in N,H,W,C；out αH,αW,tH,tW,N,C
+        h, w = ins[1], ins[2]
+        left, right = outs[0] != 1, outs[1] != 1    # 动态 ≠ 1 ⇒ 真
+        exp = [None] * 6
+        if h is None: exp[0], exp[2] = a, None
+        else: exp[0], exp[2] = (a if left else 1), (_tdiv(h - (r - 1), m) if left else h)
+        if w is None: exp[1], exp[3] = a, None
+        else: exp[1], exp[3] = (a if right else 1), (_tdiv(w - (r - 1), m) if right else w)
+        exp[4], exp[5] = ins[0], ins[3]
+        return _cmp_shape(exp, outs)
+    return [_r(['input', 'output', 'result'], 'winograd：input_transform：output 相容于 (αH,αW,tH,tW,N,C)；αH = H 动态 ? α : (out[0]≠1 ? α : 1)，tH = (H-(r-1))/m（向零截断）或 H；W 同理', f, attrs=True)]
+
+def _wo_rules(S):
+    def f(*a):
+        try: return g(*a)
+        except _Crash: return False
+    def g(V, O, R, attrs):
+        if len(V) != 1 or len(O) != 1: return False
+        m, r = _fmr(attrs); a = m + r - 1
+        vs = _shpv(V[0])                            # αH,αW,tH,tW,N,F
+        vh, vw, th, tw = vs[0], vs[1], vs[2], vs[3]
+        left, right = vh != 1, vw != 1
+        exp = [vs[4], None, None, vs[5]]            # out N,H,W,F
+        if vh is not None and th is not None:
+            if vh != (a if left else 1): return False
+            exp[1] = (m if left else 1) * th
+        if vw is not None and tw is not None:
+            if vw != (a if right else 1): return False
+            exp[2] = (m if right else 1) * tw
+        return _cmp_shape(exp, _shpv(O[0]))
+    return [_r(['value', 'output', 'result'], 'winograd：output_transform：αH,tH 皆静态时 αH = (αH≠1 ? α : 1)，H = (αH≠1 ? m : 1)·tH，否则 H 动态；W 同理；output 相容于 (N,H,W,F)', f, attrs=True)]
+
+for _op, _mk in [('linalg.softmax', _softmax_rules), ('linalg.winograd_filter_transform', _wf_rules),
+                 ('linalg.winograd_input_transform', _wi_rules), ('linalg.winograd_output_transform', _wo_rules)]:
+    CANDIDATES[_op] = ({'C++ verify()'}, _mk); REG[_op] = CANDIDATES[_op]
+UNKNOWN_COVERS = {'linalg.softmax': {'PredOpTrait: input and output have same element type'}}

@@ -456,3 +456,19 @@ R_j(t) ≝ ∃ 其余端口. Φ_comp，即用户需求里“签名允许的最�
 - 局限：常量只认 arith.constant 的整数/index 值（同名值在后续定义处清除）；MLIR 的 m_ConstantInt 认任何 ConstantLike op（如 index.constant），这类定义未建模，遇到时规则会把它当非常量，可能与 MLIR 不一致，属已知缺口。
 - **回归**（本轮改了 core.typecheck 与 odscomp 的属性传递，所以必须复跑）：首跑 odscomp S2 推导异常 65+1008、projcomp P1 异常 786+56，原因是常量表以 list 放进属性表，后者在 Φ_comp 中被哈希。改为 tuple 后复跑：odscomp S1–S4 两段全 PASS（S2 不一致 0/12375、0/15585，推导异常 0；S3 误拒 0，残差为空误收 0）；projcomp P1/P2/P4/P5 两段全 PASS（P1 不一致 0，异常 0）；N1 23 op 全 PASS（40500+16704 次比较，误拒 0、误收 0）；N2e 复跑 PASS；clauses K1–K6、M2.7 PASS。nfiface 全量在 tuple 修正与“同名值清除常量”修正之前跑完；两项修正后复跑了含 pack/unpack 最多的两个文件（Tensor/fold-into-pack-and-unpack、Linalg/data-layout-propagation），N2a/N2b/N2d 全 PASS。未复跑：core T1/T2、L1、odssig_test。
 - 至此 linalg 方言余 7 个 op 留有 declared：fill、index、softmax、3 个 winograd、yield。
+
+### 9.14 linalg.softmax 与 winograd 三个变换（第 74 轮）
+依据 MLIR 9bae84b0 `Linalg/IR/LinalgOps.cpp` 的 `SoftmaxOp::verify`、`Winograd{Filter,Input,Output}TransformOp::verify`、`getFmrFromWinogradConv2DFmr`，以及 `LinalgOps.td` 的各 `get*Dim()`。实现见 `model/nfrules.py` 第 74 轮一节。
+
+- **softmax**（端口 AnyShaped，含 vector 与无秩）：input、output 均有秩且逐维相容；0 ≤ dimension < rank(input)。无秩时 `getShape` 断言，按拒绝计。ODS 无法解析的 `PredOpTrait<TCopVTEtIsSameAs<0,1>>`（elt(input) = elt(output)）也写成 nf 原子，从未知项中移出（`UNKNOWN_COVERS`）。
+- fmr：F_2_3 → (m,r)=(2,3)，F_4_3 → (4,3)，F_2_5 → (2,5)；α = m+r−1。通用形式中属性为 `fmr = N : i32`。
+- **filter_transform**（filter 维序 F,H,W,C）：H,W ∈ {r,1} 且不同时为 1。动态维（kDynamic）既不等于 r 也不等于 1，因此拒绝。output 相容于 (H=r ? α : 1, W=r ? α : 1, C, F)。
+- **input_transform**（input N,H,W,C；output αH,αW,tH,tW,N,C）：H 动态时 αH = α、tH 动态；否则 αH = (out[0] ≠ 1 ? α : 1)，tH = (H−(r−1))/m（C++ 向零截断）或 H。W 同理。注意：变换方向由 **output** 的 αH 是否为 1 决定，而 output 的 αH 为动态时视为“≠ 1”。
+- **output_transform**（value αH,αW,tH,tW,N,F；output N,H,W,F）：αH 与 tH 都静态时须 αH = (αH ≠ 1 ? α : 1)，H = (αH ≠ 1 ? m : 1)·tH；任一动态则 H 动态，此时 αH 不受检查。W 同理。
+- 对前端：这些规则只依赖端口形状与属性，不需要值前提。输出形状是输入形状与 fmr 的确定函数（动态维除外），复合 op 可直接推出。
+
+检验（判据运行前写定）：
+- `nfiface_test` 定向（含 Linalg/roundtrip、invalid、tile-softmax、transform-op-decompose、winograd 等文件；新增 dimension 与 fmr 属性变异）：N2a 比较 8692，误拒 0；N2b 接口诊断 5007，漏判 0；N2d 7258，误拒 0、误收 0。修正 fmr 变异（首版按名字替换，对通用形式无效）后，对 5 个文件复跑：N2a 2899、N2b 1604、N2d 2793，全部 0。
+- 新增合成网格 `model/winograd_test.py`（N2f，完整模型无预言机 ≡ MLIR）：比较 3000（softmax 690、filter 753、input 799、output 758），MLIR 接受 531、拒绝 2469，误拒 0、误收 0、崩溃 0。filter 的接受只有 35，覆盖偏薄。
+- **N1 不适用于 linalg**：N1 网格只变异端口类型，不生成区域与必需属性，14 个 linalg 候选上 MLIR 接受均为 0，map 的 65 例“误收”实为“requires one region”的结构性拒绝。`nf_test` 默认集合改为排除 linalg；linalg 以 N2a/N2b/N2d/N2e/N2f 检验。
+- linalg 方言仍有 declared 的 op：fill（FillOpInterface）、index、yield。
