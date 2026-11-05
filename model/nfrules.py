@@ -542,9 +542,20 @@ def _bbargs(attrs):
     v = attrs['\x00bbargs']
     return None if v is None else [TS.parse(t) for t in v]
 
-def nf_attrs(n, at):
-    """给 nf 规则用的属性表：在 from_core 的结果上加区域 0 入口块参数类型（只给 nf 规则看，不作为 MLIR 属性）。"""
+def note_const(n, consts):
+    """第 72 轮：记下整数/index 常量（arith.constant），供依赖 getConstantIntValue 的规则（linalg.pack/unpack 的 tile）使用。"""
+    if n['op'] != 'arith.constant' or len(n['outs']) != 1: return
+    v = ((n.get('props') or {}).get('_attrs') or {}).get('value')
+    if v is None and 'value' in (n.get('props') or {}) and isinstance(n['props']['value'], int): consts[n['outs'][0][0]] = n['props']['value']; return
+    m = _re.fullmatch(r'\s*(-?\d+)\s*:\s*(index|i\d+)\s*', v or '')
+    if m: consts[n['outs'][0][0]] = int(m.group(1))
+
+def nf_attrs(n, at, consts=None):
+    """给 nf 规则用的属性表：在 from_core 的结果上加区域 0 入口块参数类型（只给 nf 规则看，不作为 MLIR 属性）。
+    consts（值名 → 整数常量）给出时，加 '\x00consts'：各操作数的常量值（非常量为 None）。"""
     if at is None: return None
+    if consts is not None:
+        at = dict(at); at['\x00consts'] = tuple(consts.get(v) for v in n.get('ins', []))
     rs = n.get('regions') or []
     if not rs: return at
     at = dict(at)
@@ -960,3 +971,85 @@ def _contr_iface(S):
     return _hand_contr(S) if S['op'] in HAND5 else _contr_iface0(S)
 IFACE['接口 verify: LinalgOp::Trait'] = _linalg_iface
 IFACE['接口 verify: ContractionOpInterface::Trait'] = _contr_iface
+
+# ───────────────────────── 第 73 轮：linalg.pack / linalg.unpack（C++ verify），closure §9.13
+# 依据：LinalgOps.cpp commonVerifierPackAndUnPackOp、isInvalidPackingPosSpecification、getMixedTilesImpl、getStaticTilesImpl、
+#       getPackOpResultTypeShape、PackOp::verify、PackOp::requirePaddingValue；StaticValueUtils dispatchIndexOpFoldResults（Value ⇒ 动态）。
+# 值前提：isZeroInteger / getConstantIntValue 会看 tile 操作数是否为常量（arith.constant）。规则从 '\x00consts' 读：本块内的常量给出其值，
+# 其余（块参数、复合 op 的端口、非常量 op 的结果）为非常量——与 MLIR 校验复合 op 体时所见一致。没有常量信息时判未定。
+def _ceil_s(a, b): return -((-a) // b)
+def _bad_pos(ds, r): return len(ds) > r or len(set(ds)) != len(ds) or any(d < 0 or d >= r for d in ds)
+def _pack_common(unp, pk, attrs, tile_vals):
+    """unp/pk：未打包/打包端的类型；tile_vals：inner_tiles 各操作数的常量值或 None。返回 (通过?, mixed, inner, outer)。"""
+    st = ints(attrs.get('static_inner_tiles')); inner = ints(attrs.get('inner_dims_pos'))
+    outer = ints(attrs.get('outer_dims_perm')) or []
+    if st is None or inner is None: return False, None, None, None
+    mixed = []; j = 0
+    for s in st:
+        if s != DYN: mixed.append(('c', s))
+        else:
+            if j >= len(tile_vals): raise _Crash()                # getInnerTiles()[j] 越界
+            mixed.append(('v', tile_vals[j])); j += 1
+    if any(v == 0 for _, v in mixed): return False, None, None, None
+    if unp[0] != 'tensor' or unp[1] is None or pk[0] != 'tensor' or pk[1] is None: raise _Crash()
+    us, ps = list(unp[1]), list(pk[1]); r = len(us)
+    if _bad_pos(inner, r) or _bad_pos(outer, r): return False, None, None, None
+    if outer and len(outer) != r: return False, None, None, None
+    if len(mixed) > r or len(mixed) != len(inner): return False, None, None, None
+    if len(ps) != r + len(mixed): return False, None, None, None
+    stat = [v if k == 'c' else None for k, v in mixed]               # getStaticTiles：Value ⇒ 动态（即使是常量）
+    res = list(us)
+    for i, pos in enumerate(inner):
+        if res[pos] is None: continue
+        res[pos] = None if stat[i] is None else _ceil_s(res[pos], stat[i])
+    if outer: res = [res[p] for p in outer]
+    res += stat
+    for d, (k, v) in zip(ps[len(ps) - len(mixed):], mixed):
+        if k == 'c' and d != v: return False, None, None, None
+        if k == 'v' and d is not None: return False, None, None, None
+    if not all(a is None or b is None or a == b for a, b in zip(res, ps)): return False, None, None, None
+    return True, mixed, inner, outer
+
+def _tile_vals(attrs, nflat, ntiles):
+    cs = attrs.get('\x00consts')
+    if cs is None:
+        if ntiles: raise NFUnknown('无常量信息（tile 操作数）')
+        return []
+    return cs[nflat - ntiles:] if ntiles else []
+
+def _pack_rules(S):
+    def f(Src, Dst, Pad, Tiles, Res, attrs):
+        if len(Src) != 1 or len(Dst) != 1: return False
+        nflat = 2 + len(Pad) + len(Tiles)
+        tv = _tile_vals(attrs, nflat, len(Tiles))
+        try:
+            ok, mixed, inner, outer = _pack_common(Src[0], Dst[0], attrs, tv)
+            if not ok: return False
+            if Pad: return Pad[0] == Src[0][2]
+            ins_, outs_ = list(Src[0][1]), list(Dst[0][1])
+            ots = outs_[:len(ins_)]
+            if outer:
+                inv = [0] * len(outer)
+                for i, p in enumerate(outer): inv[p] = i
+                ots = [ots[q] for q in inv]
+            for pos, (k, v) in zip(inner, mixed):
+                if ins_[pos] is None: continue
+                if v is None:
+                    if ots[pos] is not None and ins_[pos] % ots[pos] != 0: return False
+                elif ins_[pos] % v != 0: return False
+            return True
+        except (_Crash, IndexError, ZeroDivisionError): return False
+    return [_r(['source', 'dest', 'padding_value', 'inner_tiles', 'result'],
+               'linalg.pack：tile 非零；inner_dims_pos/outer_dims_perm 无重复、在 [0,rank) 内、outer 为空或长度 = rank；#tile = #inner_dims_pos ≤ rank；rank(dest) = rank(source)+#tile；dest 尾部 = 静态 tile（动态 tile 对应 ?）；dest 与推出的打包形状相容；padding 类型 = 源元素类型；无 padding 时须整块（值前提：tile 常量）', f, attrs=True)]
+
+def _unpack_rules(S):
+    def f(Src, Dst, Tiles, Res, attrs):
+        if len(Src) != 1 or len(Dst) != 1: return False
+        tv = _tile_vals(attrs, 2 + len(Tiles), len(Tiles))
+        try: return _pack_common(Dst[0], Src[0], attrs, tv)[0]
+        except (_Crash, IndexError, ZeroDivisionError): return False
+    return [_r(['source', 'dest', 'inner_tiles', 'result'],
+               'linalg.unpack：同 pack 的公共检查（未打包端 = dest，打包端 = source）', f, attrs=True)]
+
+CANDIDATES['linalg.pack'] = ({'C++ verify()'}, _pack_rules); REG['linalg.pack'] = CANDIDATES['linalg.pack']
+CANDIDATES['linalg.unpack'] = ({'C++ verify()'}, _unpack_rules); REG['linalg.unpack'] = CANDIDATES['linalg.unpack']

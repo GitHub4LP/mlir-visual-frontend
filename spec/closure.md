@@ -436,7 +436,7 @@ R_j(t) ≝ ∃ 其余端口. Φ_comp，即用户需求里“签名允许的最�
 - **map / reduce / transpose / broadcast**：C++ verify 与 LinalgOp::Trait 合成一条规则（`LinalgHand`）。映射由类型与属性构造：map 取恒等；reduce 的 inputs 取恒等，inits 去掉 dimensions；transpose 取 [perm 的逆, 恒等]；broadcast 取 [恒等去掉 dimensions, 恒等]。C++ 部分包括：块参数个数与类型、形状逐维相等、dimensions 的范围、isPermutationVector。MLIR 先跑接口 verify，再跑 op verify，两者为合取，断言（无秩、越界、dimensions 重复）按拒绝计。
 - **matmul / batch_matmul / batch_reduce_matmul / contract / elementwise**：映射取自 indexing_maps。缺省时，matmul 族用 C++ 默认映射，elementwise 为空数组，contract 为必需属性。迭代器：matmul 族固定；contract 由输出映射推出（出现在输出的维为 parallel）；elementwise 取 rank(init0) 个 parallel，按 ShapedType 计秩，vector 计其秩。LinalgOp 与 ContractionOpInterface 复用 §9.10/§9.11 的结构化检查与区域体检查。
 - **C++ verify（`LinalgCxx`）**：matmul 族只在映射不同于默认映射时检查：输入映射结果须取自默认映射结果；广播映射须保留 k 维，batch 变体另有 batch/m/n 组合；batch 变体的输出映射结果数固定，且依次为 batch/m/n 的函数。contract：前三个映射为投影置换；结果数等于 shaped 秩（vector 计秩，非 shaped 为 0）；维数一致；每个维至少被访问一次；只出现在一个输入中的维也须出现在输出中；至少一个收缩维。isFunctionOfDim 按表达式中出现的维判定。
-- 至此 LinalgOp::Trait 覆盖 91/91（generic、81 个 yaml op、9 个手写 op），ContractionOpInterface 覆盖 11/11（7 个 yaml op 加 4 个手写 op）。linalg 方言仍有 9 个 op 留有 declared：fill（FillOpInterface）、index、pack、unpack、softmax、3 个 winograd、yield。
+- 至此 LinalgOp::Trait 覆盖 91/91（generic、81 个 yaml op、9 个手写 op），ContractionOpInterface 覆盖 11/11（7 个 yaml op 加 4 个手写 op）。linalg 方言仍有 9 个 op 留有 declared：fill（FillOpInterface）、index、pack、unpack、softmax、3 个 winograd、yield（第 73 轮后余 7 个，见 §9.13）。
 - **检验**（nfiface_test 全量，分两段：[0,260) 与 [260,∞)。判据与第 69–71 轮相同，运行前写定。新增变异：dimensions/permutation 取反序、去尾、加 0、首项改 5、全取首项；首个块参数改类型；逐个映射取反序、去首、去尾、换成首映射）：
   - N2a：比较 5862+28729，MLIR 接受 968+5319，误拒 0，文件崩溃 0。
   - N2b：接口诊断 2977+16636，漏判 0。MLIR 崩溃 154+1541 例，按拒绝计。
@@ -444,3 +444,15 @@ R_j(t) ≝ ∃ 其余端口. Φ_comp，即用户需求里“签名允许的最�
   - 分项：LinalgHand 比较 1763，规则拒绝 1232；LinalgCxx 比较 8759，规则拒绝 1409；ContractionOpInterface 比较 9281。
   - 首跑 N2b 有 346 例漏判，原因在检验：LinalgCxx 只覆盖 C++ verify，却按 LinalgOp 的诊断计数。诊断分组改正后复跑通过。规则本身没有改动。
 - 局限：只验证了语料与上述变异中出现过的映射形状；elementwise 的 kind 与输入个数（arity）的关系由区域体与解析器保证，本规则未单列；诊断匹配仍依赖正则。
+
+### 9.13 linalg.pack / linalg.unpack 与值前提（第 73 轮）
+依据 MLIR 9bae84b0 `LinalgOps.cpp`：commonVerifierPackAndUnPackOp、isInvalidPackingPosSpecification、getMixedTiles/getStaticTiles、getPackOpResultTypeShape、PackOp::verify、requirePaddingValue。实现在 `model/nfrules.py` 第 73 轮一节。
+- **公共规则**（未打包端 U：pack 为 source，unpack 为 dest；打包端 P 为另一端）：tile 不得为 0；inner_dims_pos 与 outer_dims_perm 无重复、元素在 [0, rank U) 内、长度 ≤ rank U；outer_dims_perm 为空或长度等于 rank U；#tile ≤ rank U 且 #tile = #inner_dims_pos；rank P = rank U + #tile；P 的尾部 #tile 维：静态 tile 处等于 tile，动态 tile 处为 ?；P 与推出形状逐维相容。推出形状：U 的被分块维取 ⌈d/t⌉，d 或 t 动态则为 ?，再按 outer_dims_perm 置换，后接静态 tile。static_inner_tiles 中动态项多于 inner_tiles 操作数时 MLIR 越界，按拒绝计；少于时多出的操作数被忽略，MLIR 接受。
+- **pack 另有**：padding_value 的类型等于 source 的元素类型；无 padding_value 时须整块：对每个被分块的静态维 d，tile 为常量 c 时须 c | d；tile 不是常量时，若 P 中对应的外层维 o 静态，须 o | d（o = 0 时 MLIR 除零，按拒绝计）。
+- **值前提（新）**：零 tile 检查与整块检查经 isZeroInteger / getConstantIntValue，会看动态 tile 操作数是否由常量定义；推出形状则不看（Value 一律视为动态）。所以这两条规则不只依赖类型与属性，还依赖“操作数是否为常量及其值”。模型把它作为显式前提：`nfrules.note_const` 记录块内 arith.constant 的整数值，`nf_attrs(…, consts)` 以 `'\x00consts'` 传给规则；块参数与复合 op 的端口视为非常量，这与 MLIR 校验复合 op 体时所见一致。没有常量信息、又有动态 tile 时，规则判未定（NFUnknown），不猜。对前端的含义：tile 若由图内常量给出，签名关系按常量值判定；若从端口传入，定义时不检查整块与非零，实例化后常量传播进来可能使 MLIR 重新校验时拒绝，这一点属于实例层，需由前端在实例化后再判一次（与 P.ground 的定值残差同一机制）。
+- **检验**（判据运行前写定）：
+  - nfiface_test 全量（[0,260) 与 [260,∞)），新增变异：inner_dims_pos/outer_dims_perm/static_inner_tiles 的数组变异、常量 tile 值取 0/1/3/5（常量 op 随 pack 一起实例化）。N2a：比较 7528+32046，MLIR 接受 1281+5866，误拒 0，文件崩溃 0。N2b：接口诊断 4399+19555，漏判 0，MLIR 崩溃 157+1547 例按拒绝计。N2d：比较 6721+29379，MLIR 拒绝 5579+23826，误拒 0，误收 0。分项：pack 比较 1481+3371，unpack 比较 1362+2346。语料中带常量 tile 的实例很少，常量变异只有 8+16 例。
+  - 因此另加合成网格 `packconst_test.py`（N2e，完整模型无预言机 ≡ MLIR）：比较 1600，含常量 tile 902，MLIR 接受 358、拒绝 1242，误拒 0，误收 0。消融（不传常量信息）在 400 例中出现 1 例误收，说明值前提必要；该网格对它的区分力弱，因为常量零 tile 多数已被形状检查先行拒绝。
+- 局限：常量只认 arith.constant 的整数/index 值（同名值在后续定义处清除）；MLIR 的 m_ConstantInt 认任何 ConstantLike op（如 index.constant），这类定义未建模，遇到时规则会把它当非常量，可能与 MLIR 不一致，属已知缺口。
+- **回归**（本轮改了 core.typecheck 与 odscomp 的属性传递，所以必须复跑）：首跑 odscomp S2 推导异常 65+1008、projcomp P1 异常 786+56，原因是常量表以 list 放进属性表，后者在 Φ_comp 中被哈希。改为 tuple 后复跑：odscomp S1–S4 两段全 PASS（S2 不一致 0/12375、0/15585，推导异常 0；S3 误拒 0，残差为空误收 0）；projcomp P1/P2/P4/P5 两段全 PASS（P1 不一致 0，异常 0）；N1 23 op 全 PASS（40500+16704 次比较，误拒 0、误收 0）；N2e 复跑 PASS；clauses K1–K6、M2.7 PASS。nfiface 全量在 tuple 修正与“同名值清除常量”修正之前跑完；两项修正后复跑了含 pack/unpack 最多的两个文件（Tensor/fold-into-pack-and-unpack、Linalg/data-layout-propagation），N2a/N2b/N2d 全 PASS。未复跑：core T1/T2、L1、odssig_test。
+- 至此 linalg 方言余 7 个 op 留有 declared：fill、index、softmax、3 个 winograd、yield。
