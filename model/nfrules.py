@@ -557,19 +557,26 @@ def parent_info(n):
     rs = n.get('regions') or []
     return (n['op'], len(rs), bool(rs and rs[0]))
 
-def nf_attrs(n, at, consts=None, parent=False, vty=None, vex=None):
-    """给 nf 规则用的属性表：在 from_core 的结果上加区域 0 入口块参数类型（只给 nf 规则看，不作为 MLIR 属性）。
+def nf_attrs(n, at, consts=None, parent=False, vty=None, inst=None):
+    """给 nf 规则用的属性表：在 from_core 的结果上加区域信息（只给 nf 规则看，不作为 MLIR 属性）。
     consts（值名 → 整数常量）给出时，加 '\x00consts'：各操作数的常量值（非常量为 None）。
-    parent（第 75 轮）：父信息 parent_info(父)，None = 父未定（复合 op 体的顶层）；不给（False）则不加。"""
+    parent（第 75 轮）：父信息 parent_info(父)，None = 父未定（复合 op 体的顶层）；不给（False）则不加。
+    vty（第 76 轮，core.typecheck）：外层值的类型，给出时加 '\x00regs' 与 '\x00tterm'。
+    inst（第 77 轮，odscomp.derive）：区域各块的类型表达式快照；区域信息在 odscomp.holds 里按端口类型具体化后再算（region_keys）。"""
     if at is None: return None
     if consts is not None:
         at = dict(at); at['\x00consts'] = tuple(consts.get(v) for v in n.get('ins', []))
     if parent is not False:
         at = dict(at); at['\x00parent'] = parent
-    rs = n.get('regions') or []
-    if not rs: return at
+    if not (n.get('regions') or []): return at
     at = dict(at)
-    if vty is not None or vex is not None:                    # 第 76 轮：各区域各块的入口参数类型、末 op、末 op 操作数（scf 区域规则）
+    if inst is not None: at['\x00inst'] = inst; return at
+    return region_keys(n, at, vty)
+
+def region_keys(n, at, vty=None):
+    rs = n.get('regions') or []
+    at = dict(at)
+    if vty is not None:                    # 第 76 轮：各区域各块的入口参数类型、末 op、末 op 操作数（scf 区域规则）
         at['\x00regs'] = _regs_info(rs)
         # 终结子操作数：先在本块（块参数、本块 op 的结果）、再在同区域其他块里找（兄弟区域会复用值名，不能用平铺的值表）；都不是 ⇒ 捕获，取外层
         def _loc(r, b):
@@ -582,19 +589,15 @@ def nf_attrs(n, at, consts=None, parent=False, vty=None, vex=None):
         def _p(t):
             try: return TS.parse(t)
             except Exception: return None
-        tt, te = [], []
+        tt = []
         for r in rs:
-            rt, re_ = [], []
+            rt = []
             for b in r:
                 vs = list(b['ops'][-1]['ins']) if b['ops'] else []; d = _loc(r, b)
-                if vty is not None:
-                    ts = [_p(d[v]) if v in d else (_p(vty(v)) if vty(v) is not None else None) for v in vs]
-                    rt.append(None if any(t is None for t in ts) else ts)
-                else:
-                    re_.append([(lambda t: None if t is None else ('k', t))(_p(d[v])) if v in d else vex(v) for v in vs])
-            tt.append(rt); te.append(re_)
-        if vty is not None: at['\x00tterm'] = tt
-        else: at['\x00tterm_e'] = te                         # odscomp.holds 在端口类型下求值为 '\x00tterm'
+                ts = [_p(d[v]) if v in d else (_p(vty(v)) if vty(v) is not None else None) for v in vs]
+                rt.append(None if any(t is None for t in ts) else ts)
+            tt.append(rt)
+        at['\x00tterm'] = tt
     r0 = rs[0]
     at['\x00nb0'] = len(r0)
     at['\x00bbargs'] = None if len(r0) != 1 else [t for _, t in r0[0].get('args', [])]

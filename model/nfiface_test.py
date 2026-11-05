@@ -43,6 +43,25 @@ def _variants(t):
         out.append(f"{k}<{'x'.join(ds[:-1])}{'x' if len(ds) > 1 else ''}{e}>")
     return out
 
+def _nested_resid_changed(n0, n1):
+    """第 77 轮：n1（实例化后）区域内有 declared/unknown 未清空的 op，且其操作数或结果类型与原图 n0 不同。"""
+    import odssig as G
+    def ops(n):
+        for r in n.get('regions') or []:
+            for b in r:
+                for m in b['ops']:
+                    yield m; yield from ops(m)
+    def args(n):
+        return [b_['args'] for r in n.get('regions') or [] for b_ in r] + [x for m in ops(n) for x in args_(m)]
+    def args_(m): return [b_['args'] for r in m.get('regions') or [] for b_ in r]
+    argch = args(n0) != args(n1)
+    for a, b in zip(ops(n0), ops(n1)):
+        lk = G.lookup(b['op'])
+        if b['op'] in ('scf.yield', 'linalg.yield', 'func.return') or (lk is not None and not lk[1]['declared'] and not lk[1]['unknown']): continue
+        ta, tb = (a.get('props') or {}).get('_types'), (b.get('props') or {}).get('_types')
+        if a['outs'] != b['outs'] or argch or (ta is not None and ta != tb): return True
+    return False
+
 def run_file(path, q, seed):
     import mlir.ir as ir, irimport as I, oracle as OR, odscomp as D, odssig as G, typesig as TS, structure as ST
     from composite import instantiate
@@ -146,6 +165,7 @@ def run_file(path, q, seed):
                     bs = instantiate(pre + [n], ports, T)
                     if bs is None: st['不可实例化'] += 1; continue
                     node = bs[0]['ops'][len(pre)]
+                    full_i = full and not _nested_resid_changed(n, node)   # 第 77 轮：区域类型流下体内 op 的类型随端口变；其 C++ verify 未清空 ⇒ 该实例残差非空
                     if rmut is not None and rmut[0] == 'const':
                         c_ = bs[0]['ops'][rmut[1]]; c_['props'] = dict(c_['props']); c_['props']['_attrs'] = dict(c_['props']['_attrs'])
                         c_['props']['_attrs']['value'] = f"{rmut[2]} : {c_['outs'][0][1]}"
@@ -177,7 +197,7 @@ def run_file(path, q, seed):
                         mini = dict(S, ins=[(q, T_, mm, b) for q, _, mm, b in S['ins']], outs=[(q, T_, mm, b) for q, _, mm, b in S['outs']], infer=None, rel=[x])
                         try: rr[nm] = bool(G.check(mini, gi, go, attrs=at, strict=True))
                         except NF.NFUnknown as e: rr[nm] = None; note('规则未定', f"{nm} {n['op']} {str(e)[:80]}")
-                    if full:
+                    if full_i:
                         try:
                             import core as C
                             old = C.ORACLE_ON; C.ORACLE_ON = False
@@ -199,7 +219,7 @@ def run_file(path, q, seed):
                         if ok and r_rej: st['N2a 误拒'] += 1; note('误拒', f"{nm} {n['op']} {kind} {T} {rmut}")
                         if dg and not r_rej: st['N2b 漏判'] += 1; note('漏判', f"{nm} {n['op']} {kind} {T} {rmut} {msg[:90]}")
                         if not ok and not dg and r_rej: st['规则拒绝/MLIR 别的诊断'] += 1
-                    if full and full_rej is not None:
+                    if full_i and full_rej is not None:
                         st['N2d 比较'] += 1; st['N2d MLIR 拒绝'] += not ok
                         if ok and full_rej: st['N2d 误拒'] += 1; note('N2d 误拒', f"{n['op']} {kind} {T} {rmut}")
                         if not ok and not full_rej: st['N2d 误收'] += 1; note('N2d 误收', f"{n['op']} {kind} {T} {rmut} {msg[:90]}")
