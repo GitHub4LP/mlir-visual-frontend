@@ -29,6 +29,19 @@ def infer_types(n, ins_t):
         out.append(w)
     return out
 
+def _retype_regions(m, tys):
+    """区域内 op 的操作数类型表按当前值类型更新（块参数与区域内结果保持图上写定的类型）。"""
+    env = dict(tys)
+    def walk(n):
+        for r in n.get('regions') or []:
+            for b in r:
+                for a, t in b['args']: env[a] = t
+                for k in b['ops']:
+                    if 'props' in k and '_types' in k['props'] and all(v in env for v in k['ins']): k['props']['_types'] = [env[v] for v in k['ins']]
+                    for o, t in k['outs']: env[o] = t
+                    walk(k)
+    walk(m)
+
 def instantiate(sl, ports, T):
     """端口类型 T（字符串）→ 复合 op 体的 core 块（内部类型前推）。推断失败 ⇒ None。"""
     import typesig as TS, structure as ST, copy
@@ -43,6 +56,7 @@ def instantiate(sl, ports, T):
             if len(inf) != len(m['outs']): return None
             m['outs'] = [(o, TS.show(t)) for (o, _), t in zip(m['outs'], inf)]
         m['props']['_types'] = [tys[v] for v in m['ins']]
+        _retype_regions(m, tys)                    # 第 75 轮：区域内用到端口（捕获）的 op，其操作数类型随端口改变
         for o, t in m['outs']: tys[o] = t
         nodes.append(m)
     return [ST.blk('entry', nodes + [ST.node('ret', 'func.return', ins=[])], args=list(zip(ports, T)))]
