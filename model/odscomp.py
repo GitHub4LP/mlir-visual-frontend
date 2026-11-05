@@ -92,25 +92,72 @@ def captures(n):
     return [v for v in out if v not in defined]
 
 def derive(sl, ports, inner=None):
-    """sl：节点表（irimport 形式）；ports：端口值名（按序）。inner：{op 名: (Phi, 端口数)}，复合 op 作节点（嵌套）。"""
+    """sl：节点表（irimport 形式）；ports：端口值名（按序）。inner：{op 名: (Phi, 端口数)}，复合 op 作节点（嵌套）。
+    第 77 轮（closure §9.17）：区域 op 的块参数与结果按 regionflow 的入口边由端口表达式定义；区域内 op 与顶层一样按 ODS 推断前推结果；
+    nf 规则读到的区域信息（块参数、块内结果、终结子操作数）记作表达式快照 '\x00inst'，在 holds 里按端口类型具体化。与 composite.instantiate 同一规则。"""
+    import regionflow as RF
     P = Phi(len(ports)); ex = {v: ('p', i) for i, v in enumerate(ports)}
     import nfrules as _NF0; _consts = {}
+    def _kt(t):
+        try: return ('k', TS.parse(t))
+        except Exception: return None
+    def _src(src, ins_e, terms):
+        if src[0] == 'elt':
+            x = _src(src[1], ins_e, terms)
+            return None if x is None else ('xf', 'rf_elt', RF.elt, x)
+        if src[0] == 'opd': return ins_e[src[1]] if src[1] < len(ins_e) else None
+        t = terms.get((src[1], 0))
+        return t[src[2]] if t is not None and src[2] < len(t) and t[src[2]] is not None else None
+    def _walk_regions(n, ins_e, idx):
+        """走 n 的区域：块参数（入口边定义或写定）、区域内 op（递归 _node）；返回 (终结子表达式, 快照)。"""
+        fl = RF.flow(n) if (RF.ENABLED and n.get('regions')) else None
+        pinfo = _NF0.parent_info(n); terms = {}; snap = []
+        for ri, r in enumerate(n.get('regions') or []):
+            pre = dict(fl[0].get(ri, [])) if fl else {}
+            rs_ = []
+            for bi, b in enumerate(r):
+                aes = []
+                for k, (a, t) in enumerate(b['args']):
+                    e = _src(pre[k], ins_e, terms) if (bi == 0 and k in pre) else _kt(t)
+                    if e is None: e = _kt(t); P.bottom = P.bottom or f'{n["op"]}: 区域类型流缺源'
+                    ex[a] = e; aes.append(e); _consts.pop(a, None)
+                rs_.append(aes)
+            for bi, b in enumerate(r):
+                for m in b['ops']:
+                    for o, _ in m['outs']: _consts.pop(o, None)
+                    _NF0.note_const(m, _consts)
+                    _node(m, idx, [ex[v] for v in m['ins']], pinfo, True)
+                outs_e = {o: ex.get(o) for m in b['ops'] for o, _ in m['outs']}
+                te = [ex.get(v) for v in b['ops'][-1]['ins']] if b['ops'] else []
+                terms[(ri, bi)] = te
+                rs_[bi] = (rs_[bi], outs_e, te)
+            snap.append(rs_)
+        return fl, terms, snap
     def _node(n, idx, ins_e, parent, nested):
-        if nested and n['op'] in ('func.return', 'func.call', 'scf.yield'):      # 与 core.typecheck 相同：由结构层负责（类型关系在父 op 的残差里）
-            for o, t in n['outs']: ex[o] = ('k', TS.parse(t))
+        if nested and n['op'] in ('func.return', 'func.call', 'scf.yield'):      # 与 core.typecheck 相同：由父 op 的规则负责
+            for o, t in n['outs']: ex[o] = _kt(t)
             return
+        fl, terms, snap = _walk_regions(n, ins_e, idx) if n.get('regions') else (None, {}, None)
         lk = G.lookup(n['op'])
         if lk is None:
-            for o, t in n['outs']: ex[o] = ('k', TS.parse(t))
+            for o, t in n['outs']: ex[o] = _kt(t)
             _resid(P, [f'{n["op"]}: 无自动签名（交预言机）'], ins_e + [ex[o] for o, _ in n['outs']] + [ex[v] for v in captures(n) if v in ex])
             return
         cls, S = lk
         gi = G.bind(S, ins_e, S['ins'], _seg(n))
-        re_ = (_result_exprs(n, S, gi) if gi is not None else None) if not nested else None
-        if re_ == 'fail': P.bottom = P.bottom or f'{n["op"]}: 推断规则缺输入'; re_ = None
-        outs_e = re_ if re_ is not None and len(re_) == len(n['outs']) else [('k', TS.parse(t)) for _, t in n['outs']]
+        if fl and fl[1]:
+            post = dict(fl[1]); outs_e = []
+            for k, (o, t) in enumerate(n['outs']):
+                e = _src(post[k], ins_e, terms) if k in post else _kt(t)
+                if e is None: e = _kt(t); P.bottom = P.bottom or f'{n["op"]}: 区域类型流缺源'
+                outs_e.append(e)
+        else:
+            re_ = (_result_exprs(n, S, gi) if gi is not None else None) if (RF.ENABLED or not nested) else None
+            if re_ == 'fail': P.bottom = P.bottom or f'{n["op"]}: 推断规则缺输入'; re_ = None
+            outs_e = re_ if re_ is not None and len(re_) == len(n['outs']) else [_kt(t) for _, t in n['outs']]
         for (o, _), e in zip(n['outs'], outs_e): ex[o] = e
-        _resid(P, [f'{n["op"]}: {d}' for d in S['declared']] + [f'{n["op"]}: 未导入 {u}' for u in S['unknown']], ins_e + outs_e + [ex[v] for v in captures(n) if v in ex])   # 第 75 轮：区域捕获的值也算节点的输入
+        _resid(P, [f'{n["op"]}: {d}' for d in S['declared']] + [f'{n["op"]}: 未导入 {u}' for u in S['unknown']],
+               ins_e + outs_e + [ex[v] for v in captures(n) if v in ex] + _snap_exprs(snap))   # 第 75 轮：捕获；第 77 轮：区域内随端口变的类型
         go = G.bind(S, outs_e, S['outs'])
         P.atoms.append(('attr', n, ins_e, outs_e))       # 属性层与绑定无关（与 core.typecheck 同）
         if gi is None or go is None: P.residual.append(f'{n["op"]}: 端口组无法绑定')
@@ -125,19 +172,8 @@ def derive(sl, ports, inner=None):
             if x[2] not in ('ods', 'cpred', 'nf'): continue
             try: _at = A_.from_core(n)
             except Exception: _at = None
-            import nfrules as _NF; _at = _NF.nf_attrs(n, _at, _consts, parent, vex=ex.get)   # 第 76 轮：终结子操作数的表达式（捕获值为端口表达式）
+            import nfrules as _NF; _at = _NF.nf_attrs(n, _at, _consts, parent, inst=(n, snap) if snap is not None else None)
             P.atoms.append(('rel', x, (idx, n['op'], mini, partial, _at), groups, [e for g in gi for e in g], [] if partial else [e for g in go for e in g]))
-    def _regions(n, idx):
-        # 第 75 轮：区域内的 op 也进入 Φ_comp。块参数与区域内结果取图上写定的类型（常量）；区域内用到的外部值（捕获）就是端口或外层值。
-        pinfo = _NF0.parent_info(n)
-        for r in n.get('regions') or []:
-            for b in r:
-                for a, t in b['args']: ex[a] = ('k', TS.parse(t)); _consts.pop(a, None)
-                for m in b['ops']:
-                    for o, _ in m['outs']: _consts.pop(o, None)
-                    _NF0.note_const(m, _consts)
-                    _node(m, idx, [ex[v] for v in m['ins']], pinfo, True)
-                    _regions(m, idx)
     for idx, n in enumerate(sl):
         _NF0.note_const(n, _consts)
         ins_e = [ex[v] for v in n['ins']]
@@ -154,9 +190,17 @@ def derive(sl, ports, inner=None):
             for (o, _), e in zip(n['outs'], Q.outs_e): ex[o] = sub(e)
             continue
         _node(n, idx, ins_e, None, False)
-        _regions(n, idx)
     P.outs_e = []; P.env = ex
     return P
+
+def _snap_exprs(snap):
+    """快照里的全部表达式（块参数、块内结果、终结子操作数）。"""
+    if not snap: return []
+    out = []
+    for r in snap:
+        for aes, oes, te in r:
+            out += [e for e in aes if e is not None] + [e for e in oes.values() if e is not None] + [e for e in te if e is not None]
+    return out
 _T = lambda t: True
 
 def set_outs(P, outs):
@@ -170,20 +214,36 @@ class _Unknown:
 UNK = _Unknown()
 
 def _tterm_e(a):
-    """第 76 轮：nf 规则读到的终结子操作数表达式（scf 区域规则）。"""
+    """第 77 轮：nf 规则读到的区域表达式（快照 '\x00inst'）。"""
     at = a[2][4] if a[0] == 'rel' else None
-    if not at or '\x00tterm_e' not in at: return []
-    return [e for r in at['\x00tterm_e'] for vs in r for e in vs if e is not None]
+    if not at or '\x00inst' not in at: return []
+    return _snap_exprs(at['\x00inst'][1])
 def _sub_at(info, sub):
     at = info[4]
-    if not at or '\x00tterm_e' not in at: return info
-    at = dict(at); at['\x00tterm_e'] = [[[None if e is None else sub(e) for e in vs] for vs in r] for r in at['\x00tterm_e']]
+    if not at or '\x00inst' not in at: return info
+    n, snap = at['\x00inst']
+    s2 = [[([None if e is None else sub(e) for e in aes], {o: (None if e is None else sub(e)) for o, e in oes.items()}, [None if e is None else sub(e) for e in te])
+           for aes, oes, te in r] for r in snap]
+    at = dict(at); at['\x00inst'] = (n, s2)
     return info[:4] + (at,) + info[5:]
 def _at_eval(at, T):
-    if not at or '\x00tterm_e' not in at: return at
-    at = dict(at)
-    at['\x00tterm'] = [[(lambda ts: None if any(t is None for t in ts) else ts)([None if e is None else ev(e, T) for e in vs]) for vs in r] for r in at['\x00tterm_e']]
-    return at
+    """快照在端口类型 T 下具体化：区域各块的块参数、块内结果、终结子操作数取具体类型，再按 core 同一函数算区域信息。"""
+    if not at or '\x00inst' not in at: return at
+    import nfrules as NF
+    n, snap = at['\x00inst']
+    sh = lambda e: None if e is None else (lambda t: None if t is None else TS.show(t))(ev(e, T))
+    regs, cap = [], {}
+    for r, rs_ in zip(n['regions'], snap):
+        rr = []
+        for b, (aes, oes, te) in zip(r, rs_):
+            args = [(a, sh(e) or t) for (a, t), e in zip(b['args'], aes)]
+            ops = [dict(m, outs=[(o, sh(oes.get(o)) or t) for o, t in m['outs']]) for m in b['ops']]
+            if b['ops']:
+                for v, e in zip(b['ops'][-1]['ins'], te): cap.setdefault(v, sh(e))
+            rr.append(dict(b, args=args, ops=ops))
+        regs.append(rr)
+    at = {k: v for k, v in at.items() if k != '\x00inst'}
+    return NF.region_keys(dict(n, regions=regs), at, vty=cap.get)
 
 def holds(a, T):
     """单个原子在端口类型 T 下：True / False / UNK（nf 规则在该点未建模）。表达式求值失败（变换无定义）⇒ 不成立（与 instantiate 返回 None 一致）。"""
@@ -251,7 +311,7 @@ def simplify(P):
         elif a[0] == 'rel':
             if a[1][0] in REFLEXIVE and len({key(e) for e in es}) <= 1: continue
             k = ('rel', a[1][0], tuple(a[1][1]), id(a[1][3]) if a[1][0] == 'match' else id(a[1][4]) if a[1][0] == 'nf' else None, a[2][3],
-                 tuple((k_, repr(v_)) for k_, v_ in sorted(a[2][4].items())) if a[1][0] == 'nf' and a[1][5] and a[2][4] else None, tuple(tuple(key(e) for e in g) for g in _relgroups(a)))
+                 tuple((k_, (id(v_[0]), tuple(key(e) for e in _snap_exprs(v_[1]))) if k_ == '\x00inst' else repr(v_)) for k_, v_ in sorted(a[2][4].items())) if a[1][0] == 'nf' and a[1][5] and a[2][4] else None, tuple(tuple(key(e) for e in g) for g in _relgroups(a)))
             if k in seen: continue
             seen.add(k)
         Q.atoms.append(a)
