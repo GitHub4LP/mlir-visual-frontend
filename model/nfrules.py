@@ -1270,6 +1270,16 @@ def apply(S, reg=None):
             S = dict(S); S['rel'] = S['rel'] + [r]
             if complete:
                 S['nf_covered'] = S.get('nf_covered', []) + ['C++ verify()']; S['declared'] = [d for d in S['declared'] if d != 'C++ verify()']
+    infer_keys = ('C++ inferReturnTypes', '接口 verify: InferTypeOpInterface::Trait')
+    if ENABLED and CPPVERIFY and (reg is None or reg is REG) and any(k in S['declared'] for k in infer_keys):
+        import cppverify as _CV                      # 第 80 轮：InferTypeOpInterface 按 C++ inferReturnTypes/isCompatibleReturnTypes 解释执行
+        got = _CV.rule_infer(S)
+        if got is not None:
+            r, complete = got
+            S = dict(S); S['rel'] = S['rel'] + [r]
+            if complete:
+                done = [k for k in infer_keys if k in S['declared']]
+                S['nf_covered'] = S.get('nf_covered', []) + done; S['declared'] = [d for d in S['declared'] if d not in done]
     if ENABLED and (reg is None or reg is REG) and any('LinalgOp::Trait' in d for d in S.get('nf_covered', [])) \
             and S['ins'] and S['ins'][-1][0] in ('outputs', 'init', 'inits'):
         S = dict(S); S['rel'] = S['rel'] + [_body_rule(S)]
