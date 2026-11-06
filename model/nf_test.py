@@ -183,7 +183,12 @@ if __name__ == '__main__':
     import verdict as V, nfrules as N
     # 第 74 轮：N1 的网格只变异端口类型，不生成区域、indexing_maps 与必需属性；linalg op 在此网格上 MLIR 一律拒绝（接受 0，如“requires one region”），
     # 比较没有区分力，且 linalg.map 的结构性拒绝会被记成 nf 误收。linalg 由 nfiface_test N2a/N2b/N2d、packconst_test N2e、winograd_test N2f 检验。
-    ops = sys.argv[1:] or sorted(o for o in N.CANDIDATES if not o.startswith('linalg.'))
+    # 第 79 轮：同一理由推广到所有带区域的 op（第 76 轮起 scf.* 也进了候选：网格不生成区域，MLIR 以“expected 2 regions”拒绝，记成 nf 误收）。
+    # 带区域的 op 由 scf_test N2g、regcomp_test R1/R2、regflow_test 检验。看到第 79 轮首跑结果后做的范围修正，如实记录。
+    import odssig as G_
+    def _has_regions(o):
+        lk = G_.lookup(o); return bool(lk and lk[1].get('regions'))
+    ops = sys.argv[1:] or sorted(o for o in N.CANDIDATES if not o.startswith('linalg.') and not _has_regions(o))
     q = mp.Queue(); ps = [mp.Process(target=run_op, args=(o, q)) for o in ops]
     for p in ps: p.start()
     res = {}

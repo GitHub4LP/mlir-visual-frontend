@@ -60,6 +60,13 @@ def draw(rng, S, POOL, acc, k):
         return ins, outs
     return instance(rng, S, POOL)
 
+def attrs_of(S, ins, outs):
+    """与 text() 写出的属性一一对应：必需的 I64EnumAttr = 0 与段长；其余属性不存在。"""
+    a = {nm: '0 : i64' for nm, _, kind, req in S['attrs'] if req and kind == 'I64EnumAttr'}
+    if any('AttrSizedOperandSegments' in t for t in S['structural']): a['operandSegmentSizes'] = 'array<i32: ' + ', '.join(str(len(g)) for g in ins) + '>'
+    if any('AttrSizedResultSegments' in t for t in S['structural']): a['resultSegmentSizes'] = 'array<i32: ' + ', '.join(str(len(g)) for g in outs) + '>'
+    return a
+
 def text(S, ins, outs):
     opd = [t for g in ins for t in g]; res = [t for g in outs for t in g]
     props = [f'{nm} = 0 : i64' for nm, _, kind, req in S['attrs'] if req and kind == 'I64EnumAttr']
@@ -101,12 +108,12 @@ def L1(n, rng):
                     st[dia]['MLIR 崩溃'] += 1; st[dia]['崩溃例前端拒绝'] += bool(G.check(S, ins, outs)); continue
                 st[dia]['实例'] += 1; st[dia]['MLIR 接受'] += truth
                 for lv, L in (('ods', ('ods',)), ('+cpred', ('ods', 'cpred')), ('+nf', ('ods', 'cpred', 'nf'))):
-                    fe = not G.check(S, ins, outs, L)
+                    fe = not G.check(S, ins, outs, L, attrs=attrs_of(S, ins, outs))   # 第 79 轮：属性取实例文本里实际写出的（此前传 None 丢了信息）
                     key = f'{lv}:' + ('一致' if fe == truth else '误收' if fe else '误拒')
                     st[dia][key] += 1
                     if lv == '+nf':                       # 第 67 轮：按账目用完整模型（含规范化规则）；nf 覆盖的 op 由 declared 转为 auto/cpred
                         per[(op, cls)][key] += 1
-                        if fe != truth and (op, fe) not in ex: ex[(op, fe)] = (text(S, ins, outs).split('\n')[1].strip(), G.check(S, ins, outs, L))
+                        if fe != truth and (op, fe) not in ex: ex[(op, fe)] = (text(S, ins, outs).split('\n')[1].strip(), G.check(S, ins, outs, L, attrs=attrs_of(S, ins, outs)))
     return st, per, ex
 
 if __name__ == '__main__':

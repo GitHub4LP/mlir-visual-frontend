@@ -70,7 +70,10 @@ def interp(d, name, atom, xform):
     r = d[name]; sc = r['!superclasses']
     if 'CPred' in sc:
         k = norm(r['predExpr'])
-        if k not in atom: raise Unknown(('atom', r['predExpr'].strip()))
+        if k not in atom:
+            a = ATOM_FALLBACK(r['predExpr']) if ATOM_FALLBACK and atom is ATOM else None    # 第 79 轮：表外原子由 cppverify 解释器求值
+            if a is None: raise Unknown(('atom', r['predExpr'].strip()))
+            return lambda env: a(env['$_self'])
         a = atom[k]; return lambda env: a(env['$_self'])
     kids = lambda: [interp(d, ref(c), atom, xform) for c in r['children']]
     if 'And' in sc:
@@ -189,3 +192,4 @@ class _AtomTable(dict):
         if v is None: raise KeyError(k)
         return v
 ATOM = _AtomTable()
+ATOM_FALLBACK = None   # 第 79 轮：odssig 设为 cppverify.compile_type_atom

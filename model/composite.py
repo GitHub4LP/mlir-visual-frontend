@@ -25,6 +25,7 @@ def infer_types(n, ins_t):
         elif rl[0] == 'copy': w = (env.get(rl[1]) or [None])[0]
         else:
             src = env.get(rl[1]) or []; w = rl[2](src[0]) if src else None
+            if w is G.XF_UNK: return None                 # 第 79 轮：变换未建模 ⇒ 结果保持字面量
         if w is None or isinstance(w, list): return 'fail' if w is None and rl[0] != 'build' else None
         out.append(w)
     return out

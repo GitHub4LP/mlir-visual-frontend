@@ -103,7 +103,7 @@ if __name__ == '__main__':
     for i, path in enumerate(sorted(glob.glob('corpus/*/*.mlir'))[start:lim], start):
         q = ctxm.Queue(); p = ctxm.Process(target=run_file, args=(path, q, kslice, kmut, i)); p.start()
         try: st, ex = q.get(timeout=600)
-        except Exception: p.kill(); tot['文件超时/崩溃'] += 1; continue
+        except Exception: p.kill(); tot['文件超时/崩溃'] += 1; print('文件超时/崩溃:', path, 'exitcode', p.exitcode, flush=True); continue
         p.join(); tot.update(st)
         for k, v in ex.items(): exs[k] += v[:2]
     print('── 合计'); [print(f'   {k}: {v}') for k, v in sorted(tot.items())]

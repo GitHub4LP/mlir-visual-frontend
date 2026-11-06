@@ -24,7 +24,10 @@ def ev(e, T):
     if k == 'k': return e[1]
     x = ev(e[3], T)
     if x is None or isinstance(x, list): return None
-    return e[2](x)
+    r = e[2](x)
+    if r is G.XF_UNK:                       # 第 79 轮：解释器求值的 transformer 在此输入上未建模 ⇒ 该点 Unknown
+        import nfrules as NF; raise NF.NFUnknown('TypesMatchWith 变换')
+    return r
 def ports_of(e):
     if e[0] == 'p': return {e[1]}
     if e[0] == 'k': return set()
@@ -66,7 +69,7 @@ def _result_exprs(n, S, gi_e):
         else:
             src = env.get(rl[1]) or []
             if not src: return 'fail'
-            out.append(('xf', XF_NAME.get(id(rl[2]), 'xf'), rl[2], src[0]))
+            out.append(('xf', XF_NAME.get(id(rl[2])) or getattr(rl[2], 'xfname', 'xf'), rl[2], src[0]))
     return out
 
 def _resid(P, items, exprs):
@@ -246,6 +249,13 @@ def _at_eval(at, T):
     return NF.region_keys(dict(n, regions=regs), at, vty=cap.get)
 
 def holds(a, T):
+    """第 79 轮：表达式求值（解释器求值的 TypesMatchWith 变换）在该点未建模 ⇒ UNK。"""
+    try: return _holds(a, T)
+    except Exception as e:
+        if type(e).__name__ == 'NFUnknown': return UNK
+        raise
+
+def _holds(a, T):
     """单个原子在端口类型 T 下：True / False / UNK（nf 规则在该点未建模）。表达式求值失败（变换无定义）⇒ 不成立（与 instantiate 返回 None 一致）。"""
     import attrsig as A
     if a[0] == 'pred':

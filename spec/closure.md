@@ -580,3 +580,30 @@ R_j(t) ≝ ∃ 其余端口. Φ_comp，即用户需求里“签名允许的最�
 - 词汇外的长尾：AffineMap、getMixedSizes（OffsetSizeAndStride）、switch/枚举、父 op 与区域访问、DataLayout、std::tie。下一步按“一个构造解锁多个 op”的次序扩充。
 - 已有手写规则尚未用解释器替换；替换前需逐 op 证明等价（同一检验）。
 - 单 op 检验跳过带区域的 op；区域 op 由 regcomp/scf 检验覆盖。
+
+### §9.19 第 79 轮：解释器词汇按“一个构造解锁多个 op”扩充；同一解释器接管 ODS 的变换与类型原子
+
+**做法。** 先统计不完备 op 的阻断项，按“单一阻断项能解锁的 op 数”排序，只加通用构造，不按 op 登记：
+- 控制与语法：switch（含落空与 default）、模板函数调用（`f<T>(…)` 按投机解析）、`llvm::IsaPred<…>` 作谓词值、结构化绑定的 `const auto&`/`auto&&` 形式、多声明符同作用域、C 数组初始化、`static_assert`、限定静态方法（`GatherOp::inferResultType`）、`std::tie`/`std::get<k>`/`std::swap`、`llvm::seq`/`equal`/`zip_first`、元素赋值 `v[i] = x`。
+- 语义修正：花括号初始化是列表（`{4, 3}` 不是“4 个 3”；此前把 `return {m, r}` 误作计数构造）；SmallVector/auto 声明按值拷贝。
+- 值域：ODS 枚举（整数与 `#d<m sym>` 两种拼写；DefaultValuedAttr 缺省按 populateDefaultAttrs 物化；整数枚举值不在 case 内 ⇒ ODS 不变式先拒，verify 不可达）；`stringifyXxx`；`getMixedValues`（静态位置为 i64 IntegerAttr，动态位置为值）；`getConstantIntValue` 于属性；AffineMap（属性、恒等/仿射/strided 布局，strided 按 makeStridedLinearLayoutMap 的符号次序）；`isLastDimUnitStride`/步长（恒等与 strided 布局，其余仿射布局 Unknown）；`getAttrOfType<T>`；方言类型 isa（ODS TypeDef 按打印文本；C++ 手写类型的拼写由解释方言 printType 的 `.Case<…>` 得到，如 `!gpu.async.token`；MMAMatrixType 解析 `!gpu.mma_matrix<…>`）。
+- 结果：C++ verify 静态完备 op 43 → 80（188 个中；Transform 30 个无源码）。
+
+**同一解释器接管两类 ODS 片段**（此前靠正则表逐条登记，表外即 Unknown）：
+- TypesMatchWith 的 transformer（odssig._xf_interp）：如 vector.interleave/deinterleave 的 VectorType::Builder（setDim/setShape）、gpu.subgroup_mma_extract_thread_local 的元素类型。运行时未建模 ⇒ XF_UNK：check 中该点 Unknown（strict 时上抛），odscomp 中原子 UNK，instantiate 中结果保持字面量。trait 种类按超类识别（ResultIsHalfSourceVectorType 是 TypesMatchWith 的子类，此前按最后一个超类名漏掉）。odsdiff infer 分歧 4 → 1（余 arith.constant：tblgen 由 TypedAttr 的类型推断结果，属性到类型的推断未建模，保守方向）。
+- 类型约束的 CPred 原子（odsjson.ATOM_FALLBACK → cppverify.compile_type_atom）：只有 isa/cast 的目标都是封闭可判定的类（内建、ODS TypeDef、C++ 手写类型、MMA）才编译；接口（TypeInterface，如 bufferization.TensorLikeType）不编译，仍记“开放接口”，不据此拒绝。端口类型原子 unknown 128 → 19。
+
+**检验中发现并修正的模型错误（均在本轮代码内）。**
+- typesig 给 shape 方言类型专门的项 `('shape.shape',)`，方言类型 isa 原先只认 opaque，shape.broadcast 的 isErrorPropagationPossible 恒假，odscomp S3 首跑误收 3（残差为空）。改为按打印文本比较。
+- holds 中解释器变换未建模会上抛 NFUnknown，projcomp 首跑因此异常；holds 统一把 NFUnknown 记为 UNK。
+
+**测量修正（看到结果后改的，如实记录）。**
+- odssig_test L1：生成的实例写出的属性只有必需 I64EnumAttr = 0 与段长；此前 check 不传属性（None），属性相关的 verify 规则无从判定。改为传与文本一致的属性表（attrs_of）。首跑 nvgpu.rcp 10 例“auto 却误收”由此消失。
+- nf_test N1：第 76 轮起 scf.* 进入候选，但网格不生成区域，MLIR 以“expected 2 regions”拒绝，记成 nf 误收（3401）。按排除 linalg 的同一理由，排除所有带区域的 op；它们由 scf_test、regcomp_test、regflow_test 检验。
+
+**已知边界。** 静态完备只看名字在词汇内；运行时仍可能遇到词汇外的值（如未建模的布局）⇒ CppUnknown。此时非严格 typecheck 放行（与残差 op 同一上近似），严格模式（odscomp）记该点 Unknown。C3（完备 op 运行时未定 0）是这一缺口的守卫，本轮全语料为 0。类型原子运行时未定按 ⊤ 处理并计数。
+
+**结果（最终代码，全部重跑）。** declared 残差 298 → 270（C++ verify() 余 88 条，接口 verify 158，C++ inferReturnTypes 18，verifyRegions 6）；残差（declared + unknown）为空的 op 433/650。
+- cppverify_test（5 段）：C1 比较 45170，误拒 0；C2 完备 op 的 verify 诊断 1740（按段 328/607/755/21/29，后两段低于单段非空阈值 100，按段 FAIL，合计满足），漏判 0；C3 完备 op 未定 0；C5 比较 37023（MLIR 拒绝 25165），误拒 0、误收 0。
+- 回归：odscomp S1–S4、projcomp P1/P2/P4/P5、regcomp R1/R2、nfiface N2a/b/d、scf N2g-a/b/d、core_test、odssig L1（误收 4667 → 3806，按账目分歧 0）、attrsig A1/A2、odsdiff T1、clauses K1–K6/M2.7、packconst N2e、nf_test N1（范围修正后）均 PASS。
+- 仍 FAIL（与第 77/78 轮相同，判据未改）：regflow F2 两段、F4 第二段（增益 10）；winograd N2f（filter 接受 25 < 30，误拒/误收 0）。
