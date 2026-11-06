@@ -50,6 +50,21 @@ XF_OP = {   # TypesMatchWith 的 transformer（对 $_self）
     O.norm('SmallVector<Type, 2>(::llvm::cast<RankedTensorType>($_self).getNumElements(), ::llvm::cast<RankedTensorType>($_self).getElementType())'):
         lambda t: [t[2]] * _numel(t) if ranked(t) and t[0] == 'tensor' and None not in t[1] else None,
 }
+class _XfUnknown:
+    """transformer 在此输入上未建模（解释器 CppUnknown）。"""
+XF_UNK = _XfUnknown()
+def _xf_interp(txt):
+    """第 79 轮：表外的 transformer 用 cppverify 解释器求值（与 C++ verify、属性原子同一机制）；静态不完备 ⇒ None（留在 unknown）。"""
+    import cppverify as CV
+    f = CV.compile_type_xform(txt)
+    if f is None: return None
+    def g(t):
+        try: return f(t)
+        except CV.CppUnknown: return XF_UNK
+        except CV._Ret: return None               # cast 失败（断言）：lhs 的 ODS 约束已先拒绝
+    g.xfname = 'cpp:' + O.norm(txt)                 # odscomp 以名字判表达式相等
+    return g
+
 def _numel(t):
     n = 1
     for x in t[1]: n *= x
@@ -69,6 +84,11 @@ def _iface(d, trait):
             r = d[n]
             if not r.get('!anonymous') and r.get('trait'): idx[r['trait']] = r
     return idx.get(trait)
+
+def _type_atom_fallback(txt):
+    import cppverify as CV
+    return CV.compile_type_atom(txt)
+O.ATOM_FALLBACK = _type_atom_fallback
 
 def _tp(dialect, b, S):
     """端口类型谓词。第 18 轮：含未登记原子（方言自有类型，如 !gpu.async.token、!transform.any_op）的约束 ⇒ 记入 unknown，谓词取 ⊤（上近似：
@@ -102,13 +122,16 @@ def sig(dialect, opname):
     infer_iface = False
     for name, tr in [x for t in r['traits'] for x in _traits(d, t, [])]:
         sc = tr['!superclasses']; kind = sc[-1]
+        for k_ in ('OptionalTypesMatchWith', 'TypesMatchWith', 'AllTypesMatch', 'AllElementTypesMatch', 'AllRanksMatch', 'AllShapesMatch'):   # 第 79 轮：子类化的 trait（ResultIsHalfSourceVectorType 等）
+            if k_ in sc: kind = k_; break
         if 'PredOpTrait' in sc:
             if kind in ('AllTypesMatch', 'AllElementTypesMatch', 'AllRanksMatch', 'AllShapesMatch'):
                 S['rel'].append(({'AllTypesMatch': 'same', 'AllElementTypesMatch': 'elt_eq', 'AllRanksMatch': 'rank_eq', 'AllShapesMatch': 'shape_eq'}[kind],
                                  [('name', v) for v in tr['values']], 'ods'))
             elif kind in ('TypesMatchWith', 'OptionalTypesMatchWith'):
                 k = O.norm(tr['transformer'])
-                if k in XF_OP: S['rel'].append(('match', [('name', tr['lhs']), ('name', tr['rhs'])], 'ods', XF_OP[k], kind == 'OptionalTypesMatchWith'))
+                xf = XF_OP.get(k) or _xf_interp(tr['transformer'])
+                if xf: S['rel'].append(('match', [('name', tr['lhs']), ('name', tr['rhs'])], 'ods', xf, kind == 'OptionalTypesMatchWith'))
                 else: S['unknown'].append(f'{kind} 变换: {" ".join(tr["transformer"].split())[:60]}')
             elif kind == 'ShapedTypeMatchesElementCountAndTypes':
                 S['rel'].append(('count_types', [('name', tr['shaped']), ('name', tr['elements'])], 'ods'))
@@ -216,7 +239,11 @@ def check(S, ins, outs, levels=('ods', 'cpred', 'nf'), attrs=None, strict=False)
             a, b = groups
             if x[4] and (not a or not b): continue
             if not a: continue
-            want = x[3](a[0]); ok = want is not None and (b == want if isinstance(want, list) else b == [want])
+            want = x[3](a[0])
+            if want is XF_UNK:
+                if strict: import nfrules as _NF; raise _NF.NFUnknown('TypesMatchWith 变换')
+                continue
+            ok = want is not None and (b == want if isinstance(want, list) else b == [want])
         elif k == 'count_types':
             sh, el = groups; ok = bool(sh) and ranked(sh[0]) and None not in sh[0][1] and len(el) == _numel(sh[0]) and all(t == sh[0][2] for t in el)
         elif k == 'cond_shape':
@@ -238,6 +265,9 @@ def check(S, ins, outs, levels=('ods', 'cpred', 'nf'), attrs=None, strict=False)
             else:
                 src = env.get(rl[1]) or []
                 want = rl[2](src[0]) if src else None
+                if want is XF_UNK:
+                    if strict: import nfrules as _NF; raise _NF.NFUnknown('TypesMatchWith 变换')
+                    continue
             if want is None and rl[0] == 'build': continue          # 未登记的 builderCall：不检查
             if env.get(nm) != [want] and not (isinstance(want, list) and env.get(nm) == want): bad.append(f'推断: {nm}')
     return bad
