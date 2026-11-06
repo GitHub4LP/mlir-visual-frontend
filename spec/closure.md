@@ -607,3 +607,27 @@ R_j(t) ≝ ∃ 其余端口. Φ_comp，即用户需求里“签名允许的最�
 - cppverify_test（5 段）：C1 比较 45170，误拒 0；C2 完备 op 的 verify 诊断 1740（按段 328/607/755/21/29，后两段低于单段非空阈值 100，按段 FAIL，合计满足），漏判 0；C3 完备 op 未定 0；C5 比较 37023（MLIR 拒绝 25165），误拒 0、误收 0。
 - 回归：odscomp S1–S4、projcomp P1/P2/P4/P5、regcomp R1/R2、nfiface N2a/b/d、scf N2g-a/b/d、core_test、odssig L1（误收 4667 → 3806，按账目分歧 0）、attrsig A1/A2、odsdiff T1、clauses K1–K6/M2.7、packconst N2e、nf_test N1（范围修正后）均 PASS。
 - 仍 FAIL（与第 77/78 轮相同，判据未改）：regflow F2 两段、F4 第二段（增益 10）；winograd N2f（filter 接受 25 < 30，误拒/误收 0）。
+
+### 9.20 InferTypeOpInterface：解释执行 C++ inferReturnTypes / isCompatibleReturnTypes（第 80 轮）
+**问题。** 第 79 轮后 declared 残差 270 条中，非 Transform 的接口 verify 以 InferTypeOpInterface 最多（19 op），另有 18 条 C++ inferReturnTypes。它们的规则全在 C++ 里：MLIR 的 verifyInferredResultTypes（Interfaces/InferTypeOpInterface.cpp）先调 inferReturnTypes，失败即报 "failed to infer returned types"；成功则以 isCompatibleReturnTypes(推断, 实际) 判定（op 未覆盖时为逐个相等）。
+
+**做法（同一解释器，不逐 op 登记）。**
+- cppverify.decide_infer：按形参类型给实参（Adaptor/DictionaryAttr/OpaqueProperties/RegionRange → 被校验 op 自身；ValueRange → 全部操作数；输出形参 SmallVectorImpl<Type>& → 收集表，函数整体重赋值时取结束环境里的值）；有 isCompatibleReturnTypes 则解释执行它，否则逐个相等。cast 失败（断言）按拒绝计。
+- cppverify.rule_infer 生成 nf 原子；completeness(…, 'infer') 对两个体做静态完备检查（含形参表可解析）。完备 ⇒ 同时移出 'C++ inferReturnTypes' 与 '接口 verify: InferTypeOpInterface::Trait'。
+- 新增通用词汇：可变参数模板（`typename... Ty`、`isa<Ty...>`、函数形参包 `ranges... rs` 与 `rs...` 展开）、按实参个数选重载、无名形参、限定名自由函数定义（`bool shape::isExtentTensorType(…)`）、局部 lambda 变量、无参数方言类型的 `X::get(ctx)`（ODS TypeDef 或手写类型的打印拼写）、`MemRefType::get`（整数 0 内存空间规范化为缺省）、`Builder` 的类型工厂、`adaptor.getProperties().属性`、`SmallVectorImpl::assign/append(n, v)`、`ArrayRef::equals`、`llvm::append_range`、`llvm::copy + std::back_inserter`、`std::min/max<T>`、`emitOptionalError`、`verifyCompatibleShapes(TypeRange)`（按 IR/TypeUtilities.cpp：部分非 shaped ⇒ 失败、可扩展与否混合 ⇒ 失败、有秩者秩相等且每维静态值至多一种）。
+- 结果：19 个 op 中 18 个静态完备（vector.multi_reduction 的 inferReturnTypes 不在 .cpp 中，留残差）。declared 270 → 234；残差为空的 op 433 → 450。
+
+**检验**（cppverify_test 新增 I1–I3，判据运行前写定；5 段 `100 0`/`200 100`/`270 200`/`340 270`/`400 340`，非空阈值按合计）：
+- I1 MLIR 接受 ⇒ decide_infer 不拒绝：比较 1840（22/481/1330/7/0），拒绝 1468，误拒 0。
+- I2 infer 完备 op 上 MLIR 报 "failed to infer returned types" 或 "inferred type(s) … incompatible" ⇒ 拒绝：诊断 80（2/53/25/0/0），漏判 0。（多数推断失败的变异先被 ODS 约束或其他诊断报出，故诊断数远少于拒绝数。）
+- I3 完备 op 运行时未定 0。按段 I1/I2 在语料不含这些 op 的段 FAIL（非空阈值），合计满足。
+- C1 比较 45170 误拒 0；C2 诊断 1740 漏判 0（与第 79 轮同，第 4、5 段低于单段阈值）；C3 0；C5 比较 38863（MLIR 拒绝 26742），误拒 0、误收 0（分母比第 79 轮多 1840，即新进入“残差为空”的 op）。
+
+**检验中发现并修正的错误（均在本轮代码内）。**
+- 无名形参（`MLIRContext *, std::optional<Location>`）原先解析失败 ⇒ 运行时 CppUnknown（首跑 I3 未定 22+46）；静态完备检查当时不解析形参表，没有发现。现两处都修正。
+- vector.shuffle 的 `llvm::append_range(shape, …)` 写进了副本，推断结果缺维 ⇒ 首跑 I1 误拒 2、C5 误拒 2；vector.to_elements 的 `append(n, v)` 未支持 ⇒ 未定。均已修正。
+- 新加的 `Builder` 构造把 `VectorType::Builder` 也吞掉，使 vector.interleave 的 TypesMatchWith 变换变为 Unknown，L1 首跑“auto op 有分歧 1”（误收 31）。改为只认 mlir::Builder/OpBuilder 后 L1 按账目分歧 0。cppverify 五段在此修正后全部重跑，数字即上文。
+
+**对前端的意义与边界。** 这些 op 的结果类型现在由模型从操作数与属性算出（shape 方言的 size/index 互容、extent tensor 与 !shape.shape 互容，vector.extract 取 1 元向量可代标量等，全按 C++ 原文）。本轮只把它用于校验；把 C++ 推断用于 Φ_comp 的正向推导（结果类型随端口变化）尚未做，复合 op 中这些结果仍取写定类型，列为下一步。
+
+**回归（最终代码，全部在 Builder 修正后跑）。** odscomp S1–S4 两段 PASS（12375 + 15585；S3 误拒 0、残差为空误收 0）；projcomp P1/P2/P4/P5 两段 PASS；regcomp R1/R2 两段 PASS（点未定 1042 + 1162，第 79 轮 1261 + 1225）；nfiface N2a/b/d 两段 PASS；scf N2g-a/b/d PASS；core T1/T2 PASS；odsdiff T1 PASS（infer 分歧 1）；odssig L1 PASS（误收 3806 → 3800，按账目分歧 0）；attrsig A1/A2 PASS；clauses K1–K6/M2.7 PASS；nf_test N1 PASS（23 op 分两批跑，比较 40500 + 16704；单批 23 进程在 2 CPU 上超时）；packconst N2e PASS。仍 FAIL（与第 79 轮相同，判据未改）：regflow F2（增益 15、3）、F4 第二段（增益 10）；winograd N2f（filter 接受 25 < 30，误拒/误收 0）。

@@ -7,6 +7,11 @@
   C3 未定 0：静态完备的 op，解释器运行时不得 CppUnknown。
   C5 完整模型≡MLIR：op 的残差（declared + unknown）为空时，core.typecheck（不开预言机）与 MLIR 一致：误拒 0、误收 0。
   非空：比较 ≥ 1000，完备 op 上的 verify 诊断 ≥ 100；文件崩溃 0。
+第 80 轮（InferTypeOpInterface 的 C++ inferReturnTypes/isCompatibleReturnTypes 解释执行，运行前写定）：
+  I1 误拒 0：MLIR 接受 ⇒ decide_infer 不拒绝。
+  I2 漏判 0：infer 静态完备的 op 上，MLIR 在该 op 报 "failed to infer returned types" 或 "inferred type(s) … incompatible" ⇒ decide_infer 拒绝；此类诊断合计 ≥ 30。
+  I3 未定 0：infer 静态完备的 op，运行时不得 CppUnknown。
+  C5 同时覆盖因 infer 规则而残差为空的 op。
   只报告：不完备 op 的判定率、拒绝时消息与 MLIR 诊断一致的比例。
 原类型独立成函数后 MLIR 即拒绝的实例（父 op 要求、符号等）整例跳过。MLIR 崩溃按拒绝计，不计入 C2。
 运行：PYTHONPATH=model python3 model/cppverify_test.py [语料文件上限] [起点]
@@ -48,14 +53,19 @@ def run_file(path, q, seed):
                 if n.get('succs') or n['op'] in ('func.return', 'func.call') or n.get('regions'): continue
                 dia = n['op'].split('.')[0]
                 lk = G.lookup(n['op'])
-                if lk is None or not CV.has_source(dia, n['op']): continue
+                if lk is None: continue
                 S0 = G.sig(dia, n['op'])
-                if 'C++ verify()' not in S0['declared']: continue
+                has_v = 'C++ verify()' in S0['declared']
+                has_i = any(k in S0['declared'] for k in ('C++ inferReturnTypes', '接口 verify: InferTypeOpInterface::Trait')) and CV.infer_source(dia, n['op'])[1] is not None
+                if not has_v and not has_i: continue
                 if any(isinstance(v, str) and '@' in v for v in ((n.get('props') or {}).get('_attrs') or {}).values()): continue
                 S = lk[1]
-                complete = CV.completeness(dia, n['op'])[0]
+                if has_v and not CV.has_source(dia, n['op']): has_v = False
+                if not has_v and not has_i: continue
+                complete = has_v and CV.completeness(dia, n['op'])[0]
+                complete_i = has_i and CV.completeness(dia, n['op'], 'infer')[0]
                 full = not S['declared'] and not S['unknown']
-                lits = CV.verify_literals(dia, n['op'])
+                lits = CV.verify_literals(dia, n['op']) if has_v else []
                 ports = list(dict.fromkeys(n['ins']))
                 if any(v not in tyof for v in ports): continue
                 T0 = [tyof[v] for v in ports]
@@ -89,14 +99,17 @@ def run_file(path, q, seed):
                     a_ = node['props'].get('_attrs', {}).get('operandSegmentSizes')
                     if a_: seg = I._segs(a_) or None
                     gi = G.bind(S, ins_t, S['ins'], seg); go = G.bind(S, outs_t, S['outs'])
-                    verdict = 'skip'
+                    verdict = 'skip'; vi = 'skip'
                     if gi is not None and go is not None:
                         try: at = A.from_core(node)
                         except Exception: at = None
-                        if at is not None:
+                        if at is not None and has_v:
                             try:
                                 okv, msgv = CV.decide(dia, n['op'], S, gi + go, at); verdict = okv
                             except CV.CppUnknown as e: verdict = None; note(f'未定/{tag}', f"{n['op']}: {str(e)[:90]}")
+                        if at is not None and has_i:
+                            try: vi = CV.decide_infer(dia, n['op'], S, gi + go, at)[0]
+                            except CV.CppUnknown as e: vi = None; note('infer 未定', f"{n['op']}: {str(e)[:90]}")
                     text = OR.emit_core(bs, '(' + ', '.join(T) + ') -> ()')
                     if text is None: st['不可发射'] += 1; continue
                     tr, diags = OR.get().verify(text)
@@ -106,10 +119,24 @@ def run_file(path, q, seed):
                     # 诊断来自 verify：落在本节点，且去掉 "'op' op " 前缀后以 verify 源码里的某个字面量开头（ODS 生成的约束诊断不算）
                     strip = lambda m_: re.sub(r"^'[\w.]+' op ", '', m_)
                     vd = tr != 'crash' and any(l == node['id'] and any(strip(m_).startswith(s_[:40]) for s_ in lits) for l, m_ in diags)
-                    st['比较'] += 1; st[f'比较/{tag}'] += 1; st['MLIR 接受'] += ok; st['MLIR 崩溃'] += tr == 'crash'
-                    st[f'verify 诊断/{tag}'] += vd
-                    if verdict == 'skip': st['无法绑定/属性'] += 1; continue
-                    if verdict is None:
+                    if has_i and vi != 'skip':
+                        idg = tr != 'crash' and any(l == node['id'] and ('failed to infer returned types' in m_ or 'inferred type' in m_) for l, m_ in diags)
+                        st['I 比较'] += 1; st['I 诊断/complete'] += idg and complete_i
+                        if vi is None:
+                            if complete_i: st['I3 未定'] += 1; note('I3', f"{n['op']} {kind} {T} {mu}")
+                        else:
+                            st['I 拒绝'] += vi is False
+                            if ok and vi is False: st['I1 误拒'] += 1; note('I1 误拒', f"{n['op']} {kind} {T} {mu}")
+                            if idg and complete_i and vi is not False: st['I2 漏判'] += 1; note('I2 漏判', f"{n['op']} {kind} {T} {mu} {' '.join(d[1] for d in diags)[:100]}")
+                    if not has_v:
+                        verdict = 'skip'
+                    st['比较'] += has_v; st[f'比较/{tag}'] += has_v; st['MLIR 接受'] += ok and has_v; st['MLIR 崩溃'] += tr == 'crash' and has_v
+                    st[f'verify 诊断/{tag}'] += vd and has_v
+                    if verdict == 'skip':
+                        st['无法绑定/属性'] += has_v
+                        if not full or has_v: continue          # 与第 78 轮相同：有 verify 的 op 绑定失败整例跳过；只有 infer 的 op 照常进入 C5
+                    if verdict == 'skip': pass
+                    elif verdict is None:
                         st[f'未定/{tag}'] += 1
                         if complete: st['C3 完备 op 未定'] += 1; note('C3', f"{n['op']} {kind} {T} {mu}")
                     else:
@@ -152,5 +179,8 @@ if __name__ == '__main__':
     V.check('C3 完备 op 无未定', tot['C3 完备 op 未定'] == 0 and tot['python 异常'] == 0, f"未定 {tot['C3 完备 op 未定']}，解释器 Python 异常 {tot['python 异常']}")
     V.check('C5 残差为空 完整模型≡MLIR', tot['C5 比较'] >= 100 and tot['C5 误拒'] == 0 and tot['C5 误收'] == 0,
             f"比较 {tot['C5 比较']}（MLIR 拒绝 {tot['C5 MLIR 拒绝']}），误拒 {tot['C5 误拒']}，误收 {tot['C5 误收']}")
+    V.check('I1 infer 无误拒', tot['I 比较'] >= 100 and tot['I1 误拒'] == 0, f"比较 {tot['I 比较']}，拒绝 {tot['I 拒绝']}，误拒 {tot['I1 误拒']}")
+    V.check('I2 infer 诊断必拒', tot['I 诊断/complete'] >= 30 and tot['I2 漏判'] == 0, f"诊断 {tot['I 诊断/complete']}，漏判 {tot['I2 漏判']}")
+    V.check('I3 infer 无未定', tot['I3 未定'] == 0, f"未定 {tot['I3 未定']}")
     print(f"不完备 op：比较 {tot['比较/partial']}，判定 {tot['判定/partial']}，拒绝 {tot['拒绝/partial']}，未定 {tot['未定/partial']}；消息一致 {tot['消息一致']}/{tot['消息比较']}")
     V.finish()
