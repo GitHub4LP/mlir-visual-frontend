@@ -1259,6 +1259,7 @@ def _body_rule(S):
     return _r(names + outs, f'LinalgBody（{op}）：体内 linalg.yield 的值个数 = #inits，第 k 个值的类型 = inits[k] 的元素类型（memref/有秩 tensor）或其本身；体内 linalg.index 的 dim < 循环数', f, attrs=True)
 
 _apply0 = apply
+CPPINFER_FWD = True       # 第 80 轮：等式语义 op 的 C++ inferReturnTypes 用于正向推导（odscomp._cpp_result_exprs、composite.infer_types）；检验时切换比较
 CPPVERIFY = True          # 第 78 轮：C++ verify 解释执行（cppverify.py），对全部仍含 'C++ verify()' 残差的 op 一次生效
 def apply(S, reg=None):
     S = _apply0(S, reg)
@@ -1277,6 +1278,8 @@ def apply(S, reg=None):
         if got is not None:
             r, complete = got
             S = dict(S); S['rel'] = S['rel'] + [r]
+            if complete and not S.get('infer') and _CV.infer_source(S['op'].split('.')[0], S['op'])[2] is None:
+                S['cppinfer'] = _CV.infer_fn(S)      # 等式语义（无 isCompatibleReturnTypes 覆盖）：结果类型由操作数与属性唯一确定，可用于正向推导
             if complete:
                 done = [k for k in infer_keys if k in S['declared']]
                 S['nf_covered'] = S.get('nf_covered', []) + done; S['declared'] = [d for d in S['declared'] if d not in done]

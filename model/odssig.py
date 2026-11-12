@@ -153,6 +153,8 @@ def sig(dialect, opname):
             if t in NATIVE_OK: S['rel'].append((NATIVE_OK[t], [], 'ods'))
             elif t in NATIVE_NOVERIFY: pass
             elif STRUCTURAL.search(t): S['structural'].append(t)
+            elif re.search(r'SameVariadic(Operand|Result)Size$', t):     # 第 81 轮：无 verifyTrait，只决定可变组的切分（各组等长），由 bind 使用
+                S['samevar_' + ('ins' if 'Operand' in t else 'outs')] = True
             else: S['unknown'].append(f'native trait {t}')
         elif 'OpInterfaceTrait' in sc or 'InterfaceTrait' in sc or 'DeclareOpInterfaceMethods' in sc or 'MemoryEffects' in sc:
             t = tr.get('trait', '')
@@ -295,7 +297,19 @@ def bind(S, flat, ports, seg=None):
         return out
     multi = [j for j, p in enumerate(ports) if p[2] != 'one']
     fixed = len(ports) - len(multi)
-    if len(multi) > 1: return None
+    if len(multi) > 1:
+        # 第 81 轮：SameVariadicOperandSize/ResultSize ⇒ 各可变组等长（ODS 生成的 getODSOperandIndexAndLength）；不整除 ⇒ 不可绑定
+        side = 'ins' if ports is S.get('ins') or [p[0] for p in ports] == [p[0] for p in S.get('ins', [])] else \
+               'outs' if ports is S.get('outs') or [p[0] for p in ports] == [p[0] for p in S.get('outs', [])] else None
+        if side is None or not S.get('samevar_' + side) or any(p[2] == 'varvar' for p in ports): return None
+        rest = len(flat) - fixed
+        if rest < 0 or rest % len(multi): return None
+        k = rest // len(multi); out, i = [], 0
+        for p in ports:
+            n_ = 1 if p[2] == 'one' else k
+            if p[2] == 'optional' and n_ > 1: return None
+            out.append(flat[i:i + n_]); i += n_
+        return out
     if not multi: return [[t] for t in flat] if len(flat) == fixed else None
     k = len(flat) - fixed
     if k < 0 or (ports[multi[0]][2] == 'optional' and k > 1): return None
