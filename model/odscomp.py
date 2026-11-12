@@ -393,6 +393,7 @@ def render(P, names):
 # ───────────────────────── 单端口投影：端口 j 的最大类型范围 R_j(t) ≝ ∃其余端口. Φ（第 63 轮）
 ATTR_SPLIT = True   # 第 84 轮开关（§9.24）
 FIX_SINGLETON = True
+COPY_EXACT = True    # 第 85 轮（§9.25）
 EQ = {'same', 'same_ops'}          # 精确相等（AllTypesMatch、SameTypeOperands）；samec_all 允许动态维兼容，不是相等
 SINGLETON = {'Index': '(index)', 'I1': '(i1)', 'I8': '(i8)', 'I16': '(i16)', 'I32': '(i32)', 'I64': '(i64)',
              'F16': '(f16)', 'BF16': '(bf16)', 'F32': '(f32)', 'F64': '(f64)'}   # 第 84 轮：只容许一个类型的 ODS 约束（名 → 该类型）
@@ -429,11 +430,37 @@ def project(Q):
         free = cs - set(fx)
         for c in cs: touch.setdefault(c, []).append((a, len(free - {c}) == 0))
     ranges = {}
+    copyk = {}
     for j in range(Q.n):
         lst = touch.get(cls[j], [])
-        ranges[j] = ([a for a, solo in lst if solo], cls[j] in fx or all(solo for _, solo in lst))   # 单值类本身：范围就是那一个类型（Φ 可满足时），精确
-    Q._fixed = fx
+        ex_ = cls[j] in fx or all(solo for _, solo in lst)        # 单值类本身：范围就是那一个类型（Φ 可满足时），精确
+        if not ex_ and COPY_EXACT:
+            if cls[j] not in copyk: copyk[cls[j]] = _copy_component(Q, cls, fx, cls[j])
+            if copyk[cls[j]] is not None: ex_ = 'copy'
+        ranges[j] = ([a for a, solo in lst if solo], ex_)
+    Q._fixed = fx; Q._copyk = copyk
     return cls, ranges
+
+REFLEXIVE = {'same', 'same_ops', 'samec_all', 'shape_ops', 'shape_all', 'elt_ops', 'elt_all', 'elt_eq', 'elementwise'}
+def _copy_component(Q, cls, fx, c):
+    """第 85 轮（§9.25）：c 的自由连通分量 K 满足同值见证条件时返回 K（类集合），否则 None。"""
+    K, todo, cross = {c}, [c], []
+    while todo:
+        x = todo.pop()
+        for a in Q.atoms:
+            cs = {cls[p] for e in _aexprs(a) for p in ports_of(e)}
+            if x not in cs: continue
+            if a[0] == 'pred':
+                if len(cs) == 1 and a[3][0] == 'p': continue
+                if x != c or (cs - {c}): return None
+                continue
+            if len(cs) == 1 and cs == {c}: continue                      # c 的类内原子：属于必要条件
+            if cs & set(fx) or not all(e[0] == 'p' for e in _aexprs(a)) or a[0] != 'rel' or a[1][0] not in REFLEXIVE: return None
+            for y in cs - K: K.add(y); todo.append(y)
+    lab = lambda k: {a[1] for a in Q.atoms if a[0] == 'pred' and a[3][0] == 'p' and cls[a[3][1]] == k}
+    lc = lab(c)
+    if any(not lab(k) <= lc for k in K - {c}): return None
+    return K
 
 def range_holds(Q, cls, ranges, j, t):
     """R_j(t) 的类内部分：类内端口都取 t，单值类取其唯一类型（第 84 轮），求值只涉及这些类的原子。"""
@@ -449,7 +476,7 @@ def render_ranges(Q, names):
     for j in range(Q.n):
         if cls[j] != j and names[cls[j]] in out: out[names[j]] = f'= {names[cls[j]]}'; continue
         cons = sorted({_label(a) if a[0] != 'pred' else a[1] for a, in [(x,) for x in rg[j][0]]})
-        out[names[j]] = ('精确' if rg[j][1] else '上近似') + ': ' + ' ∧ '.join(cons)
+        out[names[j]] = ('精确（同值见证）' if rg[j][1] == 'copy' else '精确' if rg[j][1] else '上近似') + ': ' + ' ∧ '.join(cons)
     return out
 
 def range3(Q, j, t, hints, maxw=1024):
@@ -462,6 +489,10 @@ def range3(Q, j, t, hints, maxw=1024):
     if range_holds(Q, cls, rg, j, tp) is False: return ('out', None)
     others = sorted({cls[i] for i in range(Q.n)} - {cls[j]})
     rep = {c: next(i for i in range(Q.n) if cls[i] == c) for c in others}
+    K = getattr(Q, '_copyk', {}).get(cls[j])
+    if K is not None:                                   # 第 85 轮：同值见证（K ← t，其余取 hints）
+        T = [t if cls[i] in K else hints[rep[cls[i]]] for i in range(Q.n)]
+        if evaluate(Q, T) is True: return ('in', T)
     for k, combo in enumerate(itertools.product((0, 1), repeat=len(others))):
         if k >= maxw: break
         asg = {c: (t if b else hints[rep[c]]) for c, b in zip(others, combo)} | {cls[j]: t}

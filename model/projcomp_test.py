@@ -58,7 +58,7 @@ def run_file(path, q, kslice, seed):
                 st['复合 op'] += 1; st['端口'] += len(ports); st['等价类合并'] += len(ports) - len(set(cls))
                 cands = sorted(set(rng.sample(pool, min(10, len(pool))) + T0))
                 for j in range(len(ports)):
-                    exact = rg[j][1]; st['端口/精确' if exact else '端口/上近似'] += 1
+                    exact = rg[j][1] is True; st['端口/精确' if exact else '端口/上近似'] += 1   # 第 85 轮：P1 只对原义“精确”；同值精确由 projexact_test Y1/Y2 检验
                     for t in rng.sample(cands, min(6, len(cands))) + [T0[j]]:
                         try: tp = TS.parse(t)
                         except Exception: continue
