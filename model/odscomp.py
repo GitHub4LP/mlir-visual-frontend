@@ -202,7 +202,10 @@ def derive(sl, ports, inner=None):
         _resid(P, [f'{n["op"]}: {d}' for d in S['declared']] + [f'{n["op"]}: 未导入 {u}' for u in S['unknown']],
                ins_e + outs_e + [ex[v] for v in captures(n) if v in ex] + _snap_exprs(snap))   # 第 75 轮：捕获；第 77 轮：区域内随端口变的类型
         go = G.bind(S, outs_e, S['outs'])
-        P.atoms.append(('attr', n, ins_e, outs_e))       # 属性层与绑定无关（与 core.typecheck 同）
+        import attrsig as _AS
+        if ATTR_SPLIT and gi is not None and go is not None and not _AS.type_coupled(n['op']):
+            P.atoms.append(('attr', n, [], []))          # 第 84 轮：属性层不读端口类型 ⇒ 常量原子（端口表达式的有定义性由各端口的 pred 原子负责）
+        else: P.atoms.append(('attr', n, ins_e, outs_e))       # 属性层与绑定无关（与 core.typecheck 同）
         if gi is None or go is None: P.residual.append(f'{n["op"]}: 端口组无法绑定')
         if gi is None: return
         partial = go is None                          # 结果组无法绑定：与 odssig.check 的部分模式相同，只查操作数一侧
@@ -388,11 +391,26 @@ def render(P, names):
             'unknown': P.residual, 'ground': P.ground, 'bottom': P.bottom}
 
 # ───────────────────────── 单端口投影：端口 j 的最大类型范围 R_j(t) ≝ ∃其余端口. Φ（第 63 轮）
+ATTR_SPLIT = True   # 第 84 轮开关（§9.24）
+FIX_SINGLETON = True
 EQ = {'same', 'same_ops'}          # 精确相等（AllTypesMatch、SameTypeOperands）；samec_all 允许动态维兼容，不是相等
+SINGLETON = {'Index': '(index)', 'I1': '(i1)', 'I8': '(i8)', 'I16': '(i16)', 'I32': '(i32)', 'I64': '(i64)',
+             'F16': '(f16)', 'BF16': '(bf16)', 'F32': '(f32)', 'F64': '(f64)'}   # 第 84 轮：只容许一个类型的 ODS 约束（名 → 该类型）
+def _fixed(Q, cls):
+    """第 84 轮（§9.24）：一元约束只容许一个类型的端口类 ⇒ 该类在 ∃ 中取值唯一，可代入消去。返回 {类: 类型项}。"""
+    out = {}
+    if not FIX_SINGLETON: return out
+    for a in Q.atoms:
+        if a[0] == 'pred' and a[3][0] == 'p' and a[1] in SINGLETON:
+            c = cls[a[3][1]]; t = TS.parse(SINGLETON[a[1]].strip('()'))
+            if out.get(c, t) != t: out[c] = None          # 两个不同的单值约束 ⇒ 该类为空；不作代入（保守地不消去）
+            else: out[c] = t
+    return {c: t for c, t in out.items() if t is not None}
+
 def project(Q):
     """返回 (cls, ranges)。cls：端口 → 等价类代表（由端口间精确相等关系合并）。
-    ranges[j] = (atoms, exact)：atoms 是只涉及 j 所在等价类的原子（类内端口都取 t 后求值）；
-    exact ⇔ 没有原子把该类与类外端口联系起来（此时 R_j 与其余端口独立：R_j(t) ⇔ atoms(t) ∧ 其余类可满足）。
+    ranges[j] = (atoms, exact)：atoms 是只涉及 j 所在等价类（及单值类，第 84 轮）的原子；
+    exact ⇔ 没有原子把该类与类外的非单值端口联系起来（此时 R_j(t) ⇔ atoms(t; 单值类取其唯一类型) ∧ 其余类可满足）。
     exact=False 时 atoms 只是必要条件（上近似），呈现须标“上近似”。"""
     par = list(range(Q.n))
     def f(i):
@@ -404,20 +422,24 @@ def project(Q):
             if es and all(e[0] == 'p' for e in es):
                 for e in es[1:]: par[f(e[1])] = f(es[0][1])
     cls = [f(i) for i in range(Q.n)]
+    fx = _fixed(Q, cls)
     touch = {}
     for a in Q.atoms:
         cs = {cls[p] for e in _aexprs(a) for p in ports_of(e)}
-        for c in cs: touch.setdefault(c, []).append((a, len(cs) == 1))
+        free = cs - set(fx)
+        for c in cs: touch.setdefault(c, []).append((a, len(free - {c}) == 0))
     ranges = {}
     for j in range(Q.n):
         lst = touch.get(cls[j], [])
-        ranges[j] = ([a for a, solo in lst if solo], all(solo for _, solo in lst))
+        ranges[j] = ([a for a, solo in lst if solo], cls[j] in fx or all(solo for _, solo in lst))   # 单值类本身：范围就是那一个类型（Φ 可满足时），精确
+    Q._fixed = fx
     return cls, ranges
 
 def range_holds(Q, cls, ranges, j, t):
-    """R_j(t) 的类内部分：类内端口都取 t，求值只涉及该类的原子。"""
+    """R_j(t) 的类内部分：类内端口都取 t，单值类取其唯一类型（第 84 轮），求值只涉及这些类的原子。"""
     if Q.bottom: return False
-    T = [t if cls[i] == cls[j] else None for i in range(Q.n)]
+    fx = getattr(Q, '_fixed', {})
+    T = [t if cls[i] == cls[j] else fx.get(cls[i]) for i in range(Q.n)]
     hs = [holds(a, T) for a in ranges[j][0]]
     return False if any(h is False for h in hs) else UNK if any(h is UNK for h in hs) else True   # UNK 不构成“必要条件不成立”
 
