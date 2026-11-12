@@ -434,14 +434,83 @@ def project(Q):
     for j in range(Q.n):
         lst = touch.get(cls[j], [])
         ex_ = cls[j] in fx or all(solo for _, solo in lst)        # 单值类本身：范围就是那一个类型（Φ 可满足时），精确
+        atoms_j = [a for a, solo in lst if solo]
         if not ex_ and COPY_EXACT:
-            if cls[j] not in copyk: copyk[cls[j]] = _copy_component(Q, cls, fx, cls[j])
-            if copyk[cls[j]] is not None: ex_ = 'copy'
-        ranges[j] = ([a for a, solo in lst if solo], ex_)
+            if cls[j] not in copyk: copyk[cls[j]] = _elim(Q, cls, fx, cls[j])
+            if copyk[cls[j]] is not None: ex_, atoms_j = copyk[cls[j]][0], copyk[cls[j]][1]
+        ranges[j] = (atoms_j, ex_)
     Q._fixed = fx; Q._copyk = copyk
     return cls, ranges
 
-REFLEXIVE = {'same', 'same_ops', 'samec_all', 'shape_ops', 'shape_all', 'elt_ops', 'elt_all', 'elt_eq', 'elementwise'}
+COPY_REFL = {'same', 'same_ops', 'samec_all', 'shape_ops', 'shape_all', 'elt_ops', 'elt_all', 'elt_eq', 'elementwise'}   # 第 85 轮；勿与 simplify 的 REFLEXIVE 同名（PR #95 曾同名覆盖，见 §9.26）
+SUBST_MATCH = True   # 第 86 轮（§9.26）
+def _subatom(a, sub):
+    if a[0] == 'pred': return ('pred', a[1], a[2], sub(a[3]), a[4])
+    if a[0] == 'rel': return ('rel', a[1], _sub_at(a[2], sub), [[sub(e) for e in g] for g in a[3]], [sub(e) for e in a[4]], [sub(e) for e in a[5]])
+    return ('attr', a[1], [sub(e) for e in a[2]], [sub(e) for e in a[3]])
+def _one(fn):
+    def g(x):
+        r = fn(x)
+        return r[0] if isinstance(r, list) and len(r) == 1 else r
+    return g
+def _elim(Q, cls, fx, c):
+    """第 86 轮（§9.26）：c 的自由连通分量 K 内，由非可选 TypesMatchWith 原子 b = f(src)（b 为单端口组、src 不含 b 的类）确定的类代入消去；
+    之后若只剩 c 的类内原子 ⇒ ('subst', 代换后的类内原子, 见证代换)；否则在代换后的原子上做同值见证检查（§9.25）⇒ ('copy', …)；都不行 ⇒ None。"""
+    cof = lambda a: {cls[p] for e in _aexprs(a) for p in ports_of(e)}
+    K, todo = {c}, [c]
+    while todo:
+        x = todo.pop()
+        for a in Q.atoms:
+            cs = cof(a)
+            if x in cs:
+                for y in cs - set(fx) - K: K.add(y); todo.append(y)
+    atoms = [a for a in Q.atoms if cof(a) & K]
+    if any(_tterm_e(a) for a in atoms): return None
+    subs = {}
+    if SUBST_MATCH:
+        changed = True
+        while changed:
+            changed = False
+            for a in atoms:
+                if a[0] != 'rel' or a[1][0] != 'match' or a[1][4] or a[2][3]: continue
+                g = _relgroups(a) if a[1][1] else []
+                if len(g) != 2 or len(g[0]) != 1 or len(g[1]) != 1 or g[1][0][0] != 'p': continue
+                k = cls[g[1][0][1]]
+                if k == c or k in subs or k not in K or k in {cls[p] for p in ports_of(g[0][0])}: continue
+                subs[k] = ('xf', 'subst', _one(a[1][3]), g[0][0]); changed = True
+    if subs:
+        rep = {k: next(i for i in range(Q.n) if cls[i] == k) for k in subs}
+        def sub(e, depth=0):
+            if depth > 20: raise RecursionError
+            return subst(e, lambda p_: sub(subs[cls[p_[1]]], depth + 1) if cls[p_[1]] in subs else p_)
+        try: atoms = [_subatom(a, sub) for a in atoms]
+        except RecursionError: return None
+    rest = {x for a in atoms for x in cof(a)} - set(fx)
+    if rest <= {c}: return ('subst', atoms, subs)
+    K2 = _copy_component_atoms(atoms, cls, fx, c)
+    if K2 is None: return None
+    return ('copy', [a for a in atoms if not (cof(a) - set(fx) - {c})], subs, K2)
+
+def _copy_component_atoms(atoms, cls, fx, c):
+    """§9.25 的同值见证条件，作用于给定原子集。"""
+    K, todo = {c}, [c]
+    while todo:
+        x = todo.pop()
+        for a in atoms:
+            cs = {cls[p] for e in _aexprs(a) for p in ports_of(e)}
+            if x not in cs: continue
+            if a[0] == 'pred':
+                if len(cs) == 1 and a[3][0] == 'p': continue
+                if x != c or (cs - {c}): return None
+                continue
+            if len(cs) == 1 and cs == {c}: continue
+            if cs & set(fx) or not all(e[0] == 'p' for e in _aexprs(a)) or a[0] != 'rel' or a[1][0] not in COPY_REFL or (a[1][0] == 'elementwise' and not a[5]): return None
+            for y in cs - K: K.add(y); todo.append(y)
+    lab = lambda k: {a[1] for a in atoms if a[0] == 'pred' and a[3][0] == 'p' and cls[a[3][1]] == k}
+    lc = lab(c)
+    if any(not lab(k) <= lc for k in K - {c}): return None
+    return K
+
 def _copy_component(Q, cls, fx, c):
     """第 85 轮（§9.25）：c 的自由连通分量 K 满足同值见证条件时返回 K（类集合），否则 None。"""
     K, todo, cross = {c}, [c], []
@@ -455,7 +524,7 @@ def _copy_component(Q, cls, fx, c):
                 if x != c or (cs - {c}): return None
                 continue
             if len(cs) == 1 and cs == {c}: continue                      # c 的类内原子：属于必要条件
-            if cs & set(fx) or not all(e[0] == 'p' for e in _aexprs(a)) or a[0] != 'rel' or a[1][0] not in REFLEXIVE: return None
+            if cs & set(fx) or not all(e[0] == 'p' for e in _aexprs(a)) or a[0] != 'rel' or a[1][0] not in COPY_REFL or (a[1][0] == 'elementwise' and not a[5]): return None
             for y in cs - K: K.add(y); todo.append(y)
     lab = lambda k: {a[1] for a in Q.atoms if a[0] == 'pred' and a[3][0] == 'p' and cls[a[3][1]] == k}
     lc = lab(c)
@@ -476,8 +545,25 @@ def render_ranges(Q, names):
     for j in range(Q.n):
         if cls[j] != j and names[cls[j]] in out: out[names[j]] = f'= {names[cls[j]]}'; continue
         cons = sorted({_label(a) if a[0] != 'pred' else a[1] for a, in [(x,) for x in rg[j][0]]})
-        out[names[j]] = ('精确（同值见证）' if rg[j][1] == 'copy' else '精确' if rg[j][1] else '上近似') + ': ' + ' ∧ '.join(cons)
+        out[names[j]] = ('精确（同值见证）' if rg[j][1] == 'copy' else '精确（代换）' if rg[j][1] == 'subst' else '精确' if rg[j][1] else '上近似') + ': ' + ' ∧ '.join(cons)
     return out
+
+def exact_witness(Q, cls, j, tp, hints):
+    """第 85/86 轮：精确类（'copy'/'subst'）的设计见证：K ← tp（同值），被确定的类 ← f(…)（代换），其余取 hints；不适用或无定义 ⇒ None。"""
+    W = getattr(Q, '_copyk', {}).get(cls[j])
+    if W is None: return None
+    K = W[3] if W[0] == 'copy' else {cls[j]}
+    try: T = [tp if cls[i] in K else (TS.parse(hints[i]) if isinstance(hints[i], str) else hints[i]) for i in range(Q.n)]
+    except Exception: return None
+    try:
+        for _ in range(len(W[2]) + 1):
+            for k, e in W[2].items():
+                v = ev(e, T)
+                for i in range(Q.n):
+                    if cls[i] == k: T[i] = v
+    except Exception: return None
+    if any(v is None or isinstance(v, list) for v in T): return None
+    return T
 
 def range3(Q, j, t, hints, maxw=1024):
     """三值的单端口范围：('in', 见证) 找到使 Φ 成立的完整端口赋值；('out', None) 必要条件（类内原子）已不成立；
@@ -489,10 +575,8 @@ def range3(Q, j, t, hints, maxw=1024):
     if range_holds(Q, cls, rg, j, tp) is False: return ('out', None)
     others = sorted({cls[i] for i in range(Q.n)} - {cls[j]})
     rep = {c: next(i for i in range(Q.n) if cls[i] == c) for c in others}
-    K = getattr(Q, '_copyk', {}).get(cls[j])
-    if K is not None:                                   # 第 85 轮：同值见证（K ← t，其余取 hints）
-        T = [t if cls[i] in K else hints[rep[cls[i]]] for i in range(Q.n)]
-        if evaluate(Q, T) is True: return ('in', T)
+    T = exact_witness(Q, cls, j, tp, [hints[rep[cls[i]]] if cls[i] != cls[j] else None for i in range(Q.n)])
+    if T is not None and evaluate(Q, T) is True: return ('in', [TS.show(x) for x in T])   # 与组合搜索一致：见证以类型文本返回
     for k, combo in enumerate(itertools.product((0, 1), repeat=len(others))):
         if k >= maxw: break
         asg = {c: (t if b else hints[rep[c]]) for c, b in zip(others, combo)} | {cls[j]: t}

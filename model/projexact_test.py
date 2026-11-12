@@ -9,9 +9,9 @@ Y1/Y2 在开启状态下对 MLIR 检验（同 projcomp 的 instantiate + 预言�
 import sys, re, glob, random, collections, multiprocessing as mp
 from compcorpus_test import slices, _funcs
 
-def run_file(path, q, on, copy=False):
+def run_file(path, q, on, copy=False, sub=False):
     import mlir.ir as ir, irimport as I, odscomp as D
-    D.ATTR_SPLIT = D.FIX_SINGLETON = on; D.COPY_EXACT = copy
+    D.ATTR_SPLIT = D.FIX_SINGLETON = on; D.COPY_EXACT = copy or sub; D.SUBST_MATCH = sub
     rng = random.Random(84); st = collections.Counter()
     src = open(path).read()
     if 'allow-unregistered-dialect' in src: q.put(st); return
@@ -70,15 +70,20 @@ def run_y(path, q, kslice=4):
                 if D.evaluate(Q, T0) is not True: continue
                 cands = sorted(set(rng.sample(pool, min(10, len(pool))) + T0))
                 for c in sorted(set(cls)):
-                    if rg[c][1] != 'copy': continue
-                    st['同值精确类'] += 1; K = Q._copyk[c]
+                    if rg[c][1] not in ('copy', 'subst'): continue
+                    st['同值精确类' if rg[c][1] == 'copy' else '代换精确类'] += 1
                     for t in rng.sample(cands, min(6, len(cands))) + [T0[c]]:
                         try: tp = TS.parse(t)
                         except Exception: continue
                         r = D.range_holds(Q, cls, rg, c, tp)
                         if r is D.UNK: st['点未定'] += 1; continue
                         if r:
-                            T = [t if cls[i] in K else T0[i] for i in range(len(ports))]
+                            Tw = D.exact_witness(Q, cls, c, tp, T0)
+                            if Tw is None or D.evaluate(Q, Tw) is not True:
+                                st['Y1 见证不成立'] += 1
+                                if len(ex['Y1w']) < 4: ex['Y1w'].append(f'{[n["op"] for n in sl]} 类{c} {t}')
+                                continue
+                            T = [TS.show(x) for x in Tw]
                             m = mlir_ok(sl, ports, T)
                             if m is None: st['Y1 MLIR 不可判'] += 1; continue
                             st['Y1 比较'] += 1
@@ -104,10 +109,10 @@ if __name__ == '__main__':
     start = int(av[1]) if len(av) > 1 else 0
     ctxm = mp.get_context('fork'); res = {}
     files = sorted(glob.glob('corpus/**/*.mlir', recursive=True))[start:lim]
-    for key, on, cp in (() if onlyy else (('关', False, False), ('开', True, False), ('同值开', True, True))):
+    for key, on, cp, sb in (() if onlyy else (('关', False, False, False), ('开', True, False, False), ('同值开', True, True, False), ('代换开', True, True, True))):
         tot = collections.Counter()
         for path in files:
-            q = ctxm.Queue(); p = ctxm.Process(target=run_file, args=(path, q, on, cp)); p.start()
+            q = ctxm.Queue(); p = ctxm.Process(target=run_file, args=(path, q, on, cp, sb)); p.start()
             try: st = q.get(timeout=600)
             except Exception: p.kill(); tot['文件超时/崩溃'] += 1; continue
             p.join(); tot.update(st)
@@ -126,7 +131,8 @@ if __name__ == '__main__':
     ok = bool(res) and all(res[k]['推导异常'] == res['关']['推导异常'] and res[k]['文件超时/崩溃'] == 0 and res[k]['端口类'] == res['关']['端口类'] for k in res)
     if not onlyy: V.check('X3 上近似下降', ok and (rr('关') - rr('开')) * 100 >= 10, f"关 {sh('关')}，开 {sh('开')}，下降 {(rr('关')-rr('开'))*100:.1f} 个百分点")
     if not onlyy: V.check('Y3 上近似下降', ok and (rr('开') - rr('同值开')) * 100 >= 5, f"同值关 {sh('开')}，同值开 {sh('同值开')}，下降 {(rr('开')-rr('同值开'))*100:.1f} 个百分点")
+    if not onlyy: V.check('Z3 上近似下降', ok and (rr('同值开') - rr('代换开')) * 100 >= 2, f"代换关 {sh('同值开')}，代换开 {sh('代换开')}，下降 {(rr('同值开')-rr('代换开'))*100:.1f} 个百分点")
     if '--y' in sys.argv or onlyy:
-        V.check('Y1 同值见证可靠', ytot['文件超时/崩溃'] == 0 and ytot['Y1 比较'] >= 1000 and ytot['Y1 不一致'] == 0, f"比较 {ytot['Y1 比较']}，不一致 {ytot['Y1 不一致']}，MLIR 不可判 {ytot['Y1 MLIR 不可判']}，同值精确类 {ytot['同值精确类']}，点未定 {ytot['点未定']}，推导异常 {ytot['推导异常']}")
+        V.check('Y1 同值见证可靠', ytot['文件超时/崩溃'] == 0 and ytot['Y1 比较'] >= 1000 and ytot['Y1 不一致'] == 0 and ytot['Y1 见证不成立'] == 0, f"见证不成立 {ytot['Y1 见证不成立']}，代换精确类 {ytot['代换精确类']}，比较 {ytot['Y1 比较']}，不一致 {ytot['Y1 不一致']}，MLIR 不可判 {ytot['Y1 MLIR 不可判']}，同值精确类 {ytot['同值精确类']}，点未定 {ytot['点未定']}，推导异常 {ytot['推导异常']}")
         V.check('Y2 拒绝可靠', ytot['Y2 违例'] == 0 and ytot['Y2 检查'] > 0, f"检查 {ytot['Y2 检查']}，违例 {ytot['Y2 违例']}，未穷举 {ytot['Y2 未穷举']}")
     V.finish()
