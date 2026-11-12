@@ -631,3 +631,23 @@ R_j(t) ≝ ∃ 其余端口. Φ_comp，即用户需求里“签名允许的最�
 **对前端的意义与边界。** 这些 op 的结果类型现在由模型从操作数与属性算出（shape 方言的 size/index 互容、extent tensor 与 !shape.shape 互容，vector.extract 取 1 元向量可代标量等，全按 C++ 原文）。本轮只把它用于校验；把 C++ 推断用于 Φ_comp 的正向推导（结果类型随端口变化）尚未做，复合 op 中这些结果仍取写定类型，列为下一步。
 
 **回归（最终代码，全部在 Builder 修正后跑）。** odscomp S1–S4 两段 PASS（12375 + 15585；S3 误拒 0、残差为空误收 0）；projcomp P1/P2/P4/P5 两段 PASS；regcomp R1/R2 两段 PASS（点未定 1042 + 1162，第 79 轮 1261 + 1225）；nfiface N2a/b/d 两段 PASS；scf N2g-a/b/d PASS；core T1/T2 PASS；odsdiff T1 PASS（infer 分歧 1）；odssig L1 PASS（误收 3806 → 3800，按账目分歧 0）；attrsig A1/A2 PASS；clauses K1–K6/M2.7 PASS；nf_test N1 PASS（23 op 分两批跑，比较 40500 + 16704；单批 23 进程在 2 CPU 上超时）；packconst N2e PASS。仍 FAIL（与第 79 轮相同，判据未改）：regflow F2（增益 15、3）、F4 第二段（增益 10）；winograd N2f（filter 接受 25 < 30，误拒/误收 0）。
+
+### 9.21 C++ 推断用于复合 op 的正向推导；SameVariadic*Size 切分（第 81 轮）
+**问题。** 第 80 轮把 C++ inferReturnTypes 规范化，但只用于校验：Φ_comp 与 composite.instantiate 中这些 op 的结果仍取图上写定的类型，端口一变，写定结果就把端口钉死，推出的签名不是最大的（用户需求：最大类型约束范围应能从图推出）。
+
+**做法。**
+- 只对“等式语义”的 op 前推：推断静态完备且没有 isCompatibleReturnTypes 覆盖（MLIR 要求实际结果 = 推断结果，结果由操作数与属性唯一确定）。nfrules 给这些 op 置 `S['cppinfer'] = cppverify.infer_fn(S)`，共 5 个：memref.distinct_objects、memref.extract_strided_metadata、vector.shuffle、vector.to_elements、bufferization.dealloc。有兼容覆盖的 op（shape 方言、vector.extract 等）兼容类里有多个合法结果，写定类型是图的选择，仍取写定类型；这是保守的，不是最大。
+- odscomp 新增多输入表达式 `('m', 键, 函数, (e1, …))`：函数取全部操作数类型（按组还原）与该节点的属性，返回第 k 个结果类型；ev/ports_of/show/key 与嵌套代换 subst 同步扩展。推断运行时未建模 ⇒ 该点 Unknown（与 TypesMatchWith 变换同一约定）；推断失败 ⇒ 表达式无值 ⇒ 该点拒绝。composite.infer_types 调同一函数（Φ ≡ 逐点）。开关 `nfrules.CPPINFER_FWD`。
+- odssig.bind 支持 SameVariadicOperandSize / SameVariadicResultSize：这两个 trait 没有 verifyTrait，只决定 ODS 生成的 getODSOperandIndexAndLength 如何切分多个可变组（各组等长）；不整除 ⇒ 不可绑定（保守）。原先列为 unknown，涉及 3 个 op（memref.extract_strided_metadata、memref.extract_aligned_pointer_as_index、linalg.reduce）。
+- 解释器两处修正：`XAttrInterface{}` / `XTypeInterface{}` 缺省构造 = 空句柄（C++ 语义；extract_strided_metadata 用它构造无布局 memref）；迭代属性时密集数组的数值元素不再包成属性（原先使 expand_shape 的 `shape != staticOutputShapes[pos]` 恒真）。
+
+**检验中发现的旧账。** 第 80 轮 I3 = 0 对 extract_strided_metadata 是空检验：两个可变结果组无法绑定，cppverify_test 直接跳过了该 op。补上切分后 I1 比较 1840 → 2332、I2 诊断 80 → 176，仍误拒 0、漏判 0、未定 0。缺省构造修正后 expand_shape 的 verify 能求值到底，暴露了数组元素包装错误（中间代码 C1 误拒 2、S3 误拒 5），修正后均为 0；下文数字都是修正后的最终代码。
+
+**检验**（cppinfer_test J1–J3，判据运行前写定；参数 `8 4`，只取含上述 5 op 的切片，无区域切片与含区域切片都取）：
+- J1 单调（Φ_旧 接受 ⇒ Φ_新 接受）：PASS，复合 op 174，实例 896，违例 0，点未定 43，推导异常 0。
+- J2 增益为真（Φ_旧 不接受而 Φ_新 接受且残差为空的实例 ≥ 20，MLIR 全部接受）：**FAIL**，增益 18，MLIR 全部接受，误收 0。判据未改。增益少的原因：含这些 op 的切片多数同时含 memref.subview / expand_shape / collapse_shape / alloca，其 C++ verify 在变异点上运行时未定（`rank` 解析、`llvm::map_range`、父 op 访问），实例不计入接受。
+- J3 无误拒（Φ_新 拒绝而 MLIR 接受）：PASS，拒绝 505，其中 MLIR 接受 0。
+
+**回归（最终代码）。** cppverify_test 5 段：C1 45170 误拒 0；C2 1740 漏判 0（第 4、5 段低于单段阈值，按段 FAIL，合计满足）；C3 0；C5 39355（MLIR 拒绝 27202）误拒 0、误收 0；I1 2332（拒绝 1928）误拒 0；I2 176 漏判 0；I3 0。odscomp S1–S4 两段 PASS（12375 + 15585）；projcomp P1/P2/P4/P5 两段 PASS；regcomp R1/R2 两段 PASS（点未定 1042 + 1162）；nfiface N2a/b/d 两段 PASS；scf N2g-a/b/d PASS；core T1/T2 PASS；odsdiff T1 PASS（infer 分歧 1）；odssig L1 PASS（误收 3800，按账目分歧 0）；attrsig A1/A2 PASS；clauses K1–K6/M2.7 PASS。仍 FAIL（同前，判据未改）：regflow F2（增益 15、3）、F4 第二段（增益 10）。nf_test N1 两批 PASS（比较 40500 + 16704）；packconst N2e PASS（比较 1600）。仍 FAIL：winograd N2f（filter 接受 25 < 30，误拒/误收 0，同前）。nfiface 第二段因并发环境重装重跑一次，PASS（N2a 32675、N2d 30300）。
+
+**边界。** 最大性现在覆盖：ODS 推断、TypesMatchWith 变换、区域类型流入口边、以及这 5 个 op 的 C++ 推断。有兼容覆盖的推断 op 与无推断的 op 结果仍取写定类型。

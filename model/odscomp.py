@@ -9,7 +9,8 @@
     ('pred', 约束名, 谓词, e)          端口约束（ODS TypeConstraint）作用于端口表达式 e
     ('rel',  关系, 节点信息, 各组表达式) ODS 关系（AllTypesMatch、TypesMatchWith、Same*…）
     ('attr', 节点, 输入表达式, 输出表达式) 属性层中与类型耦合的约束（不透明原子，逐点求值）
-  表达式：('p', i) 端口 i | ('k', 类型) 字面量 | ('xf', 键, 函数, e) TypesMatchWith 变换 / ODS 推断。
+  表达式：('p', i) 端口 i | ('k', 类型) 字面量 | ('xf', 键, 函数, e) TypesMatchWith 变换 / ODS 推断
+        | ('m', 键, 函数, (e1, …)) 多输入推断（第 80 轮：C++ inferReturnTypes 解释执行，函数取全部操作数类型表）。
   不能表达的部分作为 Unknown 残差显式列出（declared：C++ verify、接口 verify、C++ inferReturnTypes；unknown：未导入条目；
   无签名 op；端口组无法绑定）。残差不参与 Φ 的求值：Φ 对含残差的复合 op 是上近似，必须标 Unknown 并警告，交预言机终判。
 
@@ -22,6 +23,13 @@ def ev(e, T):
     k = e[0]
     if k == 'p': return T[e[1]] if e[1] < len(T) else None
     if k == 'k': return e[1]
+    if k == 'm':
+        xs = [ev(a, T) for a in e[3]]
+        if any(x is None or isinstance(x, list) for x in xs): return None
+        r = e[2](xs)
+        if r is G.XF_UNK:
+            import nfrules as NF; raise NF.NFUnknown('C++ inferReturnTypes')
+        return r
     x = ev(e[3], T)
     if x is None or isinstance(x, list): return None
     r = e[2](x)
@@ -31,12 +39,23 @@ def ev(e, T):
 def ports_of(e):
     if e[0] == 'p': return {e[1]}
     if e[0] == 'k': return set()
+    if e[0] == 'm': return set().union(*[ports_of(a) for a in e[3]])
     return ports_of(e[3])
 def show(e, names):
     if e[0] == 'p': return names[e[1]]
     if e[0] == 'k': return TS.show(e[1])
+    if e[0] == 'm': return f'{e[1]}(' + ', '.join(show(a, names) for a in e[3]) + ')'
     return f'{e[1]}({show(e[3], names)})'
-def key(e): return (e[0], e[1]) if e[0] in ('p', 'k') else ('xf', e[1], key(e[3]))
+def key(e):
+    if e[0] in ('p', 'k'): return (e[0], e[1])
+    if e[0] == 'm': return ('m', e[1], tuple(key(a) for a in e[3]))
+    return ('xf', e[1], key(e[3]))
+def subst(e, f):
+    """端口代换（嵌套时把内层端口换成外层表达式）。"""
+    if e[0] == 'p': return f(e)
+    if e[0] == 'k': return e
+    if e[0] == 'm': return (e[0], e[1], e[2], tuple(subst(a, f) for a in e[3]))
+    return (e[0], e[1], e[2], subst(e[3], f))
 
 XF_NAME = {}
 for _k, _f in G.XF_OP.items():
@@ -53,6 +72,9 @@ def _seg(n):
 
 def _result_exprs(n, S, gi_e):
     """ODS 推断规则 → 结果表达式（与 composite.infer_types 同一规则）；None = 用字面量；'fail' = 不可实例化。"""
+    import nfrules as _NFc
+    if S is not None and not S.get('infer') and S.get('cppinfer') and _NFc.CPPINFER_FWD:
+        return _cpp_result_exprs(n, S, gi_e)
     if S is None or not S.get('infer'): return None
     env = {nm: es for (nm, *_), es in zip(S['ins'], gi_e)}
     out = []
@@ -71,6 +93,24 @@ def _result_exprs(n, S, gi_e):
             if not src: return 'fail'
             out.append(('xf', XF_NAME.get(id(rl[2])) or getattr(rl[2], 'xfname', 'xf'), rl[2], src[0]))
     return out
+
+def _cpp_result_exprs(n, S, gi_e):
+    """第 80 轮：C++ inferReturnTypes（等式语义的 op，见 nfrules）→ 每个结果一个多输入表达式；与 composite.infer_types 同一函数。"""
+    import attrsig as A_
+    try: at = A_.from_core(n)
+    except Exception: return None
+    lens = [len(g) for g in gi_e]; flat = tuple(e for g in gi_e for e in g); fn = S['cppinfer']
+    nm = 'cppinfer:' + S['op'] + ':' + repr(lens) + repr(sorted((k, str(v)) for k, v in (at or {}).items()))
+    def mk(k):
+        def g(xs):
+            groups, i = [], 0
+            for l in lens: groups.append(list(xs[i:i + l])); i += l
+            r = fn(groups, at)
+            if r is G.XF_UNK: return r
+            if r is None or k >= len(r): return None
+            return r[k]
+        return g
+    return [('m', f'{nm}#{k}', mk(k), flat) for k in range(len(n['outs']))]
 
 def _resid(P, items, exprs):
     """节点的残差（C++ verify 等不透明校验）：若该节点全部操作数/结果类型都不含端口变量（定值），
@@ -182,7 +222,7 @@ def derive(sl, ports, inner=None):
         ins_e = [ex[v] for v in n['ins']]
         if inner and n['op'] in inner:                  # 嵌套：内层 Φ 的原子经代换搬入（组合封闭）
             Q = inner[n['op']]
-            sub = lambda e: ins_e[e[1]] if e[0] == 'p' else e if e[0] == 'k' else (e[0], e[1], e[2], sub(e[3]))
+            sub = lambda e: subst(e, lambda p_: ins_e[p_[1]])
             for a in Q.atoms:
                 if a[0] == 'pred': P.atoms.append(('pred', a[1], a[2], sub(a[3]), a[4]))
                 elif a[0] == 'rel': P.atoms.append(('rel', a[1], _sub_at(a[2], sub), [[sub(e) for e in g] for g in a[3]], [sub(e) for e in a[4]], [sub(e) for e in a[5]]))

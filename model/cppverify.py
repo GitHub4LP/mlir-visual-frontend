@@ -717,7 +717,7 @@ class Interp:
     def iter(self, r):
         if isinstance(r, (list, tuple, Rng)) and not (isinstance(r, tuple) and r and isinstance(r[0], str)): return list(r)
         if isinstance(r, range): return list(r)
-        if isinstance(r, Attr): return [Attr(x) for x in _attr_list(r.a)]
+        if isinstance(r, Attr): return [x if isinstance(x, (int, float, str)) else Attr(x) for x in _attr_list(r.a)]   # 第 81 轮：密集数组的元素是数值，不包成属性
         raise CppUnknown(f'迭代 {type(r).__name__}')
     # 表达式
     def ev(self, e, env):
@@ -1509,6 +1509,7 @@ def _default(ty):
     if b == 'bool': return False
     if b.startswith('SmallVector') or b.startswith('std::vector') or b.startswith('SmallVector<'): return []
     if b in ('Type', 'Value', 'Attribute') or b.endswith('Type'): return None
+    if b.endswith('AttrInterface') or b.endswith('TypeInterface'): return None   # 第 81 轮：接口句柄缺省构造 = 空（C++ 语义）
     raise CppUnknown(f'缺省值 {ty}')
 def _conv(ty, v):
     b = _base(ty or 'auto')
@@ -1626,6 +1627,42 @@ def decide_infer(dia, opname, S, groups, attrs):
     except Exception as e:
         STATS['python 异常'] += 1; STATS.setdefault('例', []).append(f'{opname} infer: {type(e).__name__}: {e}'[:160])
         raise CppUnknown(f'解释器异常 {type(e).__name__}: {e}')
+
+def infer_types(dia, opname, S, in_groups, attrs):
+    """第 80 轮：只求 inferReturnTypes（不比较）。→ 类型表 | None（推断失败或断言）；运行时未建模 ⇒ CppUnknown。"""
+    cls, inf, _ = infer_source(dia, opname)
+    CUR['dia'] = dia
+    groups = list(in_groups) + [[] for _ in S['outs']]
+    op = Op(dia, opname, S, groups, None if attrs is None else {k: v for k, v in attrs.items() if not k.startswith('\x00')}, cls)
+    out = []
+    def am(ty, nm):
+        b = _base(re.sub(r'[&*]', '', ty).strip())
+        if 'SmallVectorImpl' in ty: return out
+        if b.endswith('Adaptor') or b in ('DictionaryAttr', 'OpaqueProperties', 'RegionRange', 'PropertyRef'): return Self()
+        if b == 'ValueRange': return [V(t) for t in op.ins]
+        return None
+    try:
+        rv, env = _run_fn(Interp(op), inf[0], inf[1], am)
+    except CppUnknown: raise
+    except InvariantFail: return None
+    except RecursionError: raise CppUnknown('递归')
+    except Exception as e:
+        STATS['python 异常'] += 1; raise CppUnknown(f'解释器异常 {type(e).__name__}: {e}')
+    if isinstance(rv, Diag) or (isinstance(rv, LR) and not rv.ok): return None
+    res = [nm_ for ty, nm_, _ in _params(inf[0]) if 'SmallVectorImpl' in ty]
+    got = env.get(res[0]) if res else out
+    if not isinstance(got, list): return None
+    got = [x.t if isinstance(x, V) else x for x in got]
+    return got if all(isinstance(x, tuple) for x in got) else None
+
+def infer_fn(S):
+    """S['cppinfer']：(操作数组类型表, 属性) → 结果类型表 | None | odssig.XF_UNK。"""
+    import odssig as G
+    dia = S['op'].split('.')[0]
+    def f(groups, attrs):
+        try: return infer_types(dia, S['op'], S, groups, attrs)
+        except CppUnknown: return G.XF_UNK
+    return f
 
 def rule_infer(S):
     """nf 原子：InferTypeOpInterface 的结果类型校验，按 C++ inferReturnTypes/isCompatibleReturnTypes 解释执行。→ (rel, 完备?) 或 None。"""

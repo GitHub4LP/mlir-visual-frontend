@@ -10,13 +10,21 @@ def infer_types(n, ins_t):
     """ODS 推断规则（odssig.sig 的 S['infer']）的具体求值；没有规则 ⇒ None（结果保持字面量）；规则求不出 ⇒ 'fail'。"""
     import odssig as G
     lk = G.lookup(n['op'])
-    if lk is None or not lk[1].get('infer'): return None
+    import nfrules as _NFc
+    if lk is None or not (lk[1].get('infer') or (lk[1].get('cppinfer') and _NFc.CPPINFER_FWD)): return None
     S = lk[1]; seg = None
     a = (n['props'].get('_attrs') or {}).get('operandSegmentSizes')
     if a:
         import irimport as I; seg = I._segs(a) or None
     gi = G.bind(S, ins_t, S['ins'], seg)
     if gi is None: return 'fail'
+    if not S.get('infer'):                                # 第 80 轮：C++ inferReturnTypes（等式语义的 op）解释执行；与 odscomp._cpp_result_exprs 同一函数
+        import attrsig as A_
+        try: at = A_.from_core(n)
+        except Exception: return None
+        r = S['cppinfer']([list(g) for g in gi], at)
+        if r is G.XF_UNK: return None
+        return 'fail' if r is None else r
     env = {nm: ts for (nm, *_), ts in zip(S['ins'], gi)}
     out = []
     for nm, *_ in S['outs']:

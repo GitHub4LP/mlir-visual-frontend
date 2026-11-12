@@ -82,11 +82,11 @@
 | E1 非符号：组 / 用例 | 895 / 6972（MLIR 接受 993、拒绝 5979） |
 | E1 非符号：违例 | **0** |
 | E1 符号层（单列）：用例 / 违例 | 1387 / **373**（全部为 sym_name：两处各自合法，同时换成同名即重名） |
-| E2 用例 | 3958：我们拒且 MLIR 拒 1601，我们收而 MLIR 拒 1909，都收 448，**误拒 0** |
+| E2 用例（二跑，见下） | 3958：我们拒且 MLIR 拒 2638，我们收而 MLIR 拒 872，都收 448，**误拒 0** |
 
 **结论**：
 1. L10 对非符号属性成立（B，真实 IR）；对符号属性不成立——符号唯一性本来就是跨使用点约束。规范收窄：符号名、符号引用不能作复合 op 参数，判 Unknown 并警告。当前实现（defs.derive_params 只开放 IntegerAttr 与 overflow 标志）本来就不接受符号参数，无需改代码。
-2. E2 的精度缺口很大：MLIR 拒绝的 3510 例中我们只先抓到 1601（46%）。剩余部分来自关系约束与 C++ verify，以及 attrsig 未单独建模的 property 存储类型；这只影响诊断时机（MLIR 预言机兜底），不影响可靠性。未按原因分类，列为下一步。
+2. E2 精度：MLIR 拒绝的 3510 例中我们先抓到 2638（75%）。首跑只用 attrsig.check（属性自身约束），得 1601（46%），是低估：使用点约束还包括引用该属性的 op 级关系（attrsig.rel_check，如 arith.constant 的 AllTypesMatch<value, result>）。二跑在看过首跑缺口分类后改为两者合取，误拒判据不变（只会更严），E1 数字不受影响。剩余 872 例按 (op, 属性)：func.func function_type 294（与入口块参数的一致性，由结构层负责，不是属性编辑器的值域）；tensor.extract_slice / memref.subview 的 static_* 共 257（与动态操作数个数、秩的关系，C++ verify）；arith.constant value 46（rel_check 未覆盖的情形，未细查）；affine.apply map 27、vector.transfer_write permutation_map/in_bounds 40、tensor.collapse_shape reassociation 21（与类型秩的关系，C++ verify）。这些只影响诊断时机（MLIR 预言机兜底），不影响可靠性；前端属性编辑器对这类属性的值域偏宽，须标“依赖操作数/类型，最终由 MLIR 判定”。
 
 **过程问题（须明示）**：
 - 首次小样本试跑发现两处测试本身的错误，均在全量前修正：(a) Python 绑定的属性 setter 对 property 类型不符时静默丢弃，不报错；同样的文本交给解析器会被拒（`Invalid attribute in property conversion`，已直接验证）。故改为读回不等即判 MLIR 拒。(b) E2 起初把其它必需属性缺失也算作拒绝，造成假误拒 16 例；改为只看被替换的属性。
