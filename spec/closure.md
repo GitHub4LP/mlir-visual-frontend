@@ -620,7 +620,7 @@ R_j(t) ≝ ∃ 其余端口. Φ_comp，即用户需求里“签名允许的最�
 **检验**（cppverify_test 新增 I1–I3，判据运行前写定；5 段 `100 0`/`200 100`/`270 200`/`340 270`/`400 340`，非空阈值按合计）：
 - I1 MLIR 接受 ⇒ decide_infer 不拒绝：比较 1840（22/481/1330/7/0），拒绝 1468，误拒 0。
 - I2 infer 完备 op 上 MLIR 报 "failed to infer returned types" 或 "inferred type(s) … incompatible" ⇒ 拒绝：诊断 80（2/53/25/0/0），漏判 0。（多数推断失败的变异先被 ODS 约束或其他诊断报出，故诊断数远少于拒绝数。）
-- I3 完备 op 运行时未定 0。按段 I1/I2 在语料不含这些 op 的段 FAIL（非空阈值），合计满足。
+- I3 完备 op 运行时未定 0。按段 I1/I2 在语料不含这些 op 的段 FAIL（非空阈值），合计满足。（注：此处 I3 = 0 对 memref.extract_strided_metadata 是空检验——双可变结果组不可绑定，测试跳过该 op；第 81 轮补切分后才实际检验，见 §9.21。）
 - C1 比较 45170 误拒 0；C2 诊断 1740 漏判 0（与第 79 轮同，第 4、5 段低于单段阈值）；C3 0；C5 比较 38863（MLIR 拒绝 26742），误拒 0、误收 0（分母比第 79 轮多 1840，即新进入“残差为空”的 op）。
 
 **检验中发现并修正的错误（均在本轮代码内）。**
@@ -651,3 +651,32 @@ R_j(t) ≝ ∃ 其余端口. Φ_comp，即用户需求里“签名允许的最�
 **回归（最终代码）。** cppverify_test 5 段：C1 45170 误拒 0；C2 1740 漏判 0（第 4、5 段低于单段阈值，按段 FAIL，合计满足）；C3 0；C5 39355（MLIR 拒绝 27202）误拒 0、误收 0；I1 2332（拒绝 1928）误拒 0；I2 176 漏判 0；I3 0。odscomp S1–S4 两段 PASS（12375 + 15585）；projcomp P1/P2/P4/P5 两段 PASS；regcomp R1/R2 两段 PASS（点未定 1042 + 1162）；nfiface N2a/b/d 两段 PASS；scf N2g-a/b/d PASS；core T1/T2 PASS；odsdiff T1 PASS（infer 分歧 1）；odssig L1 PASS（误收 3800，按账目分歧 0）；attrsig A1/A2 PASS；clauses K1–K6/M2.7 PASS。仍 FAIL（同前，判据未改）：regflow F2（增益 15、3）、F4 第二段（增益 10）。nf_test N1 两批 PASS（比较 40500 + 16704）；packconst N2e PASS（比较 1600）。仍 FAIL：winograd N2f（filter 接受 25 < 30，误拒/误收 0，同前）。nfiface 第二段因并发环境重装重跑一次，PASS（N2a 32675、N2d 30300）。
 
 **边界。** 最大性现在覆盖：ODS 推断、TypesMatchWith 变换、区域类型流入口边、以及这 5 个 op 的 C++ 推断。有兼容覆盖的推断 op 与无推断的 op 结果仍取写定类型。
+
+### 9.22 解释器词汇：reshape / 步长布局 / SaturatedInteger；解释器语义修正（第 82 轮）
+
+**目标。** 按“一个构造解锁多个 op”扩 cppverify 词汇，先解开 J2 被阻断的 reshape 切片。
+
+**新词汇**（依据 9bae84b0 源码；新增共用源 `Dialect/Utils/ReshapeOpsUtils.{h,cpp}`，排在方言文件之后，同名时方言优先）：
+- llvm::map_range、to_vector / to_vector<N>、reverse、drop_end、多范围 enumerate（不等长 ⇒ 断言崩溃）、enumerate 结果的 index()/value()、std::get<k> 的静态登记、std::move、Twine、std::string / std::to_string、APInt(w, v)。
+- SaturatedInteger（StaticValueUtils.h，逐行照抄 wrap / asInteger / desaturate / + / * / == 与数据成员 saturated、v）；`*FailureOr` 在 failure 上断言崩溃。
+- MemRefType::getStridesAndOffset 两种形式（输出形参 / pair）；一般仿射布局交给 MLIR 自身（Python 绑定 `get_strides_and_offset`，提取失败 ⇒ 无步长）。StridedLayoutAttr::get（打印形由 MLIR 给出）；MemRefType::get 接受 strided 布局；布局 isIdentity 按接口缺省实现 `getAffineMap().isIdentity()`（strided<[1]> 为恒等）。
+- AffineExpr 值（getAffine{Dim,Symbol,Constant}Expr、isa/dyn_cast、getPosition、walk 后序）、AffineMap::get(d, s, exprs)、AffineMap.getResults；IntegerAttr::get、ArrayAttr::get；SmallVector 的 resize、append(begin, end)。
+- 重载：`Op::method` 的全部 out-of-line 重载都参与静态完备检查；运行时按实参选重载（只区分 ArrayRef<AffineMap> 与 ReassociationIndices；SmallVector 声明带元素类型，空表也能区分），不唯一 ⇒ CppUnknown。本 op 的静态访问器 `XxxOp::getFooAttrName()`。
+
+**结果。** 有源码的 verify op 中静态完备 89 / 158（新增 8：tensor.expand_shape / collapse_shape / concat，memref.expand_shape / collapse_shape / reinterpret_cast，vector.insert_strided_slice / extract_strided_slice）。declared 条目 226、残差为空的 op 459（650 个 op）；第 80 轮记录为 234、450，第 81 轮未重计。
+
+**解释器语义修正（开发期快检发现，均为潜在错误）：**
+1. 后置 `--` 原按 `++` 求值。核对 inventory：在此之前的 verify 路径都不用后置 `--`（只在 fold、getMaskFormat、dropDims 中出现），旧结果不受影响；本轮新进入的 computeExpandedLayoutMap 用到，首跑表现为误拒。
+2. `SmallVector<T> v(n)` 原作单元素 [n]；现为 n 个值初始化元素（整数 0、bool false，其他元素类型 ⇒ CppUnknown）。
+3. 断言崩溃原在被调函数里被当作返回值 Diag 吞掉（调用方多半按 failure 处理，但也可能被当真值继续）；现为 `_Crash` 直达入口，按拒绝计。
+4. `assert(c)` 原整句跳过；本 MLIR 构建开启断言（闭包各节“断言按拒绝计”的前提），现求值，c 为假 ⇒ 崩溃。静态完备数未因此下降。
+5. 未解析的数据成员访问原在真值/比较中当作恒真/类型；现 ⇒ CppUnknown。
+6. `op != nullptr` 对被校验 op 求值为真（原 ⇒ “op 比较”未定；中间代码 C3 未定 149+7，shape 方言）。
+
+**检验（最终代码，md5 冻结后跑；判据均未改）：**
+- cppverify_test 5 段：C1 比较 45170 误拒 0；C2 完备 op verify 诊断 4159（第 81 轮 1740）漏判 0；C3 未定 0、Python 异常 0；C5 比较 43126（MLIR 拒绝 30408）误拒 0、误收 0；I1 2332 误拒 0；I2 176 漏判 0；I3 0。按段 I1/I2 在不含 infer op 的段低于非空阈值（同前），合计满足。
+- cppinfer_test：J1 **FAIL**（违例 5）、J2 **FAIL**（增益 18 < 20，MLIR 全部接受）、J3 PASS（Φ_新 拒绝 528，MLIR 接受 0）。J1 的 5 例全是 extract_strided_metadata → reinterpret_cast 切片：Φ_新 值为真，但残差里有 `reinterpret_cast: 接口 verify: OffsetSizeAndStrideOpInterface::Trait`。原因：reinterpret_cast 的 C++ verify 本轮变为完备，Φ_旧 下它的操作数都取写定类型，接口残差是定值（P.ground），残差为空；Φ_新 下 base 由 C++ 推断前推、随端口变，同一条接口残差不再是定值。这不是判错，是 J1 判据假设“Φ_旧 接受 ⇒ Φ_新 接受”在残差重分类时不成立；消除它要把 OffsetSizeAndStrideOpInterface 的 verify 规范化（下一步）。J2 仍被 subview、alloca 的切片阻断。
+- 回归：odscomp S1–S4 两段 PASS（12375 + 15585；S3 误拒 0，残差为空误收 0）；projcomp P1/P2/P4/P5 两段 PASS；regcomp R1/R2 两段 PASS（点未定 1033 + 945）；regflow F1 两段 PASS，F4 第一段 PASS；nfiface N2a/b/d 两段 PASS（7550 + 32675）；scf N2g-a/b/d PASS；nf_test N1 两批 PASS（40500 + 16704）；core T1/T2 PASS；odsdiff T1 PASS（infer 分歧 1）；odssig L1 PASS（误收 3800，按账目分歧 0）；attrsig A1/A2 PASS；clauses K1–K6/M2.7 PASS；packconst N2e PASS。仍 FAIL（判据未改）：regflow F2（增益 15、4；第 81 轮 15、3）、F4 第二段（增益 10）；winograd N2f（filter 接受 25 < 30，误拒/误收 0）。
+- regflow 第二段首跑时另一作业重装了环境，已重跑，结果相同。
+
+**仍不能说：** memref.subview、alloca 等仍不完备；J1、J2 未通过；OffsetSizeAndStrideOpInterface 等接口 verify 仍是 declared。
