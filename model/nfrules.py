@@ -1260,6 +1260,7 @@ def _body_rule(S):
 
 _apply0 = apply
 CPPINFER_FWD = True       # 第 80 轮：等式语义 op 的 C++ inferReturnTypes 用于正向推导（odscomp._cpp_result_exprs、composite.infer_types）；检验时切换比较
+CPPIFACE = True           # 第 83 轮：接口 verify 解释执行（cppverify.rule_iface）
 CPPVERIFY = True          # 第 78 轮：C++ verify 解释执行（cppverify.py），对全部仍含 'C++ verify()' 残差的 op 一次生效
 def apply(S, reg=None):
     S = _apply0(S, reg)
@@ -1283,6 +1284,15 @@ def apply(S, reg=None):
             if complete:
                 done = [k for k in infer_keys if k in S['declared']]
                 S['nf_covered'] = S.get('nf_covered', []) + done; S['declared'] = [d for d in S['declared'] if d not in done]
+    if ENABLED and CPPVERIFY and CPPIFACE and (reg is None or reg is REG):     # 第 83 轮：接口 verify 按 C++ 源解释执行（手写 REG/IFACE 已覆盖的不再重复）
+        import cppverify as _CV
+        for d_ in [d_ for d_ in S['declared'] if d_.startswith('接口 verify: ') and 'InferTypeOpInterface' not in d_]:
+            got = _CV.rule_iface(S, d_.split(': ', 1)[1])
+            if got is None: continue
+            r, complete = got
+            S = dict(S); S['rel'] = S['rel'] + [r]
+            if complete:
+                S['nf_covered'] = S.get('nf_covered', []) + [d_]; S['declared'] = [x for x in S['declared'] if x != d_]
     if ENABLED and (reg is None or reg is REG) and any('LinalgOp::Trait' in d for d in S.get('nf_covered', [])) \
             and S['ins'] and S['ins'][-1][0] in ('outputs', 'init', 'inits'):
         S = dict(S); S['rel'] = S['rel'] + [_body_rule(S)]

@@ -12,6 +12,13 @@
   I2 漏判 0：infer 静态完备的 op 上，MLIR 在该 op 报 "failed to infer returned types" 或 "inferred type(s) … incompatible" ⇒ decide_infer 拒绝；此类诊断合计 ≥ 30。
   I3 未定 0：infer 静态完备的 op，运行时不得 CppUnknown。
   C5 同时覆盖因 infer 规则而残差为空的 op。
+第 83 轮（接口 verify 的 C++ 源解释执行：ODS 接口记录的 verify 体 + 接口方法缺省体 + Interfaces/*.cpp，运行前写定）：
+  IF1 误拒 0：MLIR 接受 ⇒ decide_iface 不拒绝（全部带接口 verify 的 op，完备与否）。
+  IF2 漏判 0：(op, 接口) 静态完备时，MLIR 在该 op 报出来自该接口 verify 调用树的诊断（去前缀后以其源码字面量开头，且该字面量前缀
+      不短于 op 自身 verify 及其他接口的最长匹配字面量——开发快检发现单独的 'expected' 会把 op verify 的诊断归给接口，正式运行前补写）⇒ decide_iface 拒绝；
+      此类诊断合计 ≥ 20。
+  IF3 未定 0：(op, 接口) 静态完备时，运行时不得 CppUnknown。
+  C5 同时覆盖因接口规则而残差为空的 op。
   只报告：不完备 op 的判定率、拒绝时消息与 MLIR 诊断一致的比例。
 原类型独立成函数后 MLIR 即拒绝的实例（父 op 要求、符号等）整例跳过。MLIR 崩溃按拒绝计，不计入 C2。
 运行：PYTHONPATH=model python3 model/cppverify_test.py [语料文件上限] [起点]
@@ -57,11 +64,15 @@ def run_file(path, q, seed):
                 S0 = G.sig(dia, n['op'])
                 has_v = 'C++ verify()' in S0['declared']
                 has_i = any(k in S0['declared'] for k in ('C++ inferReturnTypes', '接口 verify: InferTypeOpInterface::Trait')) and CV.infer_source(dia, n['op'])[1] is not None
-                if not has_v and not has_i: continue
+                ifs = [d_.split(': ', 1)[1] for d_ in S0['declared'] if d_.startswith('接口 verify: ') and CV.iface_source(dia, n['op'], d_.split(': ', 1)[1]) is not None
+                       and 'InferTypeOpInterface' not in d_]
+                if not has_v and not has_i and not ifs: continue
                 if any(isinstance(v, str) and '@' in v for v in ((n.get('props') or {}).get('_attrs') or {}).values()): continue
                 S = lk[1]
                 if has_v and not CV.has_source(dia, n['op']): has_v = False
-                if not has_v and not has_i: continue
+                if not has_v and not has_i and not ifs: continue
+                complete_f = {t_: CV.completeness(dia, n['op'], 'iface:' + t_)[0] for t_ in ifs}
+                lits_f = {t_: CV.iface_literals(dia, n['op'], t_) for t_ in ifs}
                 complete = has_v and CV.completeness(dia, n['op'])[0]
                 complete_i = has_i and CV.completeness(dia, n['op'], 'infer')[0]
                 full = not S['declared'] and not S['unknown']
@@ -99,7 +110,7 @@ def run_file(path, q, seed):
                     a_ = node['props'].get('_attrs', {}).get('operandSegmentSizes')
                     if a_: seg = I._segs(a_) or None
                     gi = G.bind(S, ins_t, S['ins'], seg); go = G.bind(S, outs_t, S['outs'])
-                    verdict = 'skip'; vi = 'skip'
+                    verdict = 'skip'; vi = 'skip'; vf = {}
                     if gi is not None and go is not None:
                         try: at = A.from_core(node)
                         except Exception: at = None
@@ -110,6 +121,9 @@ def run_file(path, q, seed):
                         if at is not None and has_i:
                             try: vi = CV.decide_infer(dia, n['op'], S, gi + go, at)[0]
                             except CV.CppUnknown as e: vi = None; note('infer 未定', f"{n['op']}: {str(e)[:90]}")
+                        for t_ in (ifs if at is not None else []):
+                            try: vf[t_] = CV.decide_iface(dia, n['op'], S, gi + go, at, t_)
+                            except CV.CppUnknown as e: vf[t_] = None; note('接口 未定', f"{n['op']} {t_}: {str(e)[:90]}")
                     text = OR.emit_core(bs, '(' + ', '.join(T) + ') -> ()')
                     if text is None: st['不可发射'] += 1; continue
                     tr, diags = OR.get().verify(text)
@@ -128,6 +142,18 @@ def run_file(path, q, seed):
                             st['I 拒绝'] += vi is False
                             if ok and vi is False: st['I1 误拒'] += 1; note('I1 误拒', f"{n['op']} {kind} {T} {mu}")
                             if idg and complete_i and vi is not False: st['I2 漏判'] += 1; note('I2 漏判', f"{n['op']} {kind} {T} {mu} {' '.join(d[1] for d in diags)[:100]}")
+                    def _best(m_, ls): return max((min(len(s_), 40) for s_ in ls if strip(m_).startswith(s_[:40])), default=0)
+                    for t_, r_ in vf.items():
+                        # 归属：诊断以该接口字面量开头，且该前缀不短于 op 自身 verify 与其他接口的最长匹配字面量（短字面量如 'expected' 不得把别处的诊断归给接口）
+                        fd = tr != 'crash' and any(l == node['id'] and _best(m_, lits_f[t_]) > 0 and _best(m_, lits_f[t_]) >= max([_best(m_, lits)] + [_best(m_, lits_f[u_]) for u_ in ifs if u_ != t_])
+                                                   for l, m_ in diags)
+                        st['IF 比较'] += 1; st['IF 诊断/complete'] += fd and complete_f[t_]
+                        if r_ is None:
+                            if complete_f[t_]: st['IF3 未定'] += 1; note('IF3', f"{n['op']} {t_} {kind} {T} {mu}")
+                        else:
+                            st['IF 拒绝'] += r_[0] is False
+                            if ok and r_[0] is False: st['IF1 误拒'] += 1; note('IF1 误拒', f"{n['op']} {t_} {kind} {T} {mu} {r_[1]!r}")
+                            if fd and complete_f[t_] and r_[0] is not False: st['IF2 漏判'] += 1; note('IF2 漏判', f"{n['op']} {t_} {kind} {T} {mu} {' '.join(d[1] for d in diags)[:100]}")
                     if not has_v:
                         verdict = 'skip'
                     st['比较'] += has_v; st[f'比较/{tag}'] += has_v; st['MLIR 接受'] += ok and has_v; st['MLIR 崩溃'] += tr == 'crash' and has_v
@@ -182,5 +208,8 @@ if __name__ == '__main__':
     V.check('I1 infer 无误拒', tot['I 比较'] >= 100 and tot['I1 误拒'] == 0, f"比较 {tot['I 比较']}，拒绝 {tot['I 拒绝']}，误拒 {tot['I1 误拒']}")
     V.check('I2 infer 诊断必拒', tot['I 诊断/complete'] >= 30 and tot['I2 漏判'] == 0, f"诊断 {tot['I 诊断/complete']}，漏判 {tot['I2 漏判']}")
     V.check('I3 infer 无未定', tot['I3 未定'] == 0, f"未定 {tot['I3 未定']}")
+    V.check('IF1 接口 verify 无误拒', tot['IF 比较'] >= 100 and tot['IF1 误拒'] == 0, f"比较 {tot['IF 比较']}，拒绝 {tot['IF 拒绝']}，误拒 {tot['IF1 误拒']}")
+    V.check('IF2 接口诊断必拒', tot['IF 诊断/complete'] >= 20 and tot['IF2 漏判'] == 0, f"诊断 {tot['IF 诊断/complete']}，漏判 {tot['IF2 漏判']}")
+    V.check('IF3 接口无未定', tot['IF3 未定'] == 0, f"未定 {tot['IF3 未定']}")
     print(f"不完备 op：比较 {tot['比较/partial']}，判定 {tot['判定/partial']}，拒绝 {tot['拒绝/partial']}，未定 {tot['未定/partial']}；消息一致 {tot['消息一致']}/{tot['消息比较']}")
     V.finish()

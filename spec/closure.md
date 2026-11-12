@@ -680,3 +680,31 @@ R_j(t) ≝ ∃ 其余端口. Φ_comp，即用户需求里“签名允许的最�
 - regflow 第二段首跑时另一作业重装了环境，已重跑，结果相同。
 
 **仍不能说：** memref.subview、alloca 等仍不完备；J1、J2 未通过；OffsetSizeAndStrideOpInterface 等接口 verify 仍是 declared。
+
+### 9.23 接口 verify 解释执行（第 83 轮）
+
+**目标。** 接口 trait 的 verify 与 op 自身的 C++ verify 用同一个解释器批量规范化，消除第 82 轮 J1 的 5 例违例（接口残差随端口分类漂移）。
+
+**机制**（依据 9bae84b0）：
+- 体：ODS 接口记录的 `verify` 字段（`$_op` ⇒ 被校验 op 自身）；`verifyWithRegions` 的接口不在此列（RegionBranch、LoopLike 等，仍为 declared）。
+- 自由函数：`mlir/lib/Interfaces/*.cpp` 加入共用源（排在方言文件之后，同名时方言优先），如 verifyOffsetSizeAndStrideOp、verifyCastInterfaceOp、verifyShapedDimOpInterface、verifyMemorySpaceCastOpInterface。
+- 接口方法：op 自身未定义时，取接口记录方法的 methodBody / defaultBody，再取接口的 extraSharedClassDeclaration / extraTraitClassDeclaration / extraClassDeclaration 中类体顶层的内联方法。
+- `cast<接口>(op)`：op 实现该接口 ⇒ 自身；否则 ⇒ CppUnknown。
+- 静态完备：`completeness(dia, op, 'iface:' + trait)`；完备 ⇒ 该 `接口 verify: …` 条目移出残差（nfrules.CPPIFACE，排在手写 REG/IFACE 之后，已被手写规则覆盖的不重复）。
+
+**新词汇 / 修正：**
+- `Type::getTypeID()`：由 MLIR Python 绑定解析类型给出 TypeID 比较。`isa<PtrLikeTypeInterface>`：内建类型中只有 memref（含无秩）为真，tensor/vector/标量等为假，方言类型 ⇒ CppUnknown。
+- **布局比较（修正）**：`MemRefLayoutAttrInterface` 值原无相等定义，`==`/`!=` 按对象身份比较（`!=` 恒真）。现按 MLIR 解析后的布局属性比较（恒等仿射映射由 MLIR 规范化为缺省；不同秩各按自身秩规范化）。快检中 memory_space_cast 的 CastOpInterface 因此误拒 4 例后发现。此前轮次凡走到布局比较的 verify 路径都可能受影响；各轮 C1/C5 均未暴露误拒/误收，但不能据此断言无影响。
+
+**结果。** 静态完备的（op，接口）对 14：OffsetSizeAndStrideOpInterface 3（memref.reinterpret_cast、memref.subview、tensor.parallel_insert_slice）、CastOpInterface 8（index.casts/castu、tensor.bitcast、memref.cast、memref.memory_space_cast、shape.size_to_index、shape.to_extent_tensor、transform.cast）、ShapedDimOpInterface（memref.dim）、MemorySpaceCastOpInterface（memref.memory_space_cast）、SubsetOpInterface（bufferization.materialize_in_destination）。declared 条目 226 → 212（其中接口 verify 140 → 126），残差为空的 op 459 → 468（650 个 op）。仍不完备：arith.scaling_extf/truncf 的 CastOpInterface（WidthComparator / type_list 模板）、linalg.fill 的 FillOpInterface（OpOperand）、Symbol/Function/Branch/DataLayout/InParallel/Transform 接口（父 op、符号表、后继、区域）。
+
+**判据（运行前写入 cppverify_test）：** IF1 MLIR 接受 ⇒ 不拒绝；IF2 （op，接口）完备时，归属于该接口 verify 的诊断 ⇒ 拒绝，合计 ≥ 20；IF3 完备时无未定。**披露：** IF2 的诊断归属在开发快检后、正式运行前补写为“最长匹配字面量”——单独的字面量 'expected'（接口源码中 `emitError("expected ") << …`）会把 op 自身 verify 的诊断归给接口（快检中 subview 967 例）。
+
+**检验（最终代码；其余判据均未改）：**
+- cppverify_test 5 段：IF1 比较 12669、误拒 0；IF2 诊断 3698、漏判 0；IF3 0。C1 比较 45170 误拒 0；C2 诊断 4159 漏判 0；C3 0；C5 比较 46757（MLIR 拒绝 32826）误拒 0、误收 0；I1 2332 误拒 0；I2 176 漏判 0；I3 0（I1/I2 在不含 infer op 的段低于单段阈值，按合计满足，同前）。
+- cppinfer_test：**J1 PASS**（违例 5 → 0，点未定 9）；J2 **仍 FAIL**（增益 18 < 20，误收 0；subview 自身 verify 与 alloca 仍不完备）；J3 PASS（Φ_新 拒绝 540，MLIR 接受 0）。
+- 回归：odscomp S1–S4 两段 PASS（S3 残差非空误收 26 + 2）；projcomp 两段 PASS；regcomp R1/R2 两段 PASS（点未定 1167 + 2501，第 82 轮 1033 + 945；R2 残差非空误收 15 + 0，第 82 轮 46 + 293）；regflow F1、F4 第一段 PASS；nfiface N2a/b/d 两段 PASS；scf N2g PASS；nf_test N1 两批 PASS；packconst N2e PASS；core T1/T2 PASS；odsdiff T1 PASS；odssig L1 PASS（误收 3692，第 82 轮 3800）；attrsig A1/A2 PASS；clauses K1–K6/M2.7 PASS。仍 FAIL（同前，判据未改）：regflow F2（增益 15、4）、F4 第二段（增益 10）、winograd N2f（filter 接受 25 < 30，误拒/误收 0）。
+- 点未定上升主要来自 linalg.fill：其 FillOpInterface 规则不完备，运行时在首个 OpOperand 访问处 CppUnknown，原“残差非空但判接受”的点变为点未定（R2 残差非空误收 293 → 0 同源）。这与 C++ verify 不完备规则的既有处理一致：不猜，记未定。
+- 环境：cv3/cv4 与 attrsig/odssig 各有一段运行时另一作业重装了环境；四段均无导入/tblgen 错误、文件崩溃 0，结果保留。
+
+**仍不能说：** 接口 verify 已全部解释执行；J2 通过；memref.subview / alloca 已完备；linalg.fill 已规范化。

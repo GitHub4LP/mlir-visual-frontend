@@ -333,7 +333,8 @@ def _dialect_files(dia):
     # 第 82 轮：方言共用的工具源（Dialect/Utils/ReshapeOpsUtils.{h,cpp}）排在方言自身文件之后，同名时方言文件优先
     return sorted(set(out)) + [os.path.join(CPP_DIR, x) for x in SHARED_SRC if os.path.exists(os.path.join(CPP_DIR, x))]
 
-SHARED_SRC = ('Utils_ReshapeOpsUtils.h', 'Utils_ReshapeOpsUtils.cpp')
+SHARED_SRC = ('Utils_ReshapeOpsUtils.h', 'Utils_ReshapeOpsUtils.cpp') + tuple(sorted(os.path.basename(f) for f in glob.glob(os.path.join(CPP_DIR, 'Interfaces_*.cpp'))))
+# 第 83 轮：mlir/lib/Interfaces/*.cpp（接口 verify 的自由函数，如 verifyOffsetSizeAndStrideOp、verifyCastInterfaceOp）同样排在方言文件之后
 
 @functools.lru_cache(None)
 def _file(path): return re.sub(r'^\s*#.*$', '', open(path, errors='ignore').read(), flags=re.M)
@@ -455,6 +456,61 @@ def verify_source(dia, opname):
     got = find_method(dia, cls, 'verify')
     return (cls, got[1]) if got else (cls, None)
 
+# ───────────────────────── 第 83 轮：接口 verify（ODS 接口记录的 verify 体；$_op ⇒ 被校验 op 自身）
+def _subst_op(txt): return txt.replace('$_op', '(*this)')
+
+@functools.lru_cache(None)
+def op_ifaces(dia, opname):
+    """op 实现的 OpInterface 记录（含 DeclareOpInterfaceMethods 指向的具名记录）→ [(trait 名, 记录)]。"""
+    import odsjson as O, odssig as G
+    d = O.records(dia); r = d[O.ops(dia)[opname]]; out = []
+    for name, tr in [x for t in r['traits'] for x in G._traits(d, t, [])]:
+        t = tr.get('trait', '')
+        rec = G._iface(d, t) if t else None
+        if rec is not None and rec.get('methods') is not None and (t, rec) not in out: out.append((t, rec))
+    return out
+
+def iface_source(dia, opname, trait):
+    """→ (cls, 体) 或 None：接口 trait 的 verify 体（verifyWithRegions 的接口不在此列，返回 None）。"""
+    for t, rec in op_ifaces(dia, opname):
+        if t == trait:
+            v = rec.get('verify') or ''
+            if not v.strip() or str(rec.get('verifyWithRegions')) in ('1', 'True'): return None
+            return (verify_source(dia, opname)[0], _subst_op(v))
+    return None
+
+@functools.lru_cache(None)
+def iface_methods(dia, opname):
+    """接口方法的缺省体（methodBody / defaultBody；$_op ⇒ 自身）：{名字: (参数表, 体)}，先出现者优先。"""
+    import odsjson as O
+    d = O.records(dia); out = {}
+    for t, rec in op_ifaces(dia, opname):
+        for m in rec.get('methods') or []:
+            mm = d.get(m['def']) if isinstance(m, dict) and 'def' in m else m
+            if not isinstance(mm, dict) or not mm.get('name'): continue
+            body = (mm.get('body') or '').strip() or (mm.get('defaultBody') or '').strip()
+            if not body or mm['name'] in out: continue
+            params = ', '.join(f'{ty} {nm}' for ty, nm in O.dag_args(mm['arguments']))
+            out[mm['name']] = (params, _subst_op(body))
+    for t, rec in op_ifaces(dia, opname):                                   # 接口/trait 上的内联方法（extra*ClassDeclaration）
+        for fld in ('extraSharedClassDeclaration', 'extraTraitClassDeclaration', 'extraClassDeclaration'):
+            s = rec.get(fld) or ''
+            if not isinstance(s, str) or not s.strip(): continue
+            s = _subst_op(s)
+            for m in re.finditer(r'(?:^|\n|;|\})\s*(?:static\s+|inline\s+|virtual\s+)*[\w:<>,\s\*&]+?\b([A-Za-z_]\w*)\s*\(([^)]*)\)\s*(?:const\s*)?\{', s):
+                if m.group(1) in ('if', 'for', 'while', 'switch', 'return'): continue
+                pre = s[:m.start(1)]
+                if pre.count('{') - pre.count('}') != 0: continue          # 只取类体顶层的方法定义（不取方法体内的 lambda/局部调用）
+                out.setdefault(m.group(1), (m.group(2), _body_at(s, m.end())))
+    return out
+
+def _iface_names(dia, opname):
+    """op 实现的接口 C++ 类名（cast<X>(op) 用）。"""
+    out = set()
+    for t, rec in op_ifaces(dia, opname):
+        out.add(t.split('::')[0]); out.add(rec.get('cppInterfaceName') or '')
+    return out - {''}
+
 # ───────────────────────── 值
 class Op:
     """被校验的 op：ODS 端口组（已绑定的类型）与属性。"""
@@ -487,6 +543,24 @@ class LR:                # LogicalResult
 OK, FAIL = LR(True), LR(False)
 class Layout:
     def __init__(self, txt, rank=None): self.txt, self.rank = txt, rank
+    def __eq__(self, o):                                                  # 第 83 轮：布局属性相等（MLIR 解析后比较；恒等仿射映射由 MLIR 规范化为缺省）
+        if not isinstance(o, Layout): return NotImplemented
+        if self.rank is None or o.rank is None: raise CppUnknown('布局比较（秩）')   # 不同秩：各按自身秩规范化（恒等映射的维数不同 ⇒ 不等）
+        return _layout_canon(self.txt, self.rank) == _layout_canon(o.txt, o.rank)
+    def __ne__(self, o):
+        r = self.__eq__(o)
+        return r if r is NotImplemented else not r
+    def __hash__(self): return 0
+def _typeid(t):
+    import mlir.ir as ir
+    try: return ir.Type.parse(TS.show(t), _ctx()).typeid
+    except Exception: raise CppUnknown('getTypeID（类型不可解析）')
+@functools.lru_cache(None)
+def _layout_canon(txt, rank):
+    import mlir.ir as ir
+    shape = 'x'.join(['?'] * rank) + ('x' if rank else '')
+    try: return str(ir.MemRefType(ir.Type.parse(f'memref<{shape}f32' + (f', {txt}' if txt else '') + '>', _ctx())).layout)
+    except Exception: raise CppUnknown('布局不可解析')
 class Space:
     def __init__(self, txt): self.txt = txt
     def __eq__(self, o): return isinstance(o, Space) and _norm_space(self.txt) == _norm_space(o.txt)
@@ -619,6 +693,10 @@ def _isa(cls, x):
     if isinstance(x, Attr) and b in ('Attribute', 'OpFoldResult'): return True
     if isinstance(x, tuple):
         if b in TYPE_CLASSES: return TYPE_CLASSES[b](x)
+        if b == 'PtrLikeTypeInterface':                                   # 第 83 轮：内建类型中只有 MemRefType/UnrankedMemRefType 实现；方言类型未建模
+            if x[0] == 'memref': return True
+            if x[0] in ('tensor', 'vector', 'index', 'i', 'f', 'complex', 'tuple', 'none', 'func'): return False
+            raise CppUnknown('isa<PtrLikeTypeInterface> 于方言类型')
         import odsjson as O                      # 方言 ODS 类型（!shape.size 等）：按 TypeDef 的拼写判定
         m_ = re.fullmatch(r'(?:::)?(?:mlir::)?(\w+)::(\w+)', cls)
         ns = m_.group(1) if m_ else CUR['dia']
@@ -629,6 +707,10 @@ def _isa(cls, x):
         if sp is not None: return xo[1].strip() == sp
         raise CppUnknown(f'isa<{b}> 于类型')
     if isinstance(x, Attr): return _attr_isa(b, x.a, cls)
+    if isinstance(x, Self):                                               # 第 83 轮：cast<接口>(op) / isa<Op 类>(op)
+        dia_, opn_ = CUR.get('dia'), CUR.get('opname')
+        if b in ('Operation', 'OpState') or opn_ and b in _iface_names(dia_, opn_) or opn_ and b == verify_source(dia_, opn_)[0]: return True
+        raise CppUnknown(f'isa<{b}> 于 op')
     if isinstance(x, AExpr):                                              # 第 82 轮
         if b == 'AffineExpr': return True
         if b in ('AffineDimExpr', 'AffineSymbolExpr', 'AffineConstantExpr', 'AffineBinaryOpExpr'): return _aexpr_kind(x.e)[0] == b
@@ -667,7 +749,7 @@ def _attr_isa(b, a, full=None):
 
 # ───────────────────────── 解释器
 TYPE_METHODS = {'getRank', 'getShape', 'getElementType', 'getDimSize', 'isDynamicDim', 'getNumDynamicDims', 'hasStaticShape', 'hasRank',
-                'getNumElements', 'getMemorySpace', 'getLayout', 'isIndex', 'isInteger', 'isSignlessInteger', 'isSignless', 'isUnsigned', 'isSigned',
+                'getNumElements', 'getMemorySpace', 'getLayout', 'getTypeID', 'isIndex', 'isInteger', 'isSignlessInteger', 'isSignless', 'isUnsigned', 'isSigned',
                 'isIntOrFloat', 'isIntOrIndex', 'isIntOrIndexOrFloat', 'isF16', 'isF32', 'isF64', 'isBF16', 'getIntOrFloatBitWidth', 'getWidth',
                 'getScalableDims', 'isScalable', 'getElementTypeBitWidth', 'isSignedInteger', 'isUnsignedInteger', 'getNumScalableDims', 'isSignlessIntOrIndex',
                 'isSignlessIntOrIndexOrFloat', 'isSignlessIntOrFloat', 'getDynamicDimIndex'}
@@ -1331,6 +1413,7 @@ class Interp:
             if t[0] != 'vector': _crash()
             return any(_scal(t))
         if m == 'getNumScalableDims': return sum(_scal(t))
+        if m == 'getTypeID': return _typeid(t)                         # 第 83 轮：类型的 C++ 类（MLIR 绑定给出 TypeID）
         if m == 'isIndex': return t[0] == 'index'
         if m == 'isInteger':
             if not args: return t[0] == 'i'
@@ -1456,6 +1539,9 @@ class Interp:
         if im is not None: return self.invoke(im[0], im[1], args, ())
         fms = find_methods(op.dia, op.cls, m)
         if fms: fm = pick_overload(fms, args); return self.invoke(fm[0], fm[1], args, ())
+        if getattr(op, 'opname', None):
+            ifm = iface_methods(op.dia, op.opname).get(m)                # 第 83 轮：op 未自定义时取接口方法缺省体
+            if ifm is not None: return self.invoke(ifm[0], ifm[1], args, ())
         ff = find_function(op.dia, _base(m), nargs=len(args))
         if ff is not None: return self.invoke(ff[1], ff[2], args, ff[0], targs=targs)
         raise CppUnknown(f'op 方法 {m}')
@@ -1775,7 +1861,7 @@ def decide(dia, opname, S, groups, attrs):
     """→ (True | False, 消息)；不支持 ⇒ CppUnknown。解释器自身的 Python 异常也作 CppUnknown（不猜），并计数。"""
     cls, body = verify_source(dia, opname)
     if body is None: raise CppUnknown('未找到 verify 源码')
-    CUR['dia'] = dia
+    CUR['dia'] = dia; CUR['opname'] = opname
     it = Interp(Op(dia, opname, S, groups, None if attrs is None else {k: v for k, v in attrs.items() if not k.startswith('\x00')}, cls))
     try: return it.run_verify(body)
     except CppUnknown: raise
@@ -1784,6 +1870,34 @@ def decide(dia, opname, S, groups, attrs):
     except Exception as e:
         STATS['python 异常'] += 1; STATS.setdefault('例', []).append(f'{opname}: {type(e).__name__}: {e}'[:160])
         raise CppUnknown(f'解释器异常 {type(e).__name__}: {e}')
+
+def decide_iface(dia, opname, S, groups, attrs, trait):
+    """第 83 轮：接口 trait 的 verify（ODS 接口记录的 verify 体，$_op ⇒ 自身）→ (True | False, 消息)；不支持 ⇒ CppUnknown。"""
+    src = iface_source(dia, opname, trait)
+    if src is None: raise CppUnknown('未找到接口 verify 源码')
+    CUR['dia'] = dia; CUR['opname'] = opname
+    it = Interp(Op(dia, opname, S, groups, None if attrs is None else {k: v for k, v in attrs.items() if not k.startswith('\x00')}, src[0]))
+    try: return it.run_verify(src[1])
+    except CppUnknown: raise
+    except InvariantFail as e: return (False, f'ODS 不变式不满足（接口 verify 不可达）：{e}')
+    except RecursionError: raise CppUnknown('递归')
+    except Exception as e:
+        STATS['python 异常'] += 1; STATS.setdefault('例', []).append(f'{opname} {trait}: {type(e).__name__}: {e}'[:160])
+        raise CppUnknown(f'解释器异常 {type(e).__name__}: {e}')
+
+def rule_iface(S, trait):
+    """→ (nf 规则, 静态完备?) 或 None。"""
+    dia = S['op'].split('.')[0]
+    if iface_source(dia, S['op'], trait) is None: return None
+    import nfrules as NF
+    refs = [('name', nm) for nm, *_ in S['ins']] + [('name', nm) if nm is not None else ('res', k) for k, (nm, *_) in enumerate(S['outs'])]
+    def fn(*a):
+        groups, attrs = list(a[:-1]), a[-1]
+        try: ok, msg = decide_iface(dia, S['op'], S, groups, attrs, trait)
+        except CppUnknown as e: raise NF.NFUnknown(f'接口 verify: {e}')
+        return ok
+    ok, _ = completeness(dia, S['op'], 'iface:' + trait)
+    return ('nf', refs, 'nf', f'接口 verify {trait}（9bae84b0 源码解释执行）', fn, 'opt'), ok
 
 def infer_source(dia, opname):
     """第 80 轮：op 类外定义的 inferReturnTypes 与 isCompatibleReturnTypes → (类名, (参数表, 体) | None, (参数表, 体) | None)。"""
@@ -1804,7 +1918,7 @@ def decide_infer(dia, opname, S, groups, attrs):
     inferReturnTypes 失败 ⇒ 拒绝（"failed to infer returned types"）；否则 isCompatibleReturnTypes(推断, 实际)（op 未覆盖时为逐个相等）。"""
     cls, inf, comp = infer_source(dia, opname)
     if inf is None: raise CppUnknown('未找到 inferReturnTypes 源码')
-    CUR['dia'] = dia
+    CUR['dia'] = dia; CUR['opname'] = opname
     op = Op(dia, opname, S, groups, None if attrs is None else {k: v for k, v in attrs.items() if not k.startswith('\x00')}, cls)
     it = Interp(op)
     out = []
@@ -1838,7 +1952,7 @@ def decide_infer(dia, opname, S, groups, attrs):
 def infer_types(dia, opname, S, in_groups, attrs):
     """第 80 轮：只求 inferReturnTypes（不比较）。→ 类型表 | None（推断失败或断言）；运行时未建模 ⇒ CppUnknown。"""
     cls, inf, _ = infer_source(dia, opname)
-    CUR['dia'] = dia
+    CUR['dia'] = dia; CUR['opname'] = opname
     groups = list(in_groups) + [[] for _ in S['outs']]
     op = Op(dia, opname, S, groups, None if attrs is None else {k: v for k, v in attrs.items() if not k.startswith('\x00')}, cls)
     out = []
@@ -1934,9 +2048,12 @@ def completeness(dia, opname, which='verify'):
         try: [_params(x[0]) for x in (inf, comp) if x]
         except CppUnknown as e: return (False, frozenset({f'形参: {e}'}))
         extra = [comp[1]] if comp else []
+    elif which.startswith('iface:'):
+        src = iface_source(dia, opname, which[6:]); extra = []
+        cls, body = (src if src else (verify_source(dia, opname)[0], None))
     else:
         cls, body = verify_source(dia, opname); extra = []
-    CUR['dia'] = dia
+    CUR['dia'] = dia; CUR['opname'] = opname
     if body is None: return (False, frozenset({'<无源码>'}))
     S = G.sig(dia, opname)
     acc = {'get' + camel(nm) for nm, *_ in S['ins'] + S['outs']} | {'getNum' + camel(nm) for nm, *_ in S['ins'] + S['outs']}
@@ -1978,6 +2095,8 @@ def completeness(dia, opname, which='verify'):
             if fms:
                 for i_, fm in enumerate(fms): walk(fm[1], f'{b}#{i_}')
                 continue
+            ifm = iface_methods(dia, opname).get(b)            # 第 83 轮：接口方法缺省体
+            if ifm is not None: walk(ifm[1], f'iface {b}'); continue
             ff = find_function(dia, b)
             if ff is not None: walk(ff[2], b); continue
             bad.add(b)
@@ -2009,9 +2128,15 @@ def _scan_stmts(node, bad, tag):
         for x in node: _scan_stmts(x, bad, tag)
 
 @functools.lru_cache(None)
-def verify_literals(dia, opname):
+def iface_literals(dia, opname, trait):
+    """第 83 轮：接口 verify 调用树里的字符串字面量。"""
+    src = iface_source(dia, opname, trait)
+    return verify_literals(dia, opname, src) if src else frozenset()
+
+@functools.lru_cache(None)
+def verify_literals(dia, opname, src=None):
     """verify 及其调用到的方法/辅助函数里的字符串字面量（诊断消息片段），供检验判断“MLIR 的诊断来自这段 verify”。"""
-    cls, body = verify_source(dia, opname)
+    cls, body = src if src is not None else verify_source(dia, opname)
     if body is None: return frozenset()
     out, seen = set(), set()
     def walk(src, tag):
@@ -2031,6 +2156,8 @@ def verify_literals(dia, opname):
             if fms:
                 for i_, fm in enumerate(fms): walk(fm[1], f'{b}#{i_}')
                 continue
+            ifm = iface_methods(dia, opname).get(b)
+            if ifm is not None: walk(ifm[1], f'iface {b}'); continue
             ff = find_function(dia, b)
             if ff is not None: walk(ff[2], b)
     walk(body, 'verify')
