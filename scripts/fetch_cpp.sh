@@ -2,6 +2,8 @@
 # 第 50 轮：ctxcons 的 C++ 源（同一 MLIR 提交）。只下载，不编译；文本扫描见 model/ctxcons.py。
 set -e; C=9bae84b01718e53495abf50958abc86ea45f16bb; D="$(dirname "$0")/../inventory/cpp"; mkdir -p "$D"; cd "$D"
 for p in \
+  mlir/lib/Dialect/Utils/ReshapeOpsUtils.cpp \
+  mlir/include/mlir/Dialect/Utils/ReshapeOpsUtils.h \
   mlir/lib/Dialect/Arith/IR/ArithDialect.cpp \
   mlir/lib/Dialect/Arith/IR/ArithOps.cpp \
   mlir/lib/Dialect/Arith/IR/InferIntRangeInterfaceImpls.cpp \
@@ -82,5 +84,5 @@ for p in \
   mlir/lib/IR/Operation.cpp \
   mlir/lib/IR/SymbolTable.cpp \
   mlir/lib/Dialect/Utils/StaticValueUtils.cpp \
-; do f=$(echo $p | sed "s#mlir/lib/Dialect/##; s#mlir/lib/##; s#/#_#g"); [ -s "$f" ] || curl -sfL "https://raw.githubusercontent.com/llvm/llvm-project/$C/$p" -o "$f"; done
+; do f=$(echo $p | sed "s#mlir/lib/Dialect/##; s#mlir/include/mlir/Dialect/##; s#mlir/lib/##; s#/#_#g"); [ -s "$f" ] || curl -sfL "https://raw.githubusercontent.com/llvm/llvm-project/$C/$p" -o "$f"; done
 ls *.cpp | wc -l

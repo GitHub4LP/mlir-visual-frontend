@@ -18,6 +18,7 @@ import typesig as TS
 class CppUnknown(Exception): pass
 class _Ret(Exception):
     def __init__(self, v): self.v = v
+class _Crash(_Ret): pass   # 第 82 轮：断言崩溃穿过被调函数直达入口（原先被调函数把它当返回值 Diag 吞掉）
 class _Break(Exception): pass
 class _Continue(Exception): pass
 
@@ -158,7 +159,9 @@ class P:
                 self.ex('}'); return ('switch', e, arms, dflt)
             if w in ('do', 'goto', 'try', 'case', 'default', 'using', 'typedef'):
                 raise CppUnknown(f'parse: 不支持 {w}')
-            if w in ('assert', 'LLVM_DEBUG', 'llvm_unreachable', 'static_assert'):
+            if w == 'assert':                                     # 第 82 轮：本 MLIR 构建开启断言 ⇒ assert(c) 求值，c 为假 ⇒ 崩溃（按拒绝）；原先整句跳过
+                self.nx(); self.ex('('); c_ = self.expr(); self.ex(')'); self.ex(';'); return ('assert', c_)
+            if w in ('LLVM_DEBUG', 'llvm_unreachable', 'static_assert'):
                 self.nx(); self.ex('('); d = 1
                 while d:
                     x = self.nx()[1]; d += (x == '(') - (x == ')')
@@ -242,7 +245,7 @@ class P:
         try:
             self.nx(); self.typ(); r = self.isop(')') and self.pk(1)[0] in ('id', 'num') or (self.isop(')') and self.isop('(', 1))
             nm = self.t[j + 1][1]
-            return r and _base(nm) in ('int64_t', 'int', 'unsigned', 'size_t', 'int32_t', 'uint64_t', 'bool')
+            return r and _base(nm) in ('int64_t', 'int', 'unsigned', 'size_t', 'int32_t', 'uint64_t', 'bool', 'void')   # 第 82 轮：(void)x;
         except CppUnknown: return False
         finally: self.i = j
     def primary(self):
@@ -307,7 +310,7 @@ class P:
                 if self.isop('<') and nm in TEMPLATE_FNS: targs = self._targs(); e = ('mem', e, nm, targs)
                 else: e = ('mem', e, nm, None)
             elif self.isop('['): self.nx(); i = self.expr(); self.ex(']'); e = ('idx', e, i)
-            elif self.isop('++') or self.isop('--'): self.nx(); e = ('post', e)
+            elif self.isop('++') or self.isop('--'): d_ = 1 if self.isop('++') else -1; self.nx(); e = ('post', e, d_)   # 第 82 轮：记下 ++/--（原先后置 -- 按 ++ 求值）
             elif self.isop('{') and e[0] in ('id', 'tid'): self.nx(); e = ('brace', e[1], self.args('}'))
             else: return e
 
@@ -327,7 +330,10 @@ def _dialect_files(dia):
     for d in ds:
         a, b = d.split('/')[:2]
         out += sorted(glob.glob(os.path.join(CPP_DIR, f'{a}_{b}_*.cpp')))
-    return sorted(set(out))
+    # 第 82 轮：方言共用的工具源（Dialect/Utils/ReshapeOpsUtils.{h,cpp}）排在方言自身文件之后，同名时方言文件优先
+    return sorted(set(out)) + [os.path.join(CPP_DIR, x) for x in SHARED_SRC if os.path.exists(os.path.join(CPP_DIR, x))]
+
+SHARED_SRC = ('Utils_ReshapeOpsUtils.h', 'Utils_ReshapeOpsUtils.cpp')
 
 @functools.lru_cache(None)
 def _file(path): return re.sub(r'^\s*#.*$', '', open(path, errors='ignore').read(), flags=re.M)
@@ -343,6 +349,41 @@ def _body_at(s, i):
         elif c == '}': d -= 1
         j += 1
     return s[i:j - 1]
+
+@functools.lru_cache(None)
+def find_methods(dia, cls, meth):
+    """第 82 轮：Class::meth 的全部 out-of-line 重载 → [(参数表文本, 函数体)]。"""
+    out = []
+    for f in _dialect_files(dia):
+        s = _file(f)
+        for m in re.finditer(r'(?:^|\n)[\w:<>,\s\*&]*?\b' + re.escape(cls) + r'::' + re.escape(meth) + r'\s*\(([^)]*)\)\s*(?:const\s*)?\{', s):
+            out.append((m.group(1), _body_at(s, m.end())))
+    return out
+
+def _arg_fits(ptype, v):
+    """重载选择的最小类型判别（第 82 轮）：只区分 ArrayRef<AffineMap> 与 ReassociationIndices 一类的形参；其余视为相容。"""
+    pt = ptype or ''
+    if isinstance(v, TList) and v.ety:
+        e_ = _base(v.ety)
+        if 'AffineMap' in pt and 'AffineMapAttr' not in pt: return e_ == 'AffineMap'
+        if 'ReassociationIndices' in pt: return e_ in ('ReassociationIndices',)
+    if 'AffineMap' in pt and 'AffineMapAttr' not in pt:
+        return isinstance(v, AMap) or isinstance(v, list) and all(isinstance(x, AMap) for x in v)
+    if 'ReassociationIndices' in pt:
+        return isinstance(v, list) and all(isinstance(x, list) and all(isinstance(y, int) for y in x) for x in v)
+    return True
+
+def pick_overload(cands, args):
+    """按实参个数与 _arg_fits 选唯一重载；不唯一 ⇒ CppUnknown。"""
+    if len(cands) == 1: return cands[0]
+    ok = []
+    for c in cands:
+        ps = _params(c[0])
+        req = sum(1 for _, _, d in ps if d is None)
+        if not (req <= len(args) <= len(ps)): continue
+        if all(_arg_fits(t, a) for (t, _, _), a in zip(ps, args)): ok.append(c)
+    if len(ok) != 1: raise CppUnknown(f'重载不唯一（{len(ok)}）')
+    return ok[0]
 
 @functools.lru_cache(None)
 def find_method(dia, cls, meth):
@@ -435,6 +476,10 @@ def camel(nm):
 class V:                 # mlir::Value
     def __init__(self, t): self.t = t
 class Rng(list): pass    # ValueRange / OperandRange
+class TList(list):        # 第 82 轮：带声明元素类型的 SmallVector（仅供重载选择；空表也能区分 ArrayRef<AffineMap> 与 ReassociationIndices）
+    ety = ''
+def _tlist(xs, ety):
+    t = TList(xs); t.ety = ety; return t
 class Diag:              # InFlightDiagnostic（隐式转换为 failure）
     def __init__(self, msg): self.msg = msg
 class LR:                # LogicalResult
@@ -478,6 +523,17 @@ def enum_classes():
             out.setdefault(r['className'], (vals, strs, 'BitEnum' in str(r.get('!superclasses'))))
     return out
 
+class AExpr:
+    """第 82 轮：mlir::AffineExpr（经 MLIR Python 的 AffineExpr）。"""
+    def __init__(self, e): self.e = e
+    def __eq__(self, o): return isinstance(o, AExpr) and str(o.e) == str(self.e)
+    def __hash__(self): return hash(str(self.e))
+def _aexpr_kind(e):
+    import mlir.ir as ir
+    for k, K in (('AffineDimExpr', ir.AffineDimExpr), ('AffineSymbolExpr', ir.AffineSymbolExpr), ('AffineConstantExpr', ir.AffineConstantExpr)):
+        if K.isinstance(e): return k, K(e)
+    if ir.AffineBinaryExpr.isinstance(e): return 'AffineBinaryOpExpr', ir.AffineBinaryExpr(e)
+    raise CppUnknown('AffineExpr 种类')
 class AMap:
     """mlir::AffineMap（经 MLIR Python 的 AffineMap）。"""
     def __init__(self, m): self.m = m
@@ -487,6 +543,26 @@ class AMap:
 class Lambda:
     def __init__(self, params, body, env): self.params, self.body, self.env = params, body, env
 class Self: pass
+class EnumPair(tuple):    # 第 82 轮：llvm::enumerate 的 result_pair（index()/value()；结构化绑定照常）
+    pass
+class Sat:                # 第 82 轮：mlir/Dialect/Utils/StaticValueUtils.h 的 SaturatedInteger（逐行照抄语义）
+    __slots__ = ('saturated', 'v')
+    def __init__(self, saturated=True, v=0): self.saturated, self.v = saturated, v
+    @staticmethod
+    def wrap(v): return Sat(True, 0) if v == DYN else Sat(False, v)
+    def asInteger(self): return DYN if self.saturated else self.v
+    def desaturate(self, o):
+        if self.saturated and not o.saturated: return o
+        if not self.saturated and not o.saturated and self.v != o.v: return FAIL
+        return self
+    def __eq__(self, o): return isinstance(o, Sat) and ((self.saturated and o.saturated) or (not self.saturated and not o.saturated and self.v == o.v))
+    def __hash__(self): return hash((self.saturated, self.v))
+    def add(self, o): return Sat(True, 0) if self.saturated or o.saturated else Sat(False, o.v + self.v)
+    def mul(self, o):
+        if not o.saturated and o.v == 0: return Sat(False, 0)
+        if not self.saturated and self.v == 0: return Sat(False, 0)
+        if self.saturated or o.saturated: return Sat(True, 0)
+        return Sat(False, o.v * self.v)
 class Attr:
     def __init__(self, a): self.a = a
 
@@ -553,6 +629,10 @@ def _isa(cls, x):
         if sp is not None: return xo[1].strip() == sp
         raise CppUnknown(f'isa<{b}> 于类型')
     if isinstance(x, Attr): return _attr_isa(b, x.a, cls)
+    if isinstance(x, AExpr):                                              # 第 82 轮
+        if b == 'AffineExpr': return True
+        if b in ('AffineDimExpr', 'AffineSymbolExpr', 'AffineConstantExpr', 'AffineBinaryOpExpr'): return _aexpr_kind(x.e)[0] == b
+        raise CppUnknown(f'isa<{b}> 于 AffineExpr')
     if x is None: return False
     raise CppUnknown(f'isa<{b}> 于 {type(x).__name__}')
 
@@ -596,7 +676,7 @@ FREE_FNS = {'success', 'failure', 'failed', 'succeeded', 'isa', 'cast', 'dyn_cas
             'isPowerOf2_64', 'max', 'min', 'abs', 'isDynamic', 'isStatic', 'emitOpError', 'emitError', 'getOperation', 'getNumOperands', 'getNumResults',
             'getOperand', 'getResult', 'getType', 'getOperandTypes', 'getResultTypes', 'getOperands', 'getResults', 'seq', 'product', 
             'verifyCompatibleShape', 'getElementTypeOrSelf', 'drop_begin', 'drop_end', 'reverse', 'to_vector', 'SmallVector', 'ArrayRef', 'getConstantIntValue',
-            'isPermutationVector', 'accumulate', 'is_sorted', 'zip_first', 'swap', 'tie', 'equal', 'getMixedValues', 'emitOptionalError', 'verifyCompatibleShapes', 'append_range', 'back_inserter', 'copy', 'getTensorTypeFromMemRefType'}
+            'isPermutationVector', 'accumulate', 'is_sorted', 'zip_first', 'swap', 'tie', 'equal', 'getMixedValues', 'emitOptionalError', 'verifyCompatibleShapes', 'append_range', 'back_inserter', 'copy', 'getTensorTypeFromMemRefType', 'map_range', 'to_vector', 'to_string', 'string', 'APInt', 'getAffineDimExpr', 'getAffineSymbolExpr', 'getAffineConstantExpr', 'move', 'Twine'}
 
 class Interp:
     def __init__(self, op, depth=0):
@@ -629,7 +709,9 @@ class Interp:
                 if init is None: v = _default(h[2])
                 if isinstance(v, V) and _base(h[2]).endswith('Type'): v = v.t
                 v = _conv(h[2], v)
-                if isinstance(v, list) and '&' not in (h[2] or ''): v = list(v)     # 值语义：SmallVector/auto 拷贝
+                if isinstance(v, list) and '&' not in (h[2] or ''):                # 值语义：SmallVector/auto 拷贝
+                    m_ = re.match(r'(?:llvm::)?SmallVector\s*<\s*([\w:]+)', h[2] or '')
+                    v = _tlist(v, m_.group(1)) if m_ else _tlist(v, v.ety) if isinstance(v, TList) else list(v)
                 env[h[1]] = v
             else:
                 vs = list(v) if not isinstance(v, tuple) or not v or not isinstance(v[0], str) else None
@@ -696,6 +778,8 @@ class Interp:
         elif k == 'break': raise _Break()
         elif k == 'continue': raise _Continue()
         elif k == 'unreachable': raise CppUnknown('llvm_unreachable')
+        elif k == 'assert':
+            if not self.truth(self.ev(s[1], env)): _crash()
         else: raise CppUnknown(f'语句 {k}')
     def _writeback(self, inner, outer):
         for k_ in list(inner):
@@ -707,6 +791,8 @@ class Interp:
             e = e.get('\x00parent')
         raise KeyError(n)
     def truth(self, v):
+        if isinstance(v, tuple) and v and v[0] == '\x00it': raise CppUnknown('迭代器的真值')
+        if isinstance(v, tuple) and v and v[0] == '\x00bound': raise CppUnknown(f'未解析的成员 {v[2]}')   # 第 82 轮：数据成员不可当真值（原先 tuple ⇒ 恒真）
         if isinstance(v, V): return True
         if isinstance(v, LR): return v.ok
         if isinstance(v, Diag): return True
@@ -737,11 +823,12 @@ class Interp:
             if e[1] == '*':
                 if isinstance(v, Self) or v is None and False: return v
                 if isinstance(v, Self): return v
-                if isinstance(v, (int, tuple, V, list, Attr)) and not isinstance(v, bool): return v      # *optional / *this
+                if isinstance(v, (int, tuple, V, list, Attr, Sat, Layout)) and not isinstance(v, bool): return v      # *optional / *this
+                if isinstance(v, LR) and not v.ok: _crash()                  # 第 82 轮：*FailureOr 在 failure 上断言
                 raise CppUnknown('解引用')
             if e[1] == '&': return v
         if k == 'post':
-            v = self.ev(e[1], env); self.store(e[1], v + 1, env); return v
+            v = self.ev(e[1], env); self.store(e[1], _num(v) + (e[2] if len(e) > 2 else 1), env); return v
         if k == '?': return self.ev(e[2], env) if self.truth(self.ev(e[1], env)) else self.ev(e[3], env)
         if k == 'assign':
             if e[1] == '=': v = self.ev(e[3], env)
@@ -749,7 +836,9 @@ class Interp:
                 a, b = _num(self.ev(e[2], env)), _num(self.ev(e[3], env))
                 v = {'+=': a + b, '-=': a - b, '*=': a * b, '/=': (int(a / b) if b else _crash())}[e[1]]
             self.store(e[2], v, env); return v
-        if k == 'cast_c': return _conv(e[1], self.ev(e[2], env))
+        if k == 'cast_c':
+            v_ = self.ev(e[2], env)
+            return None if _base(e[1]) == 'void' else _conv(e[1], v_)
         if k == 'lambda': return Lambda(e[1], e[2], env)
         if k == 'idx':
             c, i = self.ev(e[1], env), _num(self.ev(e[2], env))
@@ -759,6 +848,7 @@ class Interp:
         if k == 'mem':
             r_ = self.ev(e[1], env)
             if isinstance(r_, Props): return self.op_method('get' + camel(e[2]) + 'Attr', [], env, None)
+            if isinstance(r_, Sat) and e[2] in ('saturated', 'v'): return getattr(r_, e[2])     # 第 82 轮：SaturatedInteger 的数据成员
             return ('\x00bound', r_, e[2], e[3])
         if k == 'call': return self.call(e[1], e[2], env)
         if k == 'tid': return ('\x00tfn', e[1], e[2])
@@ -776,6 +866,12 @@ class Interp:
             if b.startswith('SmallVector') or b.startswith('ArrayRef') or b.startswith('std::vector') or b.startswith('SmallVector<'):
                 if len(args) == 1 and isinstance(args[0], (list, Rng)): return list(args[0])
                 if len(args) == 2 and isinstance(args[0], int): return [args[1]] * args[0]
+                if len(args) == 1 and isinstance(args[0], int) and not isinstance(args[0], bool) and not b.startswith('ArrayRef'):
+                    # 第 82 轮：SmallVector<T> v(n) = n 个值初始化元素（原先误作单元素 [n]）
+                    m_ = re.search(r'<\s*([\w:]+)', e[1]); et = m_.group(1) if m_ else ''
+                    if _base(et) in ('int', 'int64_t', 'unsigned', 'size_t', 'int32_t', 'uint64_t', 'uint32_t', 'long', 'int8_t', 'uint8_t', 'int16_t'): return [0] * args[0]
+                    if _base(et) == 'bool': return [False] * args[0]
+                    raise CppUnknown(f'SmallVector 计数构造 {e[1]}')
                 return list(args)
             if re.sub(r'^(::)?(mlir::)?', '', e[1].strip()) in ('Builder', 'OpBuilder'): return BuilderV()   # 不含 VectorType::Builder
             if b.endswith('Adaptor'): return Self()                   # XxxOpAdaptor adaptor(operands, attributes, properties, regions)
@@ -810,6 +906,10 @@ class Interp:
             return _num(a) << _num(b)
         if op in ('==', '!='):
             r = _eq(a, b); return r if op == '==' else not r
+        if isinstance(a, Sat) or isinstance(b, Sat):                      # 第 82 轮：SaturatedInteger 的 + 与 *
+            if not (isinstance(a, Sat) and isinstance(b, Sat)) or op not in ('+', '*'): raise CppUnknown(f'SaturatedInteger 运算 {op}')
+            return a.add(b) if op == '+' else a.mul(b)
+        if op == '+' and isinstance(a, str) and isinstance(b, str): return a + b
         if op in ('<', '>', '<=', '>='):
             a, b = _num(a), _num(b)
             return {'<': a < b, '>': a > b, '<=': a <= b, '>=': a >= b}[op]
@@ -863,6 +963,7 @@ class Interp:
         if not isinstance(lam, Lambda): raise CppUnknown('调用非函数值')
         env = dict(zip(lam.params, args)); env['\x00parent'] = lam.env
         try: self.exec(lam.body, env)
+        except _Crash: raise
         except _Ret as r: return r.v
         return None
     def evargs(self, args_e, env):
@@ -895,6 +996,7 @@ class Interp:
             return x.t if isinstance(x, V) and _base(targs[0]) not in ('Value', 'OpResult', 'BlockArgument') else x
         if n == 'get' and len(args) == 1 and isinstance(args[0], tuple) and targs and str(targs[0]).strip().isdigit():   # std::get<k>(pair)
             return args[0][int(str(targs[0]).strip())]
+        if n == 'to_vector': return list(self.iter(args[0]))                 # 第 82 轮：llvm::to_vector<N>(range)
         if n == 'static_cast': return _conv(targs[0], args[0])
         if n in ('min', 'max'): return (min if n == 'min' else max)(_num(x) for x in args)
         if n == 'seq': return list(range(_num(args[0]), _num(args[1]))) if len(args) == 2 else list(range(_num(args[0])))
@@ -912,8 +1014,12 @@ class Interp:
         if len(q) >= 2 and q[-1] == 'get' and q[-2] in CTORS:
             return CTORS[q[-2]]([self.ev(a, env) for a in args_e])
         if len(q) == 2 and q[0].endswith('Op') and not q[0].startswith('std'):
-            fm = find_method(self.op.dia, q[0], q[1])
-            if fm is not None: return self.invoke(fm[0], fm[1], [self.ev(a, env) for a in args_e], ())
+            fms = find_methods(self.op.dia, q[0], q[1])
+            if not fms and q[0] == getattr(self.op, 'cls', None) and not inline_methods(self.op.dia, self.op.opname).get(q[1]):   # 第 82 轮：XxxOp::getFooAttrName() 等本 op 的静态访问器
+                return self.op_method(q[1], [self.ev(a, env) for a in args_e], env, None)
+            if fms:
+                av_ = [self.ev(a, env) for a in args_e]; fm = pick_overload(fms, av_)
+                return self.invoke(fm[0], fm[1], av_, ())
         if b.endswith('Type') and not args_e and b[:1].isupper(): return None          # RankedTensorType() 等：空类型
         if b == 'getMixedValues':                       # 静态数组中的 kDynamic 依次换成动态值（OpFoldResult）
             st_, dy_ = self.iter(self.ev(args_e[0], env)), self.iter(self.ev(args_e[1], env)); out_ = []; k_ = 0
@@ -951,7 +1057,11 @@ class Interp:
         if b == 'count': return sum(1 for x in self.iter(args[0]) if _eq(x, args[1]))
         if b == 'is_sorted': xs = [_num(x) for x in self.iter(args[0])]; return xs == sorted(xs)
         if b == 'is_contained': return any(_eq(x, args[1]) for x in self.iter(args[0]))
-        if b == 'enumerate': return [(i, x) for i, x in enumerate(self.iter(args[0]))]
+        if b == 'enumerate':
+            if len(args) == 1: return [EnumPair((i, x)) for i, x in enumerate(self.iter(args[0]))]
+            ls = [self.iter(a) for a in args]                            # 第 82 轮：多范围 enumerate（STLExtras 断言等长）
+            if len({len(l) for l in ls}) > 1: _crash()                  # 断言 "Ranges have different length"（本 MLIR 构建开启断言，同 zip_equal）
+            return [EnumPair((i,) + tuple(t)) for i, t in enumerate(zip(*ls))]
         if b in ('zip', 'zip_equal', 'zip_first'):
             ls = [self.iter(a) for a in args]
             if b == 'zip_first' and any(len(l) < len(ls[0]) for l in ls): _crash()
@@ -972,6 +1082,21 @@ class Interp:
                 st_ = {t[1][i_] for t in rk if t[1][i_] is not None}
                 if len(st_) > 1: return FAIL
             return OK
+        if b == 'APInt' and len(args) == 2:                              # APInt(64, v)：值即 v（IntegerAttr::get 只取其数值）
+            w_, v_ = _num(args[0]), _num(args[1])
+            if not -(1 << (w_ - 1)) <= v_ < (1 << w_): raise CppUnknown('APInt 截断')
+            return v_
+        if b in ('getAffineDimExpr', 'getAffineSymbolExpr', 'getAffineConstantExpr'):   # 第 82 轮：mlir::getAffine*Expr(位置/值, ctx)
+            import mlir.ir as ir
+            K = {'getAffineDimExpr': ir.AffineDimExpr, 'getAffineSymbolExpr': ir.AffineSymbolExpr, 'getAffineConstantExpr': ir.AffineConstantExpr}[b]
+            return AExpr(K.get(_num(args[0]), _ctx()))
+        if n in ('std::move', 'move'): return args[0]
+        if b == 'Twine' and len(args) == 1: return args[0] if isinstance(args[0], str) else str(_num(args[0]))
+        if b == 'map_range': return [self.apply(args[1], [x]) for x in self.iter(args[0])]     # 第 82 轮
+        if b == 'to_vector': return list(self.iter(args[0]))
+        if n in ('std::to_string', 'to_string'): return str(_num(args[0]))
+        if n in ('std::string', 'string'): return ''.join(args) if all(isinstance(x, str) for x in args) else _crash()
+        if n == 'SaturatedInteger::wrap': return Sat.wrap(_num(args[0]))
         if b == 'append_range':
             if not isinstance(args[0], list): raise CppUnknown('append_range 目标')
             args[0].extend(self.iter(args[1])); return None
@@ -1005,6 +1130,8 @@ class Interp:
             if isinstance(v_, int) and not isinstance(v_, bool): return v_
             raise CppUnknown('getConstantIntValue（值前提）')
         if b in ('drop_begin',): xs = self.iter(args[0]); return xs[(_num(args[1]) if len(args) > 1 else 1):]
+        if b == 'drop_end': xs = self.iter(args[0]); return xs[:len(xs) - (_num(args[1]) if len(args) > 1 else 1)]   # 第 82 轮
+        if b == 'reverse': return list(reversed(self.iter(args[0])))
         if b in ('to_vector', 'SmallVector', 'ArrayRef'): return list(self.iter(args[0])) if args else []
         if b == 'product':
             p = 1
@@ -1018,6 +1145,39 @@ class Interp:
         args = pre if pre is not None else [self.ev(a, env) for a in args_e]
         if isinstance(recv, tuple) and recv and recv[0] == '\x00bound': recv = self.method(recv[1], recv[2], recv[3], [], env, pre=[])
         if isinstance(recv, Self): return self.op_method(m, args, env, targs)
+        if isinstance(recv, AExpr):                                       # 第 82 轮：AffineExpr 方法
+            k_, e_ = _aexpr_kind(recv.e)
+            if m == 'getPosition' and k_ in ('AffineDimExpr', 'AffineSymbolExpr'): return e_.position
+            if m == 'getValue' and k_ == 'AffineConstantExpr': return e_.value
+            if m == 'getContext': return None
+            if m == 'walk':                                                   # 后序遍历（AffineExprVisitor walkPostOrder）
+                def w_(x):
+                    kx, ex = _aexpr_kind(x)
+                    if kx == 'AffineBinaryOpExpr': w_(ex.lhs); w_(ex.rhs)
+                    self.apply(args[0], [AExpr(x)])
+                w_(recv.e); return None
+            raise CppUnknown(f'AffineExpr.{m}')
+        if isinstance(recv, EnumPair):                                    # 第 82 轮
+            if m == 'index': return recv[0]
+            if m == 'value': return recv[1]
+            raise CppUnknown(f'enumerate.{m}')
+        if isinstance(recv, Sat):
+            if m == 'asInteger': return recv.asInteger()
+            if m == 'desaturate': return recv.desaturate(args[0]) if isinstance(args[0], Sat) else _crash()
+            raise CppUnknown(f'SaturatedInteger.{m}')
+        if m == 'getStridesAndOffset' and isinstance(recv, tuple) and recv and isinstance(recv[0], str):   # 第 82 轮：BuiltinTypes.cpp
+            t_ = recv
+            if t_[0] != 'memref': _crash()
+            try: st_ = _strides(t_)
+            except CppUnknown: raise
+            if not args: 
+                if st_ is False: _crash()
+                return [list(st_[0]), st_[1]]                           # std::pair（结构化绑定）
+            if len(args) == 2:
+                if st_ is False: return FAIL
+                if not isinstance(args[0], list): raise CppUnknown('getStridesAndOffset 输出形参')
+                args[0][:] = st_[0]; self.store(args_e[1], st_[1], env); return OK
+            raise CppUnknown('getStridesAndOffset 形参')
         if isinstance(recv, V):
             if m == 'getType': return recv.t
             if m in ('getDefiningOp',): raise CppUnknown('getDefiningOp（值前提）')
@@ -1042,14 +1202,23 @@ class Interp:
                 xs = list(args[0]) if len(args) == 1 and isinstance(args[0], (list, Rng)) else [args[1]] * _num(args[0]) if len(args) == 2 else None
                 if xs is None: raise CppUnknown('assign')
                 recv[:] = xs; return None
-            if m in ('reserve', 'resize') and m == 'reserve': return None
+            if m == 'reserve': return None
+            if m == 'resize':                                             # 第 82 轮：resize(n[, v])；增长且无 v 时元素类型未知 ⇒ 不猜
+                n_ = _num(args[0])
+                if n_ < 0: _crash()
+                if n_ <= len(recv): del recv[n_:]; return None
+                if len(args) < 2: raise CppUnknown('resize 增长无初值')
+                recv.extend([args[1]] * (n_ - len(recv))); return None
+            if m in ('begin', 'end') and not args: return ('\x00it', recv, 0 if m == 'begin' else len(recv))   # 第 82 轮：仅供 append(b, e)
+            if m == 'append' and len(args) == 2 and all(isinstance(x, tuple) and x and x[0] == '\x00it' for x in args):
+                if args[0][1] is not args[1][1] or args[0][2] > args[1][2]: raise CppUnknown('append 迭代器')
+                recv.extend(list(args[0][1][args[0][2]:args[1][2]])); return None
             if m == 'append': recv.extend([args[1]] * _num(args[0]) if len(args) == 2 else self.iter(args[0])); return None   # append(n, v) / append(range)
             if m == 'drop_front': return recv[(_num(args[0]) if args else 1):]
             if m == 'drop_back': return recv[:len(recv) - (_num(args[0]) if args else 1)]
             if m == 'take_front': return recv[:(_num(args[0]) if args else 1)]
             if m == 'slice': return recv[_num(args[0]):_num(args[0]) + _num(args[1])]
             if m == 'contains' or m == 'count': return any(_eq(x, args[0]) for x in recv)
-            if m in ('begin', 'end'): raise CppUnknown('迭代器')
             raise CppUnknown(f'range.{m}')
         if isinstance(recv, BuilderV):
             if m in BUILDER_TYPES: return BUILDER_TYPES[m]
@@ -1062,6 +1231,7 @@ class Interp:
             if m == 'getNumDims': return am.n_dims
             if m == 'getNumSymbols': return am.n_symbols
             if m == 'getNumResults': return len(am.results)
+            if m == 'getResults': return [AExpr(r) for r in am.results]          # 第 82 轮
             if m == 'getNumInputs': return am.n_inputs
             if m == 'isIdentity': return am.is_identity if hasattr(am, 'is_identity') else str(am) == str(type(am).get_identity(am.n_dims, _ctx()))
             if m == 'isPermutation': return am.is_permutation
@@ -1069,7 +1239,10 @@ class Interp:
             if m == 'isEmpty': return am.n_dims == 0 and am.n_symbols == 0 and len(am.results) == 0
             raise CppUnknown(f'AffineMap.{m}')
         if isinstance(recv, Layout):
-            if m == 'isIdentity': return _layout_identity(recv.txt)
+            if m == 'isIdentity':                                       # 接口缺省实现 getAffineMap().isIdentity()（第 82 轮：strided<[1]> 等也算恒等）
+                if recv.txt is not None and recv.txt.strip().startswith('strided<'):
+                    am_ = _layout_map(recv).m; return str(am_) == str(type(am_).get_identity(am_.n_dims, _ctx())) and am_.n_symbols == 0
+                return _layout_identity(recv.txt)
             if m == 'getAffineMap': return _layout_map(recv)
             raise CppUnknown(f'layout.{m}')
         if isinstance(recv, Diag): return recv
@@ -1281,8 +1454,8 @@ class Interp:
         # 内联/外部方法
         im = inline_methods(op.dia, op.opname).get(m)
         if im is not None: return self.invoke(im[0], im[1], args, ())
-        fm = find_method(op.dia, op.cls, m)
-        if fm is not None: return self.invoke(fm[0], fm[1], args, ())
+        fms = find_methods(op.dia, op.cls, m)
+        if fms: fm = pick_overload(fms, args); return self.invoke(fm[0], fm[1], args, ())
         ff = find_function(op.dia, _base(m), nargs=len(args))
         if ff is not None: return self.invoke(ff[1], ff[2], args, ff[0], targs=targs)
         raise CppUnknown(f'op 方法 {m}')
@@ -1354,6 +1527,7 @@ class Interp:
         sub = Interp(self.op, self.depth + 1)
         b = parse_body(body)
         try: sub.exec(b, env)
+        except _Crash: raise
         except _Ret as r: return r.v
         return None
 
@@ -1423,7 +1597,7 @@ def _params(txt):
         else: cur += ch
     return out
 
-def _crash(): raise _Ret(Diag('\x00crash'))
+def _crash(): raise _Crash(Diag('\x00crash'))
 def _num(v):
     if isinstance(v, bool): return int(v)
     if isinstance(v, int): return v
@@ -1431,7 +1605,7 @@ def _num(v):
     raise CppUnknown(f'数值 {type(v).__name__}')
 def _ty(x):
     if isinstance(x, V): return x.t
-    if isinstance(x, tuple) and x and isinstance(x[0], str): return x
+    if isinstance(x, tuple) and x and isinstance(x[0], str) and x[0][:1] != '\x00': return x
     raise CppUnknown('期望类型')
 def _shape(t): return [DYN if x is None else x for x in t[1]]
 def _fwidth(t):
@@ -1442,8 +1616,10 @@ def _fwidth(t):
     if m: return int(m.group(1))
     raise CppUnknown('浮点位宽')
 def _eq(a, b):
+    if any(isinstance(x, tuple) and x and x[0] == '\x00bound' for x in (a, b)): raise CppUnknown('未解析的成员')   # 第 82 轮
     if isinstance(a, V): a = a.t
     if isinstance(b, V): b = b.t
+    if isinstance(a, Self) and b is None or isinstance(b, Self) and a is None: return False   # 第 82 轮：op != nullptr（被校验 op 非空）
     if isinstance(a, Self) or isinstance(b, Self): raise CppUnknown('op 比较')
     if isinstance(a, Attr) and isinstance(b, Attr): return str(a.a) == str(b.a)
     if isinstance(a, (list, Rng)) and isinstance(b, (list, Rng)):
@@ -1473,7 +1649,16 @@ def _strides(t):
     if m:
         st = [DYN if x.strip() == '?' else int(x) for x in m.group(1).split(',') if x.strip()]
         off = m.group(2); return (st, DYN if off == '?' else int(off or 0))
-    raise CppUnknown('仿射布局的步长')
+    # 第 82 轮：一般仿射布局交给 MLIR 自身的 getStridesAndOffset（Python 绑定 MemRefType.get_strides_and_offset）；提取失败 ⇒ 无步长
+    import mlir.ir as ir
+    try:
+        with _ctx(): mt = ir.MemRefType(ir.Type.parse(TS.show(t)))
+    except Exception: raise CppUnknown('仿射布局的步长（类型不可解析）')
+    try: st, off = mt.get_strides_and_offset()
+    except Exception as e:
+        if 'Failed to extract strides' in str(e): return False
+        raise CppUnknown('仿射布局的步长')
+    return (list(st), off)
 
 def _layout_map(lay):
     import mlir.ir as ir
@@ -1510,6 +1695,7 @@ def _default(ty):
     if b.startswith('SmallVector') or b.startswith('std::vector') or b.startswith('SmallVector<'): return []
     if b in ('Type', 'Value', 'Attribute') or b.endswith('Type'): return None
     if b.endswith('AttrInterface') or b.endswith('TypeInterface'): return None   # 第 81 轮：接口句柄缺省构造 = 空（C++ 语义）
+    if b == 'SaturatedInteger': return Sat()                                     # 第 82 轮：成员缺省 saturated=true, v=0
     raise CppUnknown(f'缺省值 {ty}')
 def _conv(ty, v):
     b = _base(ty or 'auto')
@@ -1555,14 +1741,34 @@ def _mt_get(a):
     """MemRefType::get(shape, elt, layout = 恒等, memorySpace = 缺省)；整数 0 内存空间规范化为缺省（与 MLIR 打印一致）。"""
     sh, el = a[0], a[1]
     lay = a[2] if len(a) > 2 else None; sp = a[3] if len(a) > 3 else None
-    if lay is not None and not (isinstance(lay, Layout) and (lay.txt is None or _layout_identity(lay.txt))): raise CppUnknown('MemRefType::get 带布局')
     mods = []
+    if lay is not None and isinstance(lay, Layout) and lay.txt is not None and re.match(r'strided<', lay.txt): mods.append(('layout', lay.txt))   # 第 82 轮：StridedLayoutAttr
+    elif lay is not None and not (isinstance(lay, Layout) and (lay.txt is None or _layout_identity(lay.txt))): raise CppUnknown('MemRefType::get 带布局')
     if isinstance(sp, Space) and _norm_space(sp.txt) is not None: mods.append(('space', sp.txt))
     elif sp is not None and not isinstance(sp, Space): raise CppUnknown('MemRefType::get 内存空间')
     t = ('memref', tuple(None if _num(x) == DYN else _num(x) for x in sh), _ty(el))
     return t + ((('mods', tuple(mods)),) if mods else ())
 CTORS = {'MemRefType': _mt_get, 'IntegerType': lambda a: ('i', _num(a[1]), ''), 'IndexType': lambda a: ('index',),
-         'UnrankedTensorType': lambda a: ('tensor', None, _ty(a[0])), 'RankedTensorType': _rt_get, 'VectorType': _vt_get}
+         'UnrankedTensorType': lambda a: ('tensor', None, _ty(a[0])), 'RankedTensorType': _rt_get, 'VectorType': _vt_get,
+         'IntegerAttr': lambda a: _int_attr(a), 'ArrayAttr': lambda a: _array_attr(a), 'StridedLayoutAttr': lambda a: _strided_attr(a), 'AffineMap': lambda a: _amap_get(a)}
+def _amap_get(a):                    # 第 82 轮：AffineMap::get(dimCount, symbolCount, results, ctx)
+    if len(a) != 4 or not isinstance(a[2], list) or not all(isinstance(x, AExpr) for x in a[2]): raise CppUnknown('AffineMap::get 形参')
+    import mlir.ir as ir
+    return AMap(ir.AffineMap.get(_num(a[0]), _num(a[1]), [x.e for x in a[2]], _ctx()))
+def _strided_attr(a):                # 第 82 轮：StridedLayoutAttr::get(ctx, offset, strides)；打印文本由 MLIR 自身给出（与 typesig 读入的布局同一规范形）
+    off, st = _num(a[-2]), [_num(x) for x in a[-1]]
+    import mlir.ir as ir
+    return Layout(str(ir.StridedLayoutAttr.get(off, st, _ctx())), len(st))
+def _int_attr(a):                    # 第 82 轮：IntegerAttr::get(IntegerType 宽 w, APInt/整数)，仅无符号性为空的整数类型
+    t, v = _ty(a[0]), _num(a[1])
+    if t[0] != 'i' or t[2] != '': raise CppUnknown('IntegerAttr::get 类型')
+    import mlir.ir as ir
+    return Attr(ir.IntegerAttr.get(ir.IntegerType.get_signless(t[1], _ctx()), v))
+def _array_attr(a):                  # 第 82 轮：ArrayAttr::get(ctx, ArrayRef<Attribute>)
+    xs = a[-1]
+    if not isinstance(xs, list) or not all(isinstance(x, Attr) for x in xs): raise CppUnknown('ArrayAttr::get 元素')
+    import mlir.ir as ir
+    return Attr(ir.ArrayAttr.get([x.a for x in xs], _ctx()))
 STATS = {'python 异常': 0}
 CUR = {'dia': None}
 def decide(dia, opname, S, groups, attrs):
@@ -1623,6 +1829,7 @@ def decide_infer(dia, opname, S, groups, attrs):
         return (ok, None if ok else 'inferred type(s) are incompatible with return type(s) of operation')
     except CppUnknown: raise
     except InvariantFail as e: return (False, f'ODS 不变式不满足：{e}')
+    except _Crash: return (False, '\x00crash')                         # 第 82 轮：断言崩溃 ⇒ 拒绝
     except RecursionError: raise CppUnknown('递归')
     except Exception as e:
         STATS['python 异常'] += 1; STATS.setdefault('例', []).append(f'{opname} infer: {type(e).__name__}: {e}'[:160])
@@ -1645,6 +1852,7 @@ def infer_types(dia, opname, S, in_groups, attrs):
         rv, env = _run_fn(Interp(op), inf[0], inf[1], am)
     except CppUnknown: raise
     except InvariantFail: return None
+    except _Crash: return None                                            # 第 82 轮：推断中断言崩溃（同 InvariantFail：该点 op 不合法）
     except RecursionError: raise CppUnknown('递归')
     except Exception as e:
         STATS['python 异常'] += 1; raise CppUnknown(f'解释器异常 {type(e).__name__}: {e}')
@@ -1713,7 +1921,8 @@ def _calls(node, out):
 KNOWN_METHODS = TYPE_METHODS | {'assign', 'equals', 'getProperties', *BUILDER_TYPES, 'getNumDims', 'getNumSymbols', 'getNumInputs', 'isPermutation', 'isProjectedPermutation', 'getAffineMap', 'getAttrOfType', 'isEmpty', 'cloneWith', 'getContext', 'isLastDimUnitStride', 'isStrided', 'reserve', 'getType', 'size', 'empty', 'front', 'back', 'getTypes', 'push_back', 'emplace_back', 'append', 'drop_front', 'drop_back',
                                 'take_front', 'slice', 'contains', 'isIdentity', 'has_value', 'value', 'getInt', 'getValue', 'getSInt', 'getUInt',
                                 'asArrayRef', 'getNumElements', 'failed', 'succeeded', 'getOperation', 'getNumOperands', 'getNumResults', 'getOperand',
-                                'getOperands', 'getResults', 'getOperandTypes', 'getResultTypes', 'getResult', 'emitOpError', 'emitError', 'isa', 'cast', 'dyn_cast'}
+                                'getOperands', 'getResults', 'getOperandTypes', 'getResultTypes', 'getResult', 'emitOpError', 'emitError', 'isa', 'cast', 'dyn_cast',
+                                'index', 'asInteger', 'desaturate', 'saturated', 'getStridesAndOffset', 'resize', 'begin', 'end', 'getPosition', 'walk', 'getResults'}   # 第 82 轮
 @functools.lru_cache(None)
 def completeness(dia, opname, which='verify'):
     """静态完备性：→ (完备?, 不支持的名字集合)。递归展开 op 方法与方言内自由函数。
@@ -1745,15 +1954,18 @@ def completeness(dia, opname, which='verify'):
         for k, n in cs:
             b = _base(n)
             if k == 't':
-                if b in ('isa', 'cast', 'dyn_cast', 'dyn_cast_or_null', 'cast_or_null', 'isa_and_nonnull', 'dyn_cast_if_present', 'static_cast', 'SmallVector', 'ArrayRef', 'IsaPred', 'seq', 'min', 'max', 'get'): continue
+                if b in ('isa', 'cast', 'dyn_cast', 'dyn_cast_or_null', 'cast_or_null', 'isa_and_nonnull', 'dyn_cast_if_present', 'static_cast', 'SmallVector', 'ArrayRef', 'IsaPred', 'seq', 'min', 'max', 'get', 'to_vector'): continue
                 ff = find_function(dia, b)
                 if ff is not None: walk(ff[2], b); continue
                 bad.add(b); continue
             qn = n.split('::')
             if k == 'fn' and len(qn) == 2 and qn[0].endswith('Op'):
-                fm = find_method(dia, qn[0], qn[1])
-                if fm is not None: walk(fm[1], n); continue
+                fms = find_methods(dia, qn[0], qn[1])          # 第 82 轮：全部重载都要完备
+                if fms:
+                    for i_, fm in enumerate(fms): walk(fm[1], f'{n}#{i_}')
+                    continue
             if k == 'fn' and n in lam: continue
+            if k == 'fn' and n == 'SaturatedInteger::wrap': continue
             if b in KNOWN_METHODS or b in FREE_FNS - {'getConstantIntValue'} or b in acc: continue
             if td_const(dia, b) is not None: continue
             if re.fullmatch(r'stringify\w+', b): continue
@@ -1762,8 +1974,10 @@ def completeness(dia, opname, which='verify'):
             if k == 'm' and 'get' + camel(b) + 'Attr' in acc: continue          # adaptor.getProperties().属性
             im = inline_methods(dia, opname).get(b)
             if im is not None: walk(im[1], b); continue
-            fm = find_method(dia, cls, b)
-            if fm is not None: walk(fm[1], b); continue
+            fms = find_methods(dia, cls, b)                    # 第 82 轮：全部重载
+            if fms:
+                for i_, fm in enumerate(fms): walk(fm[1], f'{b}#{i_}')
+                continue
             ff = find_function(dia, b)
             if ff is not None: walk(ff[2], b); continue
             bad.add(b)
@@ -1784,10 +1998,10 @@ def _scan_stmts(node, bad, tag):
         if node and node[0] == 'id' and re.fullmatch(r'(?:\w+::)+\w+', node[1]) and _base(node[1]) not in FREE_FNS and _base(node[1]) != 'kDynamic' \
                 and not (node[1].split('::')[-1] == 'get' and (node[1].split('::')[-2] in CTORS or _nullary_type(node[1].split('::')[-2], CUR['dia'] or '') is not None)) \
                 and not (node[1].split('::')[-2] in enum_classes() and not enum_classes()[node[1].split('::')[-2]][2]) \
-                and not re.fullmatch(r'stringify\w+', _base(node[1])) and _base(node[1]) not in ('tie', 'equal', 'swap', 'zip_first') \
+                and not re.fullmatch(r'stringify\w+', _base(node[1])) and _base(node[1]) not in ('tie', 'equal', 'swap', 'zip_first') and node[1] != 'SaturatedInteger::wrap' \
                 and not _base(node[1]).startswith(('get', 'verify', 'is', 'compute', 'infer')):
             bad.add(f'限定名 {node[1]}')
-        if node and node[0] == 'tid' and _base(node[1]) not in ('isa', 'cast', 'dyn_cast', 'dyn_cast_or_null', 'cast_or_null', 'isa_and_nonnull', 'dyn_cast_if_present', 'static_cast', 'SmallVector', 'ArrayRef', 'IsaPred', 'seq', 'min', 'max') \
+        if node and node[0] == 'tid' and _base(node[1]) not in ('isa', 'cast', 'dyn_cast', 'dyn_cast_or_null', 'cast_or_null', 'isa_and_nonnull', 'dyn_cast_if_present', 'static_cast', 'SmallVector', 'ArrayRef', 'IsaPred', 'seq', 'min', 'max', 'get', 'to_vector') \
                 and find_function(CUR['dia'] or '', _base(node[1])) is None:
             bad.add(f'模板 {node[1]}')
         for x in node: _scan_stmts(x, bad, tag)
@@ -1813,8 +2027,10 @@ def verify_literals(dia, opname):
             b = _base(n)
             im = inline_methods(dia, opname).get(b)
             if im is not None: walk(im[1], b); continue
-            fm = find_method(dia, cls, b)
-            if fm is not None: walk(fm[1], b); continue
+            fms = find_methods(dia, cls, b)                    # 第 82 轮：全部重载
+            if fms:
+                for i_, fm in enumerate(fms): walk(fm[1], f'{b}#{i_}')
+                continue
             ff = find_function(dia, b)
             if ff is not None: walk(ff[2], b)
     walk(body, 'verify')
