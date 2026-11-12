@@ -325,6 +325,17 @@ def rel_check(opname, attrs, ins, outs):
             if None not in ts and len(set(ts)) > 1: out.append(f"{{{', '.join(tr['values'])}}} 类型不同")
     return out
 
+def type_coupled(opname):
+    """第 84 轮：属性层是否与端口类型耦合。只有 rel_check（引用属性的 AllTypesMatch）读端口类型；check() 只读属性。
+    无耦合 ⇒ 属性原子与端口无关，在 Φ_comp 中是常量原子（定义时求值一次）。"""
+    dia = opname.split('.')[0]
+    if attr_args(opname) is None or dia not in O.DIALECTS or opname not in O.ops(dia): return False
+    d = O.records(dia); r = d[O.ops(dia)[opname]]; an = {e['name'] for e in attr_args(opname)}
+    for t in r.get('traits', []):
+        tr = d.get(O.ref(t), {})
+        if 'AllTypesMatch' in tr.get('!superclasses', []) and any(v in an for v in tr.get('values', [])): return True
+    return False
+
 def node_check(n, ins, outs):
     """core.typecheck 的属性层：返回诊断列表（终判，与自动签名同级：A1/A2 证明不误拒）。
     已导入节点：必需性 + 约束 + 关系。core 形式的节点：翻译后的属性做约束 + 关系；必需性不查（core 的简写由降级补齐，如切片的 static_*）。"""
