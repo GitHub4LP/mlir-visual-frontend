@@ -41,6 +41,20 @@ def _template(txt):
     t = txt
     for i, n in enumerate(names): t = re.sub(r'\$' + n + r'\b', f'${i + 1}', t)
     return t, names
+def pred_cpp(d, name):
+    """第 90 轮：PredOpTrait 的谓词树 → C++ 布尔表达式（按 tblgen 的方式：And/Or/Neg 组合，SubstLeaves 文本替换 $_self）。
+    Concat 等不支持 ⇒ None。$_op 与 $名 留给 cppverify 替换。"""
+    r = d[name]; sc = r['!superclasses']
+    if 'CPred' in sc: return '(' + r['predExpr'].strip() + ')'
+    kids = [pred_cpp(d, O.ref(c)) for c in (r.get('children') or ([r['child']] if r.get('child') else []))]
+    if any(k is None for k in kids): return None
+    if 'SubstLeaves' in sc:
+        return kids[0].replace(r['pattern'], '(' + r['replacement'].strip() + ')') if len(kids) == 1 else None
+    if 'And' in sc: return '(' + ' && '.join(kids) + ')' if kids else '(true)'
+    if 'Or' in sc: return '(' + ' || '.join(kids) + ')' if kids else '(false)'
+    if 'Neg' in sc and len(kids) == 1: return '(!' + kids[0] + ')'
+    if 'TruePred' in sc or name == 'TruePred': return '(true)'
+    return None
 XF_OP = {   # TypesMatchWith 的 transformer（对 $_self）
     O.norm('$_self'): lambda t: t, O.norm('::llvm::cast<Type>($_self)'): lambda t: t,
     O.norm('::getI1SameShape($_self)'): i1same,
@@ -147,7 +161,12 @@ def sig(dialect, opname):
                         m = re.fullmatch(rx, O.norm(txt[0]))
                         if m: hit = mk(*m.groups())
                 if hit: S['rel'].append((hit[0], [x if isinstance(x, tuple) else ('name', x) for x in hit[1]], 'cpred'))
-                else: S['unknown'].append(f'PredOpTrait: {tr.get("summary", "")[:60]}')
+                else:
+                    key = f'PredOpTrait: {tr.get("summary", "")[:60]}'
+                    while key in S['unknown']: key += '′'
+                    S['unknown'].append(key)
+                    src = pred_cpp(d, O.ref(tr['predicate']))          # 第 90 轮：整棵谓词树译成 C++ 布尔表达式，由 cppverify 解释执行
+                    if src is not None: S.setdefault('predtrait', {})[key] = src
         elif 'NativeOpTrait' in sc or 'ParamNativeOpTrait' in sc or 'GenInternalOpTrait' in sc:
             t = tr.get('trait') or name
             if t in NATIVE_OK: S['rel'].append((NATIVE_OK[t], [], 'ods'))

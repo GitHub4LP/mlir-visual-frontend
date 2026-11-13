@@ -793,3 +793,10 @@ R_j(t) ≝ ∃ 其余端口. Φ_comp，即用户需求里“签名允许的最�
 - 首跑结果（2026-11-13 09:58）：**W2 FAIL**。段一 unknown 402→243 但 **P5 违例 17**（memref.distinct_objects：规则经 isinstance 检查端口，未触发哨兵读取 ⇒ 抽象 False 不可靠；P4 in 9022→9005 同源）；段二 2770→1855（−33.0%），P1–P5 PASS。
 - 修复（事后，非判据变更）：_U.__class__ 属性也抛 _Unbound，使 isinstance 计为读取。以同一判据 W2 重跑两段，记为 W2'（修复后重判，如实区分）。
 - W2' 结果（2026-11-13 10:09，修复后重判）：段一 unknown 402→243（−39.6%），段二 2770→1866（−32.6%）。**W2' PASS**（修复是在首跑 FAIL 后做的，属事后修复重判）。剩余未定集中在 vector.transfer_read、insert、insert_strided_slice、outerproduct、from_elements、gather——规则先读其余端口再读 t 自身，抽象求值遇读取即停，两段 P1/P4 不一致 0、P2/P5 违例 0。
+
+### §9.29 第 90 轮：PredOpTrait 谓词解释执行 + 类型 Builder 词汇（判据写定于 2026-11-13 约 15:30 CST，运行前）
+- 机制：odssig.pred_cpp 把 PredOpTrait 谓词树整体译成 C++ 布尔表达式（$_op → 被校验 op，$名 → 访问器），由 cppverify 解释器执行（静态完备检查同 C++ verify），nfrules 以 CPPPRED 挂接。cppverify 另补 RankedTensorType/MemRefType/VectorType::Builder（setShape/setElementType 只换对应分量）与 llvm::binary_search（未排序 ⇒ 未定）。
+- 判据（predtrait_test，运行前写定）：P1 误拒 0（比较 ≥ 200）；P2 漏判 0（诊断 ≥ 20）；P3 未定 0 且无 Python 异常；P4 残差为空时 core.typecheck ≡ MLIR（比较 ≥ 50）。
+- 结果：P1 比较 906 误拒 0；P2 诊断 187 漏判 0；P3 未定 0；P4 比较 175（MLIR 拒绝 122）误拒 0 误收 0 —— **PASS**。tensor.gather/scatter 定向 cppverify：C1/C2/C3/C5 PASS（定向首跑 C3 未定 46、C5 误收 25：Builder 方法分派被类型元组分支抢先，修正分派顺序后重跑，属事后修复，如实记录）。
+- 残差：残差为空 468→474，条目 611→601；可规范化 59→49（PredOpTrait 10→2，词汇 29→27）。
+- 全量回归（scripts/check_all.sh，logs/r90，26 段 100 判据行）：总判定 PASS；可靠性字段全 0；已知数量阈值 FAIL 11 条与第 89 轮相同；变化 8 行均为比较数增加或未定减少。运行中沙箱重置一次，r2、f1 重跑。

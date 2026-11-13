@@ -24,7 +24,7 @@ class _Continue(Exception): pass
 
 DYN = -(2 ** 63)                    # ShapedType::kDynamic
 _HERE = os.path.dirname(os.path.abspath(__file__))
-CPP_DIR = os.path.join(_HERE, '..', 'inventory', 'cpp')
+CPP_DIR = next((p_ for p_ in (os.path.join(_HERE, '..', 'inventory', 'cpp'), os.path.join(_HERE, '..', '..', 'inventory', 'cpp')) if os.path.isdir(p_)), os.path.join(_HERE, '..', 'inventory', 'cpp'))   # 开发副本 work/devN 也能找到
 
 # ───────────────────────── 词法
 _TOK = re.compile(r'''
@@ -758,7 +758,7 @@ FREE_FNS = {'success', 'failure', 'failed', 'succeeded', 'isa', 'cast', 'dyn_cas
             'isPowerOf2_64', 'max', 'min', 'abs', 'isDynamic', 'isStatic', 'emitOpError', 'emitError', 'getOperation', 'getNumOperands', 'getNumResults',
             'getOperand', 'getResult', 'getType', 'getOperandTypes', 'getResultTypes', 'getOperands', 'getResults', 'seq', 'product', 
             'verifyCompatibleShape', 'getElementTypeOrSelf', 'drop_begin', 'drop_end', 'reverse', 'to_vector', 'SmallVector', 'ArrayRef', 'getConstantIntValue',
-            'isPermutationVector', 'accumulate', 'is_sorted', 'zip_first', 'swap', 'tie', 'equal', 'getMixedValues', 'emitOptionalError', 'verifyCompatibleShapes', 'append_range', 'back_inserter', 'copy', 'getTensorTypeFromMemRefType', 'map_range', 'to_vector', 'to_string', 'string', 'APInt', 'getAffineDimExpr', 'getAffineSymbolExpr', 'getAffineConstantExpr', 'move', 'Twine'}
+            'isPermutationVector', 'accumulate', 'is_sorted', 'binary_search', 'zip_first', 'swap', 'tie', 'equal', 'getMixedValues', 'emitOptionalError', 'verifyCompatibleShapes', 'append_range', 'back_inserter', 'copy', 'getTensorTypeFromMemRefType', 'map_range', 'to_vector', 'to_string', 'string', 'APInt', 'getAffineDimExpr', 'getAffineSymbolExpr', 'getAffineConstantExpr', 'move', 'Twine'}
 
 class Interp:
     def __init__(self, op, depth=0):
@@ -1093,6 +1093,12 @@ class Interp:
         q = n.split('::')
         if len(q) >= 2 and q[-1] == 'get' and q[-2] not in CTORS and _nullary_type(q[-2], self.op.dia) is not None:
             return _nullary_type(q[-2], self.op.dia)          # 无参数的方言类型 X::get(ctx)：!shape.size 等
+        if TB_RE.match(n):
+            a_ = [self.ev(a, env) for a in args_e]
+            if len(a_) != 1: raise CppUnknown('类型 Builder 构造')
+            t_ = _ty(a_[0])
+            if not (isinstance(t_, tuple) and t_ and t_[0] in ('tensor', 'memref', 'vector') and t_[1] is not None): raise CppUnknown('类型 Builder 实参')
+            return TB(t_)
         if len(q) >= 2 and q[-1] == 'get' and q[-2] in CTORS:
             return CTORS[q[-2]]([self.ev(a, env) for a in args_e])
         if len(q) == 2 and q[0].endswith('Op') and not q[0].startswith('std'):
@@ -1138,6 +1144,10 @@ class Interp:
             return {'any_of': any(r), 'all_of': all(r), 'none_of': not any(r), 'count_if': sum(r)}[b]
         if b == 'count': return sum(1 for x in self.iter(args[0]) if _eq(x, args[1]))
         if b == 'is_sorted': xs = [_num(x) for x in self.iter(args[0])]; return xs == sorted(xs)
+        if b == 'binary_search':                                          # 第 90 轮：llvm::binary_search（前提：已排序；未排序为未定义行为 ⇒ 未定）
+            xs = [_num(x) for x in self.iter(args[0])]
+            if xs != sorted(xs): raise CppUnknown('binary_search 未排序')
+            return _num(args[1]) in xs
         if b == 'is_contained': return any(_eq(x, args[1]) for x in self.iter(args[0]))
         if b == 'enumerate':
             if len(args) == 1: return [EnumPair((i, x)) for i, x in enumerate(self.iter(args[0]))]
@@ -1226,6 +1236,7 @@ class Interp:
     def method(self, recv, m, targs, args_e, env, pre=None):
         args = pre if pre is not None else [self.ev(a, env) for a in args_e]
         if isinstance(recv, tuple) and recv and recv[0] == '\x00bound': recv = self.method(recv[1], recv[2], recv[3], [], env, pre=[])
+        if isinstance(recv, TB) and m in ('setShape', 'setElementType'): return _tb_set(recv, m, args)   # 第 90 轮
         if isinstance(recv, Self): return self.op_method(m, args, env, targs)
         if isinstance(recv, AExpr):                                       # 第 82 轮：AffineExpr 方法
             k_, e_ = _aexpr_kind(recv.e)
@@ -1638,6 +1649,19 @@ class BackIns:
     def __init__(self, dst): self.dst = dst
 class Props:
     """adaptor.getProperties()：成员即属性存储。"""
+class TB(tuple):
+    """第 90 轮：RankedTensorType::Builder / MemRefType::Builder / VectorType::Builder（mlir/IR/BuiltinTypes.h）：
+    以原类型为初值，setShape/setElementType 只替换对应分量，其余（编码、布局、内存空间、可伸缩标记）原样保留；隐式转换为类型。"""
+TB_RE = re.compile(r'(?:::)?(?:mlir::)?(RankedTensorType|MemRefType|VectorType)::Builder$')
+def _tb_set(recv, m, args):
+    t = tuple(recv)
+    if m == 'setShape':
+        sh = tuple(None if _num(x) == DYN else _num(x) for x in args[0])
+        if t[1] is not None and len(sh) != len(t[1]) and len(t) > 3: raise CppUnknown('Builder.setShape 改秩且带布局/可伸缩标记')
+        if t[0] == 'vector' and None in sh: raise CppUnknown('VectorType 动态维')
+        return TB(t[:1] + (sh,) + t[2:])
+    if m == 'setElementType': return TB(t[:2] + (_ty(args[0]),) + t[3:])
+    raise CppUnknown(f'类型 Builder.{m}')
 class BuilderV:
     """mlir::Builder：只用到其类型工厂。"""
 BUILDER_TYPES = {'getIndexType': ('index',), 'getI1Type': ('i', 1, ''), 'getI8Type': ('i', 8, ''), 'getI16Type': ('i', 16, ''), 'getI32Type': ('i', 32, ''),
@@ -2032,7 +2056,7 @@ def _calls(node, out):
     elif isinstance(node, list):
         for x in node: _calls(x, out)
 
-KNOWN_METHODS = TYPE_METHODS | {'assign', 'equals', 'getProperties', *BUILDER_TYPES, 'getNumDims', 'getNumSymbols', 'getNumInputs', 'isPermutation', 'isProjectedPermutation', 'getAffineMap', 'getAttrOfType', 'isEmpty', 'cloneWith', 'getContext', 'isLastDimUnitStride', 'isStrided', 'reserve', 'getType', 'size', 'empty', 'front', 'back', 'getTypes', 'push_back', 'emplace_back', 'append', 'drop_front', 'drop_back',
+KNOWN_METHODS = TYPE_METHODS | {'setShape', 'setElementType', 'assign', 'equals', 'getProperties', *BUILDER_TYPES, 'getNumDims', 'getNumSymbols', 'getNumInputs', 'isPermutation', 'isProjectedPermutation', 'getAffineMap', 'getAttrOfType', 'isEmpty', 'cloneWith', 'getContext', 'isLastDimUnitStride', 'isStrided', 'reserve', 'getType', 'size', 'empty', 'front', 'back', 'getTypes', 'push_back', 'emplace_back', 'append', 'drop_front', 'drop_back',
                                 'take_front', 'slice', 'contains', 'isIdentity', 'has_value', 'value', 'getInt', 'getValue', 'getSInt', 'getUInt',
                                 'asArrayRef', 'getNumElements', 'failed', 'succeeded', 'getOperation', 'getNumOperands', 'getNumResults', 'getOperand',
                                 'getOperands', 'getResults', 'getOperandTypes', 'getResultTypes', 'getResult', 'emitOpError', 'emitError', 'isa', 'cast', 'dyn_cast',
@@ -2048,6 +2072,8 @@ def completeness(dia, opname, which='verify'):
         try: [_params(x[0]) for x in (inf, comp) if x]
         except CppUnknown as e: return (False, frozenset({f'形参: {e}'}))
         extra = [comp[1]] if comp else []
+    elif which.startswith('src:'):                                  # 第 90 轮：合成的 verify 体（PredOpTrait 谓词）
+        cls, body = verify_source(dia, opname)[0], which[4:]; extra = []
     elif which.startswith('iface:'):
         src = iface_source(dia, opname, which[6:]); extra = []
         cls, body = (src if src else (verify_source(dia, opname)[0], None))
@@ -2081,6 +2107,7 @@ def completeness(dia, opname, which='verify'):
                 if fms:
                     for i_, fm in enumerate(fms): walk(fm[1], f'{n}#{i_}')
                     continue
+            if k == 'fn' and TB_RE.match(n): continue
             if k == 'fn' and n in lam: continue
             if k == 'fn' and n == 'SaturatedInteger::wrap': continue
             if b in KNOWN_METHODS or b in FREE_FNS - {'getConstantIntValue'} or b in acc: continue
@@ -2118,6 +2145,7 @@ def _scan_stmts(node, bad, tag):
                 and not (node[1].split('::')[-1] == 'get' and (node[1].split('::')[-2] in CTORS or _nullary_type(node[1].split('::')[-2], CUR['dia'] or '') is not None)) \
                 and not (node[1].split('::')[-2] in enum_classes() and not enum_classes()[node[1].split('::')[-2]][2]) \
                 and not re.fullmatch(r'stringify\w+', _base(node[1])) and _base(node[1]) not in ('tie', 'equal', 'swap', 'zip_first') and node[1] != 'SaturatedInteger::wrap' \
+                and not TB_RE.match(node[1]) \
                 and not _base(node[1]).startswith(('get', 'verify', 'is', 'compute', 'infer')):
             bad.add(f'限定名 {node[1]}')
         if node and node[0] == 'tid' and _base(node[1]) not in ('isa', 'cast', 'dyn_cast', 'dyn_cast_or_null', 'cast_or_null', 'isa_and_nonnull', 'dyn_cast_if_present', 'static_cast', 'SmallVector', 'ArrayRef', 'IsaPred', 'seq', 'min', 'max', 'get', 'to_vector') \
@@ -2254,3 +2282,35 @@ def compile_attr_atom(txt):
         if isinstance(v, (int, bool)): return bool(v)
         raise CppUnknown('原子值')
     return f
+
+# ───────────────────────── 第 90 轮：PredOpTrait 谓词（ODS 谓词树译成 C++ 表达式，与 verify 同一解释器）
+def pred_body(S, expr):
+    """$_op ⇒ 自身；$名 ⇒ 该端口/属性的 ODS 访问器（tblgen 的替换：命名操作数/结果为 Value，属性为属性值）。"""
+    names = {nm for nm, *_ in S['ins'] + S['outs'] if nm} | {nm for nm, *_ in S['attrs']}
+    def rep(m):
+        n = m.group(1)
+        if n not in names: raise CppUnknown(f'PredOpTrait 未知占位 ${n}')
+        return f'(*this).get{camel(n)}()'
+    e = re.sub(r'\$(?!_)(\w+)', rep, _subst_op(expr))
+    return f'if (!({e})) return emitOpError("PredOpTrait"); return success();'
+def rule_pred(S, key, expr):
+    """→ (nf 规则, 静态完备?) 或 None。"""
+    dia = S['op'].split('.')[0]
+    if not verify_source(dia, S['op'])[0]: return None
+    try: body = pred_body(S, expr)
+    except CppUnknown: return None
+    import nfrules as NF
+    refs = [('name', nm) for nm, *_ in S['ins']] + [('name', nm) if nm is not None else ('res', k) for k, (nm, *_) in enumerate(S['outs'])]
+    def fn(*a):
+        groups, attrs = list(a[:-1]), a[-1]
+        CUR['dia'] = dia; CUR['opname'] = S['op']
+        it = Interp(Op(dia, S['op'], S, groups, None if attrs is None else {k: v for k, v in attrs.items() if not k.startswith('\x00')}, verify_source(dia, S['op'])[0]))
+        try: ok, msg = it.run_verify(body)
+        except CppUnknown as e: raise NF.NFUnknown(f'PredOpTrait: {e}')
+        except InvariantFail: return False
+        except RecursionError: raise NF.NFUnknown('PredOpTrait: 递归')
+        except Exception as e:
+            STATS['python 异常'] += 1; raise NF.NFUnknown(f'PredOpTrait 解释器异常 {type(e).__name__}')
+        return ok
+    ok, _ = completeness(dia, S['op'], 'src:' + body)
+    return ('nf', refs, 'nf', f'{key}（ODS 谓词，9bae84b0 解释执行）', fn, 'opt'), ok
