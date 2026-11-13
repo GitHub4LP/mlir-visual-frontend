@@ -21,7 +21,8 @@ def _base(d, c):
 NATIVE_OK = {   # native trait → 关系（C++ 实现见 mlir/lib/IR/Operation.cpp 的 OpTrait::impl::verify*）
     'SameOperandsAndResultType': 'samec_all', 'SameTypeOperands': 'same_ops', 'SameOperandsShape': 'shape_ops',
     'SameOperandsAndResultShape': 'shape_all', 'SameOperandsElementType': 'elt_ops', 'SameOperandsAndResultElementType': 'elt_all',
-    'Elementwise': 'elementwise'}
+    'Elementwise': 'elementwise',
+    'SameOperandsAndResultRank': 'rank_all'}   # 第 93 轮：Operation.cpp verifySameOperandsAndResultRank
 NATIVE_NOVERIFY = {'AlwaysSpeculatableImplTrait', 'RecursivelySpeculatableImplTrait', 'IsCommutative', 'Scalarizable', 'Vectorizable',
                    'Tensorizable', 'IsIdempotent', 'ConstantLike', 'HasRecursiveMemoryEffects', 'MemRefsNormalizable', 'InferTypeOpAdaptor'}
 STRUCTURAL = re.compile(r'IsTerminator|HasParent<|SingleBlock|NoTerminator|IsIsolatedFromAbove|AffineScope|AutomaticAllocationScope|'
@@ -253,6 +254,8 @@ def check(S, ins, outs, levels=('ods', 'cpred', 'nf'), attrs=None, strict=False)
         elif k == 'elt_ops': ok = all(E(a) == E(opd[0]) for a in opd)
         elif k == 'elt_all': ok = all(E(a) == E((opd + res)[0]) for a in opd + res)
         elif k == 'elementwise': ok = _elementwise(opd, res)
+        elif k == 'rank_all':                                    # 第 93 轮：至少一个操作数；有秩的操作数与结果秩相同（无秩不参与）
+            ok = bool(opd) and len({len(t[1]) for t in opd + res if ranked(t)}) <= 1
         elif k == 'same': ok = all(t == ts[0] for t in ts)
         elif k == 'elt_eq': ok = all(E(t) == E(ts[0]) for t in ts)
         elif k == 'rank_eq': ok = all(ranked(t) for t in ts) and len({len(t[1]) for t in ts}) <= 1

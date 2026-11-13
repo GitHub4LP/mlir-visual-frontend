@@ -32,7 +32,9 @@ for dia in O.DIALECTS:
                 if ok: b = 'C++ 完备但仍在残差（需查）'
                 else:
                     txt = ' '.join(sorted(bad)); b = None
-                    if '<无源码>' in txt: b = '无 C++ 源码（未下载 / 生成代码）'
+                    if '<无源码>' in txt:                                  # 第 93 轮：verifyWithRegions 的接口 verify 不是缺源码，是区域层校验（原先误归此桶）
+                        wr = which.startswith('iface:') and any(t == which[6:] and str(r.get('verifyWithRegions')) in ('1', 'True') for t, r in CV.op_ifaces(dia, op))
+                        b = '接口区域 verify（verifyWithRegions，区域结构）' if wr else '无 C++ 源码（未下载 / 生成代码）'
                     for nm, rx in BUCKETS:
                         if b is None and re.search(rx, txt): b = nm
                     if b is None: b = '解释器词汇未覆盖（可扩）'

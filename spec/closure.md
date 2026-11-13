@@ -800,3 +800,12 @@ R_j(t) ≝ ∃ 其余端口. Φ_comp，即用户需求里“签名允许的最�
 - 结果：P1 比较 906 误拒 0；P2 诊断 187 漏判 0；P3 未定 0；P4 比较 175（MLIR 拒绝 122）误拒 0 误收 0 —— **PASS**。tensor.gather/scatter 定向 cppverify：C1/C2/C3/C5 PASS（定向首跑 C3 未定 46、C5 误收 25：Builder 方法分派被类型元组分支抢先，修正分派顺序后重跑，属事后修复，如实记录）。
 - 残差：残差为空 468→474，条目 611→601；可规范化 59→49（PredOpTrait 10→2，词汇 29→27）。
 - 全量回归（scripts/check_all.sh，logs/r90，26 段 100 判据行）：总判定 PASS；可靠性字段全 0；已知数量阈值 FAIL 11 条与第 89 轮相同；变化 8 行均为比较数增加或未定减少。运行中沙箱重置一次，r2、f1 重跑。
+
+### §9.30 第 93 轮：秩一致 trait、FunctionType、TensorLike/BufferLike 与类型接口外部模型（2026-11-14）
+- 机制（批量，不逐 op）：odssig/composite 新增 native trait `SameOperandsAndResultRank`（rank_all：至少一个操作数，有秩者秩相同；依据 IR/Operation.cpp verifySameOperandsAndResultRank）；cppverify 增加 FunctionType 的 getInputs/getResults/getNumInputs/getNumResults（由 MLIR 自身解析）、`TensorLikeType`/`BufferLikeType` 的 isa（内建 tensor/memref 为真；已导入方言中无实现者的方言类型为假；未导入方言为未定）、类型接口方法回退到本方言 `X::attachInterface<M>` 外部模型执行；UnrankedTensorType/UnrankedMemRefType::getShape() 返回空（BuiltinTypes.td），仅当接收者静态类型为 ShapedType/Unranked* 时取此值，TensorType/BaseMemRefType 或静态类型不明时沿用“断言 ⇒ 拒绝”。attr_residual 新增“接口区域 verify（verifyWithRegions）”桶。
+- 首次全量回归（logs/r93_attempt1）**FAIL**：L1 按账目有分歧 2（bufferization.to_tensor/to_buffer）。原因两层：①开发时把“外部模型内断言”改记为未定（理由是发布版不断言），使 `memref<*xi1>→tensor<2x3xi1>` 在残差为空的 op 上被接受，而 MLIR 拒绝；②TensorLike isa 对方言类型运行时未定，类型原子按上近似取真，`!shape.shape` 被接受。另 cppverify 段 cv2/cv3 超时：每次调用新建 MLIR Context（Tensor 语料单文件 5000+ 次），耗时增至 2–4 倍。
+- 修复（事后，判据不变）：撤销“断言 ⇒ 未定”，改为按 BuiltinTypes.td 精确建模 unranked getShape；TensorLike/BufferLike 在已导入方言上封闭判定；每进程共享一个 Context（关多线程以便 fork）。MLIR 核对：`memref<*xf32>→tensor<f32>` 接受、`memref<*xf32>→tensor<2xf32>` 拒绝、`!shape.shape` 拒绝，模型一致。
+- 定向差分 work/dev93/diff93.py（to_tensor/to_buffer、call_indirect、shard 四个集体通信 op，对 MLIR）：336 例，一致 313，误拒 0，残差为空误收 0，模型未定 0；其余 23 例为 shard 残差非空（符号义务）时模型接受、MLIR 拒绝。
+- 修复后全量回归（logs/r93b，26 段 100 判据行）：总判定 PASS；可靠性字段全 0；已知数量阈值 FAIL 11 条与第 92 轮相同；cv2 计数与第 92 轮逐数相同。扩展方言 S1–S4、R1、R2 PASS（数字同第 92 轮）。运行中沙箱重置约 4 次，由断点续跑补齐。
+- 残差（logs/attr.json）：op 650，残差为空 461→464，条目 622→610。条目减少部分来自归因改桶（verifyWithRegions 原误记为“无源码”），不全是规范化增量。非 Transform 的可规范化残差：词汇 27、类型 CPred 4、属性 CPred 5、native trait 1，合计 37（第 92 轮口径 49）；另有符号使用义务 18 条（shard）未做。
+- 已知局限：类型原子运行时未定仍按上近似取真（未导入方言类型）；unranked getShape 的接收者静态类型只跟踪显式声明与 `auto x = cast<T>(…)`。
