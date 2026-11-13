@@ -24,7 +24,7 @@
 - 范围：Φ_comp 的“最大性”对顶层推导与入口边定义的区域类型流成立（以 ODS 推断与字面量为界）。
 
 ## 3. 边界（C4）：残差逐条归因
-650 op 中残差为空 468；残差条目 611，**全部落入下列有名边界，未分类 0**（`scripts/attr_residual.py`，按源码不支持构造的正则分桶，分桶本身是启发式、不是判据）。
+650 op 中残差为空 474；残差条目 601（第 90 轮，原 468 / 611），**全部落入下列有名边界，未分类 0**（`scripts/attr_residual.py`，按源码不支持构造的正则分桶，分桶本身是启发式、不是判据）。
 
 | 边界 | 条目 | 性质 |
 |---|---|---|
@@ -32,14 +32,14 @@
 | 父 op / 区域 / 块结构 | 38 | 约束依赖所在父 op 或区域内容，不是端口类型（affine 作用域、gpu 启动体等） |
 | 无 C++ 源码（生成代码接口） | 13 | RegionBranch / LoopLike 等接口 verify 在生成代码中 |
 | 区域 verify（verifyRegions） | 6 | 区域结构 |
-| 解释器词汇未覆盖 | 29 | 可批量补（如 WidthComparator/type_list 模板、RankedTensorType::Builder、operand_begin） |
-| PredOpTrait 的 $_op 谓词 | 10 | 跨端口 C++ 谓词未编译 |
+| 解释器词汇未覆盖 | 27 | 可批量补（如 WidthComparator/type_list 模板、operand_begin）；第 90 轮补 RankedTensorType::Builder、binary_search（tensor.gather/scatter） |
+| PredOpTrait 的 $_op 谓词 | 2 | 第 90 轮起谓词树整体译为 C++ 由解释器执行（predtrait_test P1–P4）；剩 bufferization.to_tensor/to_buffer 的 typesMatchAfterBufferization（类型接口） |
 | ODS 类型 CPred 未编译 | 8 | |
 | 属性 CPred 未编译 | 5 | |
 | native trait 未建模 | 5 | SameOperandsAndResultRank 4、HasDefaultDLTIDataLayout 1 |
 | TypesMatchWith 变换未解释 | 2 | func.call_indirect |
 
-- 非 Transform 残差共 116 条（86 个 op）：57 条属结构层，59 条属可规范化而未做。
+- 非 Transform 残差共 106 条（80 个 op）：57 条属结构层，49 条属可规范化而未做（第 90 轮前为 116 条 / 86 个 op / 59 条）。
 - 单点 Unknown（残差为空但单端口范围无法判定）：段一 243/15767≈1.5%、段二 1866/25034≈7.5%（第 88 轮）。成因：规则先读其余端口再读本端口，抽象求值遇读取即停（§9.28）。
 
 ## 4. 一键检验（C5）

@@ -190,6 +190,8 @@ if __name__ == '__main__':
     start = int(sys.argv[2]) if len(sys.argv) > 2 else 0
     tot = collections.Counter(); exs = collections.defaultdict(list); ctxm = mp.get_context('fork')
     files = (sorted(glob.glob('corpus/*/*.mlir')) + sorted(glob.glob('corpus_ext/Linalg/*.mlir')))[start:lim]
+    import os
+    if os.environ.get('CV_FILTER'): files = [f for f in files if re.search(os.environ['CV_FILTER'], open(f, errors='ignore').read())]   # 第 90 轮：定向（只取含指定 op 的文件）
     for i, path in enumerate(files, start):
         q = ctxm.Queue(); p = ctxm.Process(target=run_file, args=(path, q, i)); p.start()
         try: st, ex = q.get(timeout=600)

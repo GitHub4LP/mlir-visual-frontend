@@ -375,7 +375,7 @@ def apply(S, reg=None):
 # 映射来源：linalg.generic ← 属性 indexing_maps / iterator_types；opdsl 命名 op ← LinalgNamedStructuredOps.yaml（符号按 index 属性或默认值绑定）。
 # 手写 getIndexingMaps 的 9 个 op（matmul 族、contract、elementwise、transpose、broadcast、reduce、map）暂不套用，条目留在残差。
 import os as _os
-_YAML = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), '..', 'inventory', 'LinalgNamedStructuredOps.yaml')
+_YAML = next((p_ for p_ in (_os.path.join(_os.path.dirname(_os.path.abspath(__file__)), *u_, 'inventory', 'LinalgNamedStructuredOps.yaml') for u_ in (('..',), ('..', '..'))) if _os.path.exists(p_)), _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), '..', 'inventory', 'LinalgNamedStructuredOps.yaml'))   # 开发副本也能找到
 
 @functools.lru_cache(None)
 def linalg_yaml():
@@ -1261,6 +1261,7 @@ def _body_rule(S):
 _apply0 = apply
 CPPINFER_FWD = True       # 第 80 轮：等式语义 op 的 C++ inferReturnTypes 用于正向推导（odscomp._cpp_result_exprs、composite.infer_types）；检验时切换比较
 CPPIFACE = True           # 第 83 轮：接口 verify 解释执行（cppverify.rule_iface）
+CPPPRED = True            # 第 90 轮：PredOpTrait 谓词（ODS 谓词树 → C++ 表达式）解释执行
 CPPVERIFY = True          # 第 78 轮：C++ verify 解释执行（cppverify.py），对全部仍含 'C++ verify()' 残差的 op 一次生效
 def apply(S, reg=None):
     S = _apply0(S, reg)
@@ -1293,6 +1294,16 @@ def apply(S, reg=None):
             S = dict(S); S['rel'] = S['rel'] + [r]
             if complete:
                 S['nf_covered'] = S.get('nf_covered', []) + [d_]; S['declared'] = [x for x in S['declared'] if x != d_]
+    if ENABLED and CPPVERIFY and CPPPRED and (reg is None or reg is REG) and S.get('predtrait'):   # 第 90 轮：PredOpTrait 谓词解释执行
+        import cppverify as _CV
+        for k_, src_ in S['predtrait'].items():
+            if k_ not in S['unknown']: continue
+            got = _CV.rule_pred(S, k_, src_)
+            if got is None: continue
+            r, complete = got
+            S = dict(S); S['rel'] = S['rel'] + [r]
+            if complete:
+                S['nf_covered'] = S.get('nf_covered', []) + [k_]; S['unknown'] = [x for x in S['unknown'] if x != k_]
     if ENABLED and (reg is None or reg is REG) and any('LinalgOp::Trait' in d for d in S.get('nf_covered', [])) \
             and S['ins'] and S['ins'][-1][0] in ('outputs', 'init', 'inits'):
         S = dict(S); S['rel'] = S['rel'] + [_body_rule(S)]

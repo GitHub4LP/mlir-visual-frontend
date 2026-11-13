@@ -23,3 +23,4 @@ k clauses_test
 n2e packconst_test
 n2f winograd_test
 scf scf_test
+pt predtrait_test
