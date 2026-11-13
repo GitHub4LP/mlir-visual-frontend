@@ -1,0 +1,25 @@
+cv1 cppverify_test 100 0
+cv2 cppverify_test 200 100
+cv3 cppverify_test 270 200
+cv4 cppverify_test 340 270
+cv5 cppverify_test 400 340
+s1 odscomp_test 6 4 125 0
+s2 odscomp_test 6 4 1000 125
+r1 regcomp_test 6 4 200 0
+r2 regcomp_test 6 4 1000 200
+f1 regflow_test 6 4 200 0
+f2 regflow_test 6 4 1000 200
+nfi1 nfiface_test 260 0
+nfi2 nfiface_test 1000 260
+ya projexact_test 125 0 --only-y
+yb projexact_test 1000 125 --only-y
+j cppinfer_test 8 4
+n1a nf_test arith.bitcast arith.extf arith.extsi arith.extui arith.fptosi arith.fptoui arith.index_cast arith.index_castui arith.sitofp arith.truncf arith.trunci arith.uitofp
+n1b nf_test memref.load memref.store tensor.cast tensor.dim tensor.extract_slice tensor.insert_slice vector.broadcast vector.shape_cast vector.transfer_read vector.transfer_write vector.transpose
+core core_test
+l1 odssig_test
+t1 odsdiff_test
+k clauses_test
+n2e packconst_test
+n2f winograd_test
+scf scf_test
