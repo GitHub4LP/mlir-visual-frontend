@@ -178,6 +178,7 @@ def run_file(path, q, seed):
                         finally: C.ORACLE_ON = old
                         if full_rej is not None:
                             st['C5 比较'] += 1; st['C5 MLIR 拒绝'] += not ok
+                            st['C5op ' + n['op']] += 1   # 第 92 轮：按 op 计 C5 覆盖
                             if ok and full_rej: st['C5 误拒'] += 1; note('C5 误拒', f"{n['op']} {kind} {T} {mu}")
                             if not ok and not full_rej: st['C5 误收'] += 1; note('C5 误收', f"{n['op']} {kind} {T} {mu} {' '.join(d[1] for d in diags)[:100]}")
     st['python 异常'] += CV.STATS['python 异常']
@@ -189,8 +190,10 @@ if __name__ == '__main__':
     lim = int(sys.argv[1]) if len(sys.argv) > 1 else 10 ** 9
     start = int(sys.argv[2]) if len(sys.argv) > 2 else 0
     tot = collections.Counter(); exs = collections.defaultdict(list); ctxm = mp.get_context('fork')
-    files = (sorted(glob.glob('corpus/*/*.mlir')) + sorted(glob.glob('corpus_ext/Linalg/*.mlir')))[start:lim]
     import os
+    files = (sorted(glob.glob('corpus/*/*.mlir')) + sorted(glob.glob('corpus_ext/Linalg/*.mlir')))[start:lim]
+    if os.environ.get('CV_EXT'):   # 第 92 轮：主语料未覆盖的方言（corpus_ext/<方言>，MLIR 9bae84b0 mlir/test/Dialect/<方言>）
+        files = [f for d in os.environ['CV_EXT'].split(',') for f in sorted(glob.glob(f'corpus_ext/{d}/*.mlir'))][start:lim]
     if os.environ.get('CV_FILTER'): files = [f for f in files if re.search(os.environ['CV_FILTER'], open(f, errors='ignore').read())]   # 第 90 轮：定向（只取含指定 op 的文件）
     for i, path in enumerate(files, start):
         q = ctxm.Queue(); p = ctxm.Process(target=run_file, args=(path, q, i)); p.start()
@@ -198,7 +201,11 @@ if __name__ == '__main__':
         except Exception: p.kill(); tot['文件超时/崩溃'] += 1; exs['文件超时/崩溃'].append(path); continue
         p.join(); tot.update(st)
         for k, v in ex.items(): exs[k] += v[:3]
+    c5ops = {k[5:]: v for k, v in tot.items() if k.startswith('C5op ')}
+    for k in list(tot):
+        if k.startswith('C5op '): del tot[k]
     print('── 合计'); [print(f'   {k}: {v}') for k, v in sorted(tot.items())]
+    print('── C5 覆盖 op', len(c5ops), ' '.join(f'{k}:{v}' for k, v in sorted(c5ops.items())))
     for k, v in exs.items(): print('──', k); [print('    ', x) for x in v[:10]]
     V.check('C1 解释器无误拒', tot['比较'] >= 1000 and tot['C1 误拒'] == 0 and tot['文件超时/崩溃'] == 0,
             f"比较 {tot['比较']}（op 实例 {tot['op 实例']}），MLIR 接受 {tot['MLIR 接受']}，误拒 {tot['C1 误拒']}，文件崩溃 {tot['文件超时/崩溃']}")

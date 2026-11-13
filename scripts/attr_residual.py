@@ -38,6 +38,7 @@ for dia in O.DIALECTS:
                     if b is None: b = '解释器词汇未覆盖（可扩）'
                     per[b].append((op, d, txt[:160]))
             elif d.startswith('native trait '): b = 'native trait 未建模'
+            elif d.startswith('符号使用义务'): b = '符号使用义务（verifySymbolUses，symtab.USES 未登记）'
             elif d.startswith('PredOpTrait'): b = 'PredOpTrait 的 $_op CPred 未编译（跨端口谓词）'
             elif d.startswith('属性约束'): b = '属性 CPred 未编译'
             elif d.startswith('TypesMatchWith'): b = 'TypesMatchWith 变换未解释'
