@@ -71,6 +71,20 @@ def run_file(path, q, kslice, seed):
                             else:
                                 st['P4 比较'] += 1; st['P4 不一致'] += m is not True
                                 if m is not True: note('P4 不一致', f'{[n["op"] for n in sl]} 端口{j} {w}')
+                        if r3 == 'unknown':     # 诊断（非判据）：未定点是见证搜索不足还是必要条件太弱
+                            others = sorted({cls[i] for i in range(len(ports))} - {cls[j]})
+                            ops = '+'.join(sorted({n['op'] for n in sl}))
+                            if r is D.UNK: st['U/点未定'] += 1; st['U/点未定/' + ops] += 1
+                            elif len(cands) ** len(others) > 3000: st['U/未穷举'] += 1; st['U/未穷举/' + ops] += 1
+                            else:
+                                hit = None
+                                for combo in itertools.product(cands, repeat=len(others)):
+                                    asg = dict(zip(others, combo)) | {cls[j]: t}
+                                    v = D.evaluate(Q, [asg[cls[i]] for i in range(len(ports))])
+                                    if v is True: hit = True; break
+                                    if v is D.UNK: hit = hit or 'unk'
+                                k = '搜索不足' if hit is True else '池内无补全' if hit is None else '池内仅未定'
+                                st['U/' + k] += 1; st[f'U/{k}/' + ops] += 1; note('U/' + k, f'{ops} 端口{j} {t} T0={T0}')
                         if r3 == 'out':
                             others = sorted({cls[i] for i in range(len(ports))} - {cls[j]})
                             if len(cands) ** len(others) > 3000: st['P5 未穷举'] += 1
