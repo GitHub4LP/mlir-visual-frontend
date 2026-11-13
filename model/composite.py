@@ -142,7 +142,7 @@ def check(sl, ports, T, oracle=True):
     finally: C.ORACLE_ON = old
 
 # ───────────────────────── L27 端口投影（第 24 轮，spec/closure.md §7）：建在有拒绝权的层上
-SUBSET_REL = {'same', 'elt_eq', 'same_ops', 'elt_ops', 'samec_all', 'shape_ops', 'shape_all', 'elt_all', 'rank_eq', 'shape_eq', 'tdims'}
+SUBSET_REL = {'same', 'elt_eq', 'same_ops', 'elt_ops', 'samec_all', 'shape_ops', 'shape_all', 'elt_all', 'rank_eq', 'shape_eq', 'tdims', 'rank_all'}
 def project(sl, ports, port, t, others=None):
     """“端口 port 接类型 t”是否可能有补全。返回 ('no', 节点, 原因) 或 ('maybe',)。
     只用必要条件，故可靠（'no' ⇒ 任何补全都被有拒绝权的层拒绝 ⇒ MLIR 拒绝，L33）：
@@ -210,7 +210,7 @@ def project(sl, ports, port, t, others=None):
             k = x[0]
             if x[2] not in ('ods', 'cpred') or k not in SUBSET_REL: continue
             if k in ('same_ops', 'elt_ops', 'shape_ops'): ts = opd
-            elif k in ('samec_all', 'shape_all', 'elt_all'): ts = opd + res
+            elif k in ('samec_all', 'shape_all', 'elt_all', 'rank_all'): ts = opd + res
             else: ts = [y for r in x[1] for y in grp(r) if y is not None]
             if len(ts) < 2: continue
             pairs = list(itertools.combinations(ts, 2))
@@ -222,6 +222,7 @@ def project(sl, ports, port, t, others=None):
                 if r0 is not None: ok = ok and all(compat_shape(y, r0) and y[0] == r0[0] for y in ts)
             elif k in ('shape_ops', 'shape_all'): ok = all(compat_shape(u, v) for u, v in pairs)
             elif k == 'rank_eq': ok = all(ranked(y) for y in ts) and len({len(y[1]) for y in ts}) <= 1
+            elif k == 'rank_all': ok = len({len(y[1]) for y in ts if ranked(y)}) <= 1
             elif k == 'shape_eq': ok = all(ranked(y) for y in ts) and len({y[1] for y in ts}) <= 1
             elif k == 'tdims':
                 sh = lambda y: y[1] if y[0] == 'tensor' and y[1] is not None else (None if y[0] == 'tensor' else ())

@@ -457,6 +457,35 @@ def verify_source(dia, opname):
     return (cls, got[1]) if got else (cls, None)
 
 # ───────────────────────── 第 83 轮：接口 verify（ODS 接口记录的 verify 体；$_op ⇒ 被校验 op 自身）
+def _concrete_type_class(t):
+    """内建类型项 → C++ 具体类名（attachInterface 的接收者）；方言类型 ⇒ None。"""
+    if t[0] == 'tensor': return 'RankedTensorType' if t[1] is not None else 'UnrankedTensorType'
+    if t[0] == 'memref': return 'MemRefType' if t[1] is not None else 'UnrankedMemRefType'
+    return {'vector': 'VectorType', 'i': 'IntegerType', 'index': 'IndexType', 'complex': 'ComplexType', 'tuple': 'TupleType', 'none': 'NoneType', 'fn': 'FunctionType'}.get(t[0])
+
+@functools.lru_cache(None)
+def type_ext_models(dia):
+    """第 93 轮：方言源码里 `X::attachInterface<M<X>>` / `X::attachInterface<M>` 登记的类型外部模型 → {具体类: 模型结构体的方法表 {名: (形参, 体)}}。
+    只认本方言文件（与 MLIR 一致：外部模型随方言加载而挂上，op 所在方言必已加载）。"""
+    out = {}
+    for f in _dialect_files(dia):
+        s = _file(f)
+        for m in re.finditer(r'\b(\w+)::attachInterface\s*<\s*(\w+)\s*(?:<\s*\w+\s*>)?\s*>', s):
+            cls, model = m.group(1), m.group(2)
+            sm = re.search(r'\bstruct\s+' + re.escape(model) + r'\b[^;{]*\{', s)
+            if not sm: continue
+            body = _body_at(s, sm.end()); meths = {}
+            for mm in re.finditer(r'(?:^|\n|;|\})\s*(?:static\s+|inline\s+)*[\w:<>,\s\*&]+?\b([A-Za-z_]\w*)\s*\(((?:[^()]|\([^()]*\))*)\)\s*(?:const\s*)?\{', body):
+                if mm.group(1) in ('if', 'for', 'while', 'switch', 'return'): continue
+                pre = body[:mm.start(1)]
+                if pre.count('{') - pre.count('}') != 0: continue
+                meths.setdefault(mm.group(1), (mm.group(2), _body_at(body, mm.end())))
+            out.setdefault(cls, {}).update({k: v for k, v in meths.items() if k not in out.get(cls, {})})
+    return out
+
+def type_ext_method(dia, cls, m):
+    return (type_ext_models(dia).get(cls) or {}).get(m) if cls else None
+
 def _subst_op(txt): return txt.replace('$_op', '(*this)')
 
 @functools.lru_cache(None)
@@ -679,11 +708,44 @@ TYPE_CLASSES = {
     'UnrankedTensorType': lambda t: t[0] == 'tensor' and t[1] is None, 'VectorType': lambda t: t[0] == 'vector', 'MemRefType': lambda t: t[0] == 'memref' and t[1] is not None,
     'BaseMemRefType': lambda t: t[0] == 'memref', 'UnrankedMemRefType': lambda t: t[0] == 'memref' and t[1] is None,
     'IntegerType': lambda t: t[0] == 'i', 'FloatType': lambda t: t[0] == 'f', 'IndexType': lambda t: t[0] == 'index', 'ComplexType': lambda t: t[0] == 'complex',
-    'NoneType': lambda t: t[0] == 'none', 'TupleType': lambda t: t[0] == 'tuple',
+    'NoneType': lambda t: t[0] == 'none', 'TupleType': lambda t: t[0] == 'tuple', 'FunctionType': lambda t: t[0] == 'fn',   # 第 93 轮
     'ScalableVectorType': lambda t: t[0] == 'vector' and any(_scal(t)), 'FixedVectorType': lambda t: t[0] == 'vector' and not any(_scal(t)),
 }
+BUILTIN_IFACE_TYPES = {'PtrLikeTypeInterface': 'memref', 'TensorLikeType': 'tensor', 'BufferLikeType': 'memref'}   # 内建类型中实现该类型接口的种类
 def _mods(t): return dict(t[3][1]) if len(t) > 3 and t[3] and t[3][0] == 'mods' else {}
 def _scal(t): return tuple(_mods(t).get('scalable', (False,) * len(t[1] or ())))
+def _static_ty(decl_ty, init):
+    """第 93 轮：声明的静态类型类名：显式类型取其基名；auto 取初始化式 cast/dyn_cast<T> 的 T；否则 None。"""
+    b = _base(re.sub(r'\bconst\b|[&*\s]', '', decl_ty or ''))
+    if b and b not in ('auto', 'Type'): return b
+    if b == 'auto' and isinstance(init, tuple) and init and init[0] == 'call' and init[1][0] == 'tid' and _base(init[1][1]) in ('cast', 'dyn_cast', 'cast_or_null', 'dyn_cast_or_null') and init[1][2]:
+        return _base(init[1][2][0])
+    return None
+def _recv_static_ty(e, env):
+    if e[0] == 'id':
+        x = env
+        while x is not None:
+            if '\x00ty:' + e[1] in x: return x['\x00ty:' + e[1]]
+            if e[1] in x: return None
+            x = x.get('\x00parent')
+        return None
+    if e[0] == 'call' and e[1][0] == 'tid' and _base(e[1][1]) in ('cast', 'dyn_cast') and e[1][2]: return _base(e[1][2][0])
+    return None
+_IFACE_KEY = {'TensorLikeType': 'TensorLike', 'BufferLikeType': 'BufferLike', 'PtrLikeTypeInterface': 'PtrLike'}
+@functools.lru_cache(None)
+def _dialect_may_implement(ns, iface):
+    """第 93 轮：方言 ns 的类型是否可能实现内建/缓冲化类型接口 iface。ns 未导入 ⇒ True（开放世界）；
+    已导入时查其 TypeDef 记录的 traits 与方言源码（attachInterface / Type::TypeBase 的接口 Trait），凡提及该接口即 True。
+    当前 19 个已导入方言均不提及 TensorLike/BufferLike；PtrLike 只出现在 shard 记录里的内建 MemRef（builtin，不属 shard 类型）。"""
+    import odsjson as O, json
+    if ns not in O.DIALECTS: return True
+    key = _IFACE_KEY.get(iface, iface)
+    R = O.records(ns)
+    for k, r in R.items():
+        if isinstance(r, dict) and 'TypeDef' in r.get('!superclasses', []) and not k.startswith('Builtin_') and key in json.dumps(r.get('traits')): return True
+    for f in _dialect_files(ns):
+        if key in _file(f) and re.search(r'attachInterface|TypeBase', _file(f)) and re.search(r'(attachInterface\s*<[^;]*|TypeBase\s*<[^;]*)' + key, _file(f)): return True
+    return False
 def _isa(cls, x):
     b = _base(cls)
     if isinstance(x, V):
@@ -693,10 +755,12 @@ def _isa(cls, x):
     if isinstance(x, Attr) and b in ('Attribute', 'OpFoldResult'): return True
     if isinstance(x, tuple):
         if b in TYPE_CLASSES: return TYPE_CLASSES[b](x)
-        if b == 'PtrLikeTypeInterface':                                   # 第 83 轮：内建类型中只有 MemRefType/UnrankedMemRefType 实现；方言类型未建模
-            if x[0] == 'memref': return True
-            if x[0] in ('tensor', 'vector', 'index', 'i', 'f', 'complex', 'tuple', 'none', 'func'): return False
-            raise CppUnknown('isa<PtrLikeTypeInterface> 于方言类型')
+        if b in BUILTIN_IFACE_TYPES:                                      # 第 83 轮 PtrLike；第 93 轮 TensorLike/BufferLike（BufferizationDialect::initialize 的 attachInterface）
+            if x[0] == BUILTIN_IFACE_TYPES[b]: return True
+            if x[0] in ('tensor', 'memref', 'vector', 'index', 'i', 'f', 'complex', 'tuple', 'none', 'fn'): return False
+            ns = TS.show(x).lstrip('!').split('.')[0].split('<')[0]
+            if not _dialect_may_implement(ns, b): return False            # 第 93 轮：已导入方言里无该接口的实现者 ⇒ 否（!shape.shape 非 TensorLike）
+            raise CppUnknown(f'isa<{b}> 于方言类型')         # 未导入方言或可能实现该接口的方言：开放世界，不判
         import odsjson as O                      # 方言 ODS 类型（!shape.size 等）：按 TypeDef 的拼写判定
         m_ = re.fullmatch(r'(?:::)?(?:mlir::)?(\w+)::(\w+)', cls)
         ns = m_.group(1) if m_ else CUR['dia']
@@ -797,6 +861,9 @@ class Interp:
                     m_ = re.match(r'(?:llvm::)?SmallVector\s*<\s*([\w:]+)', h[2] or '')
                     v = _tlist(v, m_.group(1)) if m_ else _tlist(v, v.ety) if isinstance(v, TList) else list(v)
                 env[h[1]] = v
+                st_ = _static_ty(h[2], init)                                  # 第 93 轮：局部变量的静态类型（只用于 unranked 上 getShape 的分派）
+                if st_ is not None: env['\x00ty:' + h[1]] = st_
+                elif '\x00ty:' + h[1] in env: del env['\x00ty:' + h[1]]
             else:
                 vs = list(v) if not isinstance(v, tuple) or not v or not isinstance(v[0], str) else None
                 if vs is None or len(vs) != len(h[1]): raise CppUnknown('结构化绑定')
@@ -1031,7 +1098,9 @@ class Interp:
     # 调用
     def call(self, f, args_e, env):
         if f[0] == 'mem':
-            recv = self.ev(f[1], env); return self.method(recv, f[2], f[3], args_e, env)
+            recv = self.ev(f[1], env)
+            if f[2] == 'getShape': CUR['recv_sty'] = _recv_static_ty(f[1], env)
+            return self.method(recv, f[2], f[3], args_e, env)
         if f[0] == 'tid':
             return self.tcall(_base(f[1]), f[2], args_e, env)
         if f[0] == 'id':
@@ -1383,6 +1452,10 @@ class Interp:
         if m == 'asArrayRef' and re.fullmatch(r'array<i(?:8|16|32)(?::.*)?>', str(x), re.S): return [int(v) for v in _attr_list(x)]
         raise CppUnknown(f'attr.{m}')
     def type_method(self, t, m, args, targs):
+        if t[0] == 'fn' and m in ('getInputs', 'getResults', 'getNumInputs', 'getNumResults'):   # 第 93 轮：FunctionType（typesig 存打印文本）
+            ins, outs = _fn_parts(t[1])
+            r = ins if m in ('getInputs', 'getNumInputs') else outs
+            return len(r) if m.startswith('getNum') else list(r)
         mm = _mma(t)
         if mm is not None:
             if m == 'getOperand': return mm[2]
@@ -1397,7 +1470,13 @@ class Interp:
             return len(t[1])
         if m == 'hasRank': return TS.ranked(t)
         if m == 'getShape':
-            if not TS.ranked(t): _crash()
+            if not TS.ranked(t):
+                # 第 93 轮：UnrankedTensorType/UnrankedMemRefType::getShape() 返回 {}（BuiltinTypes.td），ShapedType 接口分派到它；
+                # 只有 TensorType/BaseMemRefType::getShape()（cast<Ranked…> 断言）在 unranked 上崩溃。
+                st_ = CUR.pop('recv_sty', None)
+                if st_ in ('ShapedType', 'UnrankedTensorType', 'UnrankedMemRefType'): return []
+                _crash()                                                      # TensorType/BaseMemRefType 或静态类型不明：沿用第 82 轮口径（断言 ⇒ 拒绝），C1 在语料上检验
+            CUR.pop('recv_sty', None)
             return _shape(t)
         if m == 'getElementType':
             if t[0] == 'complex': return t[1]
@@ -1503,6 +1582,17 @@ class Interp:
         if m == 'isStrided': return _strides(t) is not False
         if m == 'getContext': return None
         if m == 'getTypeID': raise CppUnknown('getTypeID')
+        em = type_ext_method(CUR.get('dia') or '', _concrete_type_class(t), m)    # 第 93 轮：类型接口方法 ⇒ 方言 attachInterface 的外部模型
+        if em is not None:
+            ps = _params(em[0])
+            if len(ps) != len(args) + 1: raise CppUnknown(f'外部模型 {m} 形参个数')
+            argv = [t] + list(args)
+            env = {nm: v for (ty, nm, dflt), v in zip(ps, argv)}
+            try: self.exec(parse_body(em[1]), env)
+            except _Ret as r:
+                if isinstance(r, _Crash): raise                               # 断言崩溃照常穿出（按拒绝），与 op 自身 verify 同一口径
+                return r.v
+            return None
         raise CppUnknown(f'type.{m}')
     def op_method(self, m, args, env, targs):
         op = self.op
@@ -1828,10 +1918,24 @@ def _conv(ty, v):
     if b in ('Value', 'OpResult', 'BlockArgument', 'TypedValue'): return v
     return v
 
-@functools.lru_cache(None)
-def _ctx():
+@functools.lru_cache(4096)
+def _fn_parts(txt):
+    """第 93 轮：FunctionType 文本 → (输入类型表, 结果类型表)，由 MLIR 自身解析，逐个转回 typesig 项。"""
     import mlir.ir as ir
-    c = ir.Context(); c.allow_unregistered_dialects = True; return c
+    try:
+        ft = ir.FunctionType(ir.Type.parse(txt, _ctx()))
+        return tuple(TS.parse(str(x)) for x in ft.inputs), tuple(TS.parse(str(x)) for x in ft.results)
+    except Exception: raise CppUnknown(f'函数类型解析 {txt[:40]}')
+_CTX = [None, None]
+def _ctx():
+    """第 93 轮：每进程一个共享 Context（原先每次调用新建，Tensor 语料上 5000+ 次新建占运行时间约一半）；关多线程以便 fork。"""
+    import os, mlir.ir as ir
+    if _CTX[0] != os.getpid():
+        c = ir.Context(); c.allow_unregistered_dialects = True
+        try: c.enable_multithreading(False)
+        except Exception: pass
+        _CTX[0], _CTX[1] = os.getpid(), c
+    return _CTX[1]
 @functools.lru_cache(4096)
 def _parse_attr(txt):
     import mlir.ir as ir
@@ -2135,6 +2239,10 @@ def completeness(dia, opname, which='verify'):
             if ifm is not None: walk(ifm[1], f'iface {b}'); continue
             ff = find_function(dia, b)
             if ff is not None: walk(ff[2], b); continue
+            ems = [ms[b] for ms in type_ext_models(dia).values() if b in ms]   # 第 93 轮：类型接口方法的外部模型（全部实现都要完备）
+            if k == 'm' and ems:
+                for i_, em in enumerate(ems): walk(em[1], f'ext {b}#{i_}')
+                continue
             bad.add(b)
     walk(body, which)
     for i_, b_ in enumerate(extra): walk(b_, f'isCompatibleReturnTypes')
@@ -2207,7 +2315,7 @@ ATOM_METHODS = {'getType', 'getElementType', 'isSignlessInteger', 'isInteger', '
                 'getWidth', 'isa', 'cast', 'dyn_cast', 'isSignedInteger', 'isUnsignedInteger', 'isF32', 'isF64', 'isF16', 'isBF16', 'isIntOrFloat', 'hasRank'}
 ATOM_FNS = {'ArrayRef', 'SmallVector', 'isa', 'cast', 'dyn_cast', 'all_of', 'any_of', 'none_of', 'is_sorted', 'size', 'count', 'is_contained', 'isPermutationVector', 'isPowerOf2_32', 'isPowerOf2_64'}
 
-TYPE_XF_METHODS = {'getElementType', 'getRank', 'getDimSize', 'getShape', 'setDim', 'setShape', 'getOperand', 'getNumElements', 'size'}
+TYPE_XF_METHODS = {'getInputs', 'getResults', 'getElementType', 'getRank', 'getDimSize', 'getShape', 'setDim', 'setShape', 'getOperand', 'getNumElements', 'size'}
 @functools.lru_cache(None)
 def compile_type_xform(txt):
     """ODS TypesMatchWith 的 transformer（C++ 表达式，$_self 为类型）→ f(类型) -> 类型/类型表；静态不完备 ⇒ None。运行时不支持 ⇒ CppUnknown。"""
@@ -2227,6 +2335,7 @@ def compile_type_xform(txt):
         v = it.ev(e, {'__self': t})
         if isinstance(v, V): v = v.t
         if isinstance(v, tuple) and v and isinstance(v[0], str): return v
+        if isinstance(v, list) and all(isinstance(y, tuple) and y and isinstance(y[0], str) for y in v): return list(v)   # 第 93 轮：类型表（FunctionType::getInputs）
         raise CppUnknown('变换值')
     return f
 
@@ -2241,6 +2350,7 @@ def _type_class_known(cls):
     """类型类是封闭且可判定的：内建类、ODS TypeDef、C++ 手写类型（printType 拼写）、MMAMatrixType。接口不算。"""
     import odsjson as O
     b = _base(cls)
+    if b in BUILTIN_IFACE_TYPES: return True                       # 第 93 轮：内建成员已知，方言类型运行时 CppUnknown（原子取真，上近似）
     if 'Interface' in b: return False
     if b in TYPE_CLASSES or b in cpp_type_spellings(): return True
     m_ = re.fullmatch(r'(?:::)?(?:mlir::)?(\w+)::(\w+)', str(cls).strip())
