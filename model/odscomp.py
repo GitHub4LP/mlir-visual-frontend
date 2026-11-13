@@ -573,13 +573,60 @@ def range3(Q, j, t, hints, maxw=1024):
     try: tp = TS.parse(t) if isinstance(t, str) else t
     except Exception: return ('unknown', None)
     if range_holds(Q, cls, rg, j, tp) is False: return ('out', None)
+    if ABS_OUT and abstract_out(Q, cls, j, tp): return ('out', None)
     others = sorted({cls[i] for i in range(Q.n)} - {cls[j]})
     rep = {c: next(i for i in range(Q.n) if cls[i] == c) for c in others}
     T = exact_witness(Q, cls, j, tp, [hints[rep[cls[i]]] if cls[i] != cls[j] else None for i in range(Q.n)])
     if T is not None and evaluate(Q, T) is True: return ('in', [TS.show(x) for x in T])   # 与组合搜索一致：见证以类型文本返回
-    for k, combo in enumerate(itertools.product((0, 1), repeat=len(others))):
+    pools = [_wcands(hints[rep[c]], t, tp) for c in others]
+    for k, combo in enumerate(itertools.product(*pools)):
         if k >= maxw: break
-        asg = {c: (t if b else hints[rep[c]]) for c, b in zip(others, combo)} | {cls[j]: t}
+        asg = dict(zip(others, combo)) | {cls[j]: t}
         T = [asg[cls[i]] for i in range(Q.n)]
         if evaluate(Q, T) is True: return ('in', T)
     return ('unknown', None)
+
+class _Unbound(BaseException):
+    """读取了未绑定端口（不是 Exception 子类：任何 except Exception 都吞不掉它，不会被误当作“不成立”）。"""
+class _U:
+    """第 87 轮：其余端口的未绑定类型。对它的任何读取（下标、比较、长度、迭代、真值、散列、属性）都抛 _Unbound。"""
+    __slots__ = ()
+    def _x(self, *a, **k): raise _Unbound()
+    __getitem__ = __eq__ = __ne__ = __lt__ = __le__ = __gt__ = __ge__ = __len__ = __iter__ = __bool__ = __hash__ = __contains__ = _x
+    __str__ = __repr__ = __format__ = __add__ = __radd__ = __mul__ = __rmul__ = __call__ = _x
+    def __getattr__(self, k): raise _Unbound()
+    @property
+    def __class__(self): raise _Unbound()          # isinstance(U, X) 也触发（第 88 轮首跑 P5 违例：memref.distinct_objects 经 isinstance 绕过哨兵）
+UNBOUND = _U()
+ABS_OUT = True
+def abstract_out(Q, cls, j, tp):
+    """其余类未绑定时的抽象求值：某原子在未读取任何未绑定端口的情况下得 False ⇒ 该原子对所有补全都为 False ⇒ out。
+    读到未绑定端口 ⇒ 该原子不作结论（UNK）。只用 Φ 的全部原子（含 nf/C++ 解释规则），不读残差。"""
+    fx = getattr(Q, '_fixed', {})
+    ub = {}                                                   # 每个未绑定类一个实例：同类端口同一对象（容器比较的同一性捷径只在同类间成立）
+    T = [tp if cls[i] == cls[j] else fx[cls[i]] if cls[i] in fx else ub.setdefault(cls[i], _U()) for i in range(Q.n)]
+    for a in Q.atoms:
+        try:
+            if holds(a, T) is False: return True
+        except _Unbound: continue
+    return False
+
+TRANSPLANT = True   # 第 87 轮：见证候选加入“特征移植”——把 t 的元素类型/形状移植进其余端口的原类型（容器⇄元素、同形异元、i1 同形）
+def _wcands(h, t, tp):
+    """其余端口的见证候选：原类型 h、t 本身（第 86 轮及以前只有这两个），再加特征移植。只用于找见证，'in' 仍须 evaluate 为真。"""
+    out = [h, t]
+    if not TRANSPLANT: return out
+    try: hp = TS.parse(h) if isinstance(h, str) else h
+    except Exception: return out
+    sh, st = TS.shaped(hp), TS.shaped(tp)
+    c = []
+    if sh: c.append(hp[:2] + (TS.elt(tp),) + hp[3:])                 # h 的容器装 t 的元素
+    if sh and st and tp[1] is not None:
+        c.append((hp[0], tp[1], hp[2]) + (tp[3:] if hp[0] == tp[0] else ()))   # t 的形状装 h 的元素
+    if not sh and st: c.append(TS.elt(tp))                          # 取 t 的元素
+    if st: c.append(TS.i1same(tp))                                  # 同形 i1（掩码、条件）
+    for x in c:
+        try: s_ = TS.show(x)
+        except Exception: continue
+        if s_ not in out: out.append(s_)
+    return out

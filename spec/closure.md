@@ -777,3 +777,19 @@ R_j(t) ≝ ∃ 其余端口. Φ_comp，即用户需求里“签名允许的最�
 - 回归 projcomp：首跑段一 P4 FAIL（不一致 2960）——range3 的设计见证以解析后的元组返回，P4 用它拼 IR 文本，属本轮新代码缺陷；改为返回类型文本后两段重跑：P1 9336 + 15035 不一致 0；P2 违例 0（1765 + 2820）；P4 8903 + 10261 不一致 0；P5 违例 0（6308 + 11011）。range3 'in' 比第 85 轮多 4 + 4。
 - 回归 odscomp（恢复 simplify 后）：S1–S4 两段 PASS（12375 + 15585 实例，S3 误拒 0，残差为空误收 0，残差非空误收 26 + 2，同第 83/84 轮）。
 - 第 84 轮欠的回归补跑（受 Φ 改动影响、导入 odscomp 的测试）：regflow 两段 F1 PASS（5565 + 13310 违例 0）、F2 FAIL（15、4）、F4 段一 PASS 段二 FAIL（10）——与第 83 轮逐数相同；nfiface 两段 N2a/N2b/N2d PASS（N2d 6993 + 30300 误拒 0 误收 0）；cppinfer J1 PASS、J2 FAIL 18（同前）、J3 PASS。cppverify、nf_test、core 不导入 odscomp，第 84/85 轮未改其依赖代码，未重跑。
+
+### §9.27 第 87 轮：见证候选的特征移植（判据写定于 2026-11-13 09:35 CST，运行前）
+- 动机：range3 未定点（第 86 轮 projcomp 两段 402 + 2770）按 op 诊断，段一 335/402 为“池内无补全”、67 为“搜索不足”；集中在 memref.store、vector.transfer_read/write、math.fpowi、arith.select、addui_extended、tensor.insert 等——其余端口需要“装 t 元素的容器 / t 形状的同形异元 / i1 同形”才有补全，而旧搜索只试 {原类型, t}。
+- 机制：odscomp.TRANSPLANT，_wcands 为每个其余类加入特征移植候选；'in' 仍须 evaluate(Q,T) 为真，且 P4 用 MLIR 核对见证。
+- 判据 W1：projcomp 两段（`4 125 0`、`4 1000 125`）各自 range3 unknown 下降 ≥ 30%（相对同脚本 TRANSPLANT=False 基线 r86_ua/r86_ub），且各段 P1/P4 不一致 0、P2/P5 违例 0。单段判定，不合计。
+- 结果（2026-11-13 09:44）：**W1 FAIL**。段一 unknown 402→283（−29.6%，差 0.4pp 未达 30%）；段二 2770→2594（−6.4%）。两段 P1/P4 不一致 0、P2/P5 违例 0（见证可靠）。TRANSPLANT 未合并，留在 work/dev。
+- 诊断：段二剩余未定 2293/2594 为“池内无补全”，集中在 vector.transfer_read/write（805+）、vector.insert、from_elements、insert_strided_slice、outerproduct、tensor.insert_slice、gather、linalg.pack——由 nf/C++ verify 中“#indices = rank”、static_* 计数、属性形状等约束决定，t 多半确实不可连，但必要条件只读类内原子，看不到这些不透明规则。故剩余缺口在 **out 证书**，不在见证搜索。
+- 下一步机制（批量）：对不透明规则做“其余端口未绑定”的三值抽象求值——其余端口取 Unknown 类型，若规则在图定计数/属性与 t 自身特征下已确定为 False，则 out。可靠性依赖解释器 Unknown 传播（与/或短路）正确，判据仍以 P5 违例 0 守卫。
+- §9.26 补记：SUBST_MATCH 保留开启——Z3 未达 2pp（0.7pp），但 Y1/P1/P4 不一致 0，无害且为精确；此保留为 11-13 决定。§9.26 标题“23:50”应为约 23:23 写定，更正于此。
+
+### §9.28 第 88 轮：未绑定端口抽象求值给出 out 证书（判据写定于 2026-11-13 10:00 CST，运行前）
+- 机制：odscomp.ABS_OUT/abstract_out。其余每个类取一个独立的未绑定对象 _U（任何读取抛 _Unbound，它是 BaseException，不会被 except Exception 吞成“不成立”）；对 Φ 的每个原子（含 nf 规则与 C++ 解释规则）求值，若未读未绑定端口即得 False，则该原子对一切补全为 False ⇒ out。可靠性论证：规则是确定性函数，未读取的输入不影响结果。已知风险：规则若以 isinstance/is 等不触发读取的方式检查端口，会绕过哨兵——由 P5 守卫。
+- 判据 W2（TRANSPLANT 与 ABS_OUT 同开）：projcomp 两段（`4 125 0`、`4 1000 125`）各自 range3 unknown 相对基线（402、2770）下降 ≥ 30%，且各段 P1/P4 不一致 0、P2/P5 违例 0。单段判定，不合计。
+- 首跑结果（2026-11-13 09:58）：**W2 FAIL**。段一 unknown 402→243 但 **P5 违例 17**（memref.distinct_objects：规则经 isinstance 检查端口，未触发哨兵读取 ⇒ 抽象 False 不可靠；P4 in 9022→9005 同源）；段二 2770→1855（−33.0%），P1–P5 PASS。
+- 修复（事后，非判据变更）：_U.__class__ 属性也抛 _Unbound，使 isinstance 计为读取。以同一判据 W2 重跑两段，记为 W2'（修复后重判，如实区分）。
+- W2' 结果（2026-11-13 10:09，修复后重判）：段一 unknown 402→243（−39.6%），段二 2770→1866（−32.6%）。**W2' PASS**（修复是在首跑 FAIL 后做的，属事后修复重判）。剩余未定集中在 vector.transfer_read、insert、insert_strided_slice、outerproduct、from_elements、gather——规则先读其余端口再读 t 自身，抽象求值遇读取即停，两段 P1/P4 不一致 0、P2/P5 违例 0。
