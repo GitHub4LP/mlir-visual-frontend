@@ -189,6 +189,10 @@ def sig(dialect, opname):
     import attrsig as _AS
     for e in _AS.attr_args(opname) or []:
         if e['unknown'] is not None: S['unknown'].append(f"属性约束 {e['name']}: {str(e['unknown'])[:60]}")
+    # 第 92 轮：SymbolUserOpInterface 的 verifySymbolUses（C++）可约束端口（如 shard.grid_shape 结果个数 = grid 秩）；
+    # symtab.USES 未登记 ⇒ 不判，必须进残差，否则“残差为空”对这些 op 偏宽（新方言语料 shard.grid_shape 漏判暴露）
+    import symtab as _ST
+    if _ST.is_user(opname) and opname not in _ST.USES: S['unknown'].append('符号使用义务 verifySymbolUses 未登记')
     return S
 
 def _ods_infer(d, r, S):

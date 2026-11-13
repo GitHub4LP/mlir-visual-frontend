@@ -196,6 +196,8 @@ def _unwrap(d, con):
     if 'DefaultValuedOptionalAttr' in sc: return 'default', r.get('defaultValue'), O.ref(r['baseAttr']) or con
     if 'DefaultValuedAttr' in sc: return 'default', r.get('defaultValue'), O.ref(r['baseAttr']) or con
     if 'OptionalAttr' in sc: return 'optional', None, O.ref(r['baseAttr']) or con
+    if ('Property' in sc or 'PropConstraint' in sc) and (r.get('defaultValue') or '').strip():   # 第 92 轮：带缺省值的 Property（UnitProp 缺省 false）可省略
+        return 'default', r.get('defaultValue'), con
     return 'required', None, con
 
 def _domain(d, con):

@@ -24,7 +24,7 @@
 - 范围：Φ_comp 的“最大性”对顶层推导与入口边定义的区域类型流成立（以 ODS 推断与字面量为界）。
 
 ## 3. 边界（C4）：残差逐条归因
-650 op 中残差为空 474；残差条目 601（第 90 轮，原 468 / 611），**全部落入下列有名边界，未分类 0**（`scripts/attr_residual.py`，按源码不支持构造的正则分桶，分桶本身是启发式、不是判据）。
+650 op 中残差为空 461；残差条目 622（第 92 轮；第 90 轮为 474 / 601，差额来自新增的符号使用义务条目，见下），**全部落入下列有名边界，未分类 0**（`scripts/attr_residual.py`，按源码不支持构造的正则分桶，分桶本身是启发式、不是判据）。
 
 | 边界 | 条目 | 性质 |
 |---|---|---|
@@ -38,6 +38,7 @@
 | 属性 CPred 未编译 | 5 | |
 | native trait 未建模 | 5 | SameOperandsAndResultRank 4、HasDefaultDLTIDataLayout 1 |
 | TypesMatchWith 变换未解释 | 2 | func.call_indirect |
+| 符号使用义务（verifySymbolUses，symtab.USES 未登记） | 21 | shard 18、transform 3。第 92 轮前不进 op 残差，导致 14 个 shard op“残差为空”偏宽（shard.grid_shape 结果个数由 grid 秩决定，MLIR 拒绝而模型接受）；现记为残差（不判） |
 
 - 非 Transform 残差共 106 条（80 个 op）：57 条属结构层，49 条属可规范化而未做（第 90 轮前为 116 条 / 86 个 op / 59 条）。
 - 单点 Unknown（残差为空但单端口范围无法判定）：段一 243/15767≈1.5%、段二 1866/25034≈7.5%（第 88 轮）。成因：规则先读其余端口再读本端口，抽象求值遇读取即停（§9.28）。
@@ -50,6 +51,13 @@ bash scripts/check_all.sh          # 25 段，2 CPU 约 3–4 小时，日志在
 - 退出码 0 = 通过。`check_summary.py` 把可靠性字段（误拒、残差为空误收、不一致、违例、漏判、见证不成立、推导异常、文件崩溃）非零视为硬失败；故障注入（把一个“误拒 0”改成 3）已验证会被抓出。
 - `scripts/check_known.txt` 列出 11 条**只因数量阈值不足**的已知 FAIL，可靠性字段都是 0：regflow F2（增益 15、4）、F4 段二（10）、cppinfer J2（18<20）、winograd N2f（filter 接受 25<30）、projexact Y1 段二（比较 289）、cppverify I1/I2 后三段（按合计判：I1 2332 误拒 0，I2 176 漏判 0）。
 - L1 是 ODS 单层差分，误收按设计允许；N1 的“消融误收”是对照组。
+
+## 4.1 新方言差分（第 92 轮，此前未披露的覆盖缺口）
+- 第 92 轮前差分语料只有 12 方言 + Linalg；Affine、GPU、Bufferization、NVGPU、Shard、Transform 的 op 从未与 MLIR 差分（其中残差为空的 105 个）。guarantees 此前未写明，属披露遗漏。
+- 现取 MLIR 9bae84b0 `mlir/test/Dialect/{Affine,GPU,Bufferization,NVGPU,Shard,Transform}` 到 `corpus_ext/`；`CV_EXT=方言,…` 时 cppverify_test / odscomp_test / regcomp_test 改用这些语料（缺省不变，不进 check_all 段表）。
+- 首次差分暴露 4 处模型缺陷，均为事后修复：cppverify `SmallVector<T>(n, v)` 误作两元素表；`return` 时丢失输出形参写回（bufferization.dealloc 误拒）；带缺省值 Property 被当作必需属性（affine.linearize_index 误拒 51 例）；irimport 丢失绑定不列出的纯 Property（回发后 disjoint 被改成 false）；以及上表的符号使用义务。
+- 修复后（新方言）：cppverify C1/C3/C5/IF1/I3 硬条件 0（C5 比较 2148 等，C2/I1/I2/IF2 数量阈值未达，比较量小）；odscomp S1–S4 PASS（S3 实例 2223，残差为空误收 0）；regcomp R1/R2 PASS（R2 实例 2377，误拒 0，残差为空误收 0）；corpus_test C2 自动签名误拒 0，C1 往返仅 1 例不同（MLIR 自身 affine_map 打印/解析不幂等）。
+- 仍是语料上的经验保证；新方言 C5 只比较到少数 op（取样只取函数体顶层、带 C++ verify 的 op），不能说 105 个 op 都已差分。
 
 ## 5. 不保证 / 已披露
 - 端口范围闭式精确表示（上近似 29.6%）、覆盖所有长尾 op、Unknown=0，均不在保证内。

@@ -231,7 +231,7 @@ if __name__ == '__main__':
     start = int(sys.argv[2]) if len(sys.argv) > 2 else 0
     tot = collections.Counter(); exs = collections.defaultdict(list); ctxm = mp.get_context('fork')
     import os
-    files = (sorted(glob.glob('corpus/*/*.mlir')) + sorted(glob.glob('corpus_ext/*/*.mlir')))[start:lim]
+    files = (sorted(glob.glob('corpus/*/*.mlir')) + sorted(glob.glob('corpus_ext/Linalg/*.mlir')))[start:lim]   # 第 92 轮：corpus_ext 新增方言不并入（段表分母不变）
     if os.environ.get('NFI_FILES'): files = [f for f in files if any(k in f for k in os.environ['NFI_FILES'].split(','))]   # 定向复跑
     for i, path in enumerate(files, start):
         q = ctxm.Queue(); p = ctxm.Process(target=run_file, args=(path, q, i)); p.start()

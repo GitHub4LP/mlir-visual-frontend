@@ -109,6 +109,12 @@ def run_file(path, q, kslice, kmut, seed):
                         if not unk: note('R2 误收/残差为空', f'{[n["op"] for n in sl]} {T} {diags[0][1][:120] if diags else ""}')
     q.put((st, dict(ex)))
 
+def _ext_files():
+    """第 92 轮：CV_EXT=方言,… 时改用 corpus_ext/<方言>（主语料未覆盖的方言）；缺省不变。"""
+    import os
+    e = os.environ.get('CV_EXT')
+    return [f for d in e.split(',') for f in sorted(glob.glob(f'corpus_ext/{d}/*.mlir'))] if e else None
+
 if __name__ == '__main__':
     import verdict as V
     kslice = int(sys.argv[1]) if len(sys.argv) > 1 else 6
@@ -116,7 +122,7 @@ if __name__ == '__main__':
     lim = int(sys.argv[3]) if len(sys.argv) > 3 else 10 ** 9
     start = int(sys.argv[4]) if len(sys.argv) > 4 else 0
     tot = collections.Counter(); exs = collections.defaultdict(list); ctxm = mp.get_context('fork')
-    files = sorted(glob.glob('corpus/*/*.mlir')) + sorted(glob.glob('corpus_ext/Linalg/*.mlir'))
+    files = _ext_files() or (sorted(glob.glob('corpus/*/*.mlir')) + sorted(glob.glob('corpus_ext/Linalg/*.mlir')))
     for i, path in enumerate(files[start:lim], start):
         q = ctxm.Queue(); p = ctxm.Process(target=run_file, args=(path, q, kslice, kmut, i)); p.start()
         try: st, ex = q.get(timeout=600)

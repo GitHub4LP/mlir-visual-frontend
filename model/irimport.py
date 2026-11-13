@@ -16,6 +16,47 @@ def _segs(a):
     m = re.match(r'array<i32(?::\s*([-\d,\s]*))?>', a or '')
     return [int(x) for x in m.group(1).split(',')] if m and m.group(1) else []
 
+def _prop_ops():
+    """第 92 轮：带 ODS Property（非属性）参数的 op —— Python 绑定的 op.attributes 不列出纯 Property（如 affine.linearize_index 的 UnitProp disjoint）。"""
+    try:
+        import odsjson as O, attrsig as A
+    except Exception: return set()
+    out = set()
+    for dia in O.DIALECTS:
+        try: names = list(O.ops(dia))
+        except Exception: continue
+        for o in names:
+            try: aa = A.attr_args(o)
+            except Exception: continue
+            if any(e.get('prop') for e in aa or []): out.add(o)
+    return out
+_PROP_OPS = []
+def _hidden_props(op):
+    """从 op 自身通用形式的 `<{…}>` 读出属性字典里没有的 Property（无 `=` 的项是单元值，记 'unit'）。"""
+    if not _PROP_OPS: _PROP_OPS.append(_prop_ops())
+    if op.name not in _PROP_OPS[0]: return {}
+    txt = op.get_asm(print_generic_op_form=True)
+    i = txt.find('<{')
+    if i < 0: return {}
+    depth = 0; j = i; items = []; cur = ''
+    for j in range(i + 2, len(txt)):
+        c = txt[j]
+        if c in '<[({': depth += 1
+        elif c in '>])}':
+            if depth == 0: break
+            depth -= 1
+        if c == ',' and depth == 0: items.append(cur); cur = ''; continue
+        if c == '"': pass
+        cur += c
+    items.append(cur)
+    out = {}
+    for it in items:
+        it = it.strip()
+        if not it: continue
+        k, eq, v = it.partition(' = ')
+        out[k.strip()] = v.strip() if eq else 'unit'
+    return out
+
 _ID = [0]
 def import_op(op, st, bnames):
     """MLIR Operation → core 节点（递归）。st: AsmState；bnames: Block → 名字（按出现顺序分配）。"""
@@ -27,6 +68,7 @@ def import_op(op, st, bnames):
         try: out_a[k] = str(op.attributes[k])
         except Exception: raise NotImplementedError(f'Python 绑定无法读出属性 {k}（如复数 dense）')
     attrs = out_a
+    hidden = {k: v for k, v in _hidden_props(op).items() if k not in attrs}   # 第 92 轮：纯 Property（绑定不列出），单独回发在 <{…}>
     ins = [nm(v) for v in op.operands]
     outs = [(nm(r), str(r.type)) for r in op.results]
     regions = []
@@ -38,6 +80,7 @@ def import_op(op, st, bnames):
                           args=[(nm(a), str(a.type)) for a in b.arguments]))
         regions.append(bs)
     succs = []; props = {'_attrs': attrs, '_types': [str(v.type) for v in op.operands]}
+    if hidden: props['_props'] = hidden
     if len(op.successors):
         sb = [bname(b, bnames) for b in op.successors]
         if op.name == 'cf.br': succs = [(sb[0], ins)]; ins = []
@@ -90,6 +133,7 @@ def emit_generic(n, ind='', loc=False):
         else: groups.append([b, 1])
     res = ', '.join(b if k == 1 and not any(v.startswith(b + '#') for v, _ in n['outs']) else f'{b}:{k}' for b, k in groups)
     out.append(ind + (res + ' = ' if res else '') + f'"{n["op"]}"(' + ', '.join(ins) + ')' + succ
+               + ((' <{' + ', '.join(k if v == 'unit' else f'{k} = {v}' for k, v in n['props']['_props'].items()) + '}>') if n['props'].get('_props') else '')
                + ((' (' + ', '.join(regs) + ')') if regs else '')
                + ((' {' + ', '.join(f'{k} = {v}' for k, v in a.items()) + '}') if a else '')
                + ' : (' + ', '.join(tys) + ') -> (' + ', '.join(t for _, t in n['outs']) + ')' + (f' loc("{n["id"]}")' if loc else ''))

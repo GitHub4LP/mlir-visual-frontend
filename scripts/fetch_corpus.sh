@@ -10,3 +10,13 @@ for d in Arith Math Index Complex Tensor MemRef SCF Func ControlFlow Vector Shap
     | while read u; do curl -fsSL -o "$d/$(basename "$u")" "$u"; done
   echo "$d $(ls $d | wc -l)"
 done
+
+# 第 92 轮：模型覆盖但主语料没有的方言 → corpus_ext/<方言>（Linalg 已有）
+cd ..
+for d in Linalg Affine GPU Bufferization NVGPU Shard Transform; do
+  mkdir -p corpus_ext/$d
+  curl -fsSL "https://api.github.com/repos/llvm/llvm-project/contents/mlir/test/Dialect/$d?ref=$SHA" \
+    | python3 -c "import json,sys; [print(f['name']) for f in json.load(sys.stdin) if f['type']=='file' and f['name'].endswith('.mlir')]" \
+    | while read n; do [ -s corpus_ext/$d/$n ] || curl -fsSL -o "corpus_ext/$d/$n" "https://raw.githubusercontent.com/llvm/llvm-project/$SHA/mlir/test/Dialect/$d/$n"; done
+  echo "$d $(ls corpus_ext/$d | wc -l)"
+done

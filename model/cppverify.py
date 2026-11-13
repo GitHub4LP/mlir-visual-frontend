@@ -781,7 +781,9 @@ class Interp:
             for x in s[1]: self.exec(x, env)
         elif k == 'block':
             env2 = dict(env); env2['\x00parent'] = env
-            for x in s[1]: self.exec(x, env2)
+            try:
+                for x in s[1]: self.exec(x, env2)
+            except _Ret: self._writeback(env2, env); raise      # 第 92 轮：return 前对外层变量（如输出形参）的赋值不丢
             self._writeback(env2, env)
         elif k == 'decl':
             h, init = s[1], s[2]
@@ -806,8 +808,10 @@ class Interp:
             if s[2][0] == 'declcond':
                 self.exec(s[2][1], env2); nm = s[2][1][1][1]; c = self.truth(env2[nm])
             else: c = self.truth(self.ev(s[2], env2))
-            if c: self.exec(s[3], env2)
-            elif s[4] is not None: self.exec(s[4], env2)
+            try:
+                if c: self.exec(s[3], env2)
+                elif s[4] is not None: self.exec(s[4], env2)
+            except _Ret: self._writeback(env2, env); raise
             self._writeback(env2, env)
         elif k == 'return':
             raise _Ret(None if s[1] is None else self.ev(s[1], env))
@@ -826,6 +830,7 @@ class Interp:
                 try: self.exec(s[3], env2)
                 except _Break: self._writeback(env2, env); break
                 except _Continue: pass
+                except _Ret: self._writeback(env2, env); raise
                 self._writeback(env2, env)
         elif k == 'for':
             env2 = dict(env); env2['\x00parent'] = env
@@ -837,6 +842,7 @@ class Interp:
                 try: self.exec(s[4], env2)
                 except _Break: break
                 except _Continue: pass
+                except _Ret: self._writeback(env2, env); raise
                 for e in s[3]: self.ev(e, env2)
             self._writeback(env2, env)
         elif k == 'while':
@@ -1084,6 +1090,9 @@ class Interp:
         if n == 'seq': return list(range(_num(args[0]), _num(args[1]))) if len(args) == 2 else list(range(_num(args[0])))
         if n in ('SmallVector', 'ArrayRef'):
             if len(args) == 1 and isinstance(args[0], (list, Rng)): return list(args[0])
+            if n == 'SmallVector' and len(args) == 2 and isinstance(args[0], int) and not isinstance(args[0], bool):
+                return [args[1]] * args[0]                    # 第 92 轮：SmallVector<T>(n, v) 是计数构造（原先误作两元素表；bufferization.dealloc 推断）
+            if n == 'SmallVector' and len(args) == 1 and isinstance(args[0], int) and not isinstance(args[0], bool): raise CppUnknown('SmallVector<T>(n) 计数构造')
             return list(args)
         ff = find_function(self.op.dia, n, nargs=len(args))
         if ff is not None: return self.invoke(ff[1], ff[2], args, ff[0], targs=targs)
