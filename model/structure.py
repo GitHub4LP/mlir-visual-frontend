@@ -177,6 +177,8 @@ def _same_ty(x, y):
         return TSg.parse(x) == TSg.parse(y)
     except Exception: return x.replace(' ', '') == y.replace(' ', '')
 
+SYMUSES_UNDECIDED = []   # 第 95 轮：S6 解释执行未定（完备 op 上 SU4 要求为 0；此处不判拒、只记账）
+PAR = [None]
 def _symbols(root, d):
     """义务 S1 重名、S2 解析、S3 可见性、S4 使用义务。
     第 14 轮：定义者 / 符号表 / 使用者 / 名字 / 可见性 / 引用全部经 symtab.py 从 ODS 的 trait/interface 与 _attrs 读出；
@@ -184,6 +186,8 @@ def _symbols(root, d):
     已用真实 MLIR 确认的事实：扁平引用只在使用者的最近符号表里解析，既不向外层上溯，也看不见嵌套符号表内部；
     private 在本符号表内（含其中的非符号表区域）可见。"""
     import symtab as SY
+    import symtab as SY
+    PAR[0] = SY.parent_map(root)
     def table_of(n): return n['op'] in STRUCT and any(r.table for r in (STRUCT[n['op']].regions or [])) or SY.is_table(n['op'])
     def walk(tnode):
         syms = {}
@@ -208,6 +212,14 @@ def _symbols(root, d):
                         if nm: out[nm] = (SY.vis_of(n), n)
             return out
         def use(n, tys):
+            if n['op'] not in SY.USES and not n.get('callee') and SY.is_user(n['op']) and SY.symuses_complete(n['op']):
+                # 第 95 轮（S6）：解释执行 C++ verifySymbolUses（符号经最近符号表解析）；判据 symuses_test SU1–SU4
+                import cppverify as CV
+                CHECKED['S6'] += 1
+                try: v, msg = SY.symuses_decide(root, n, PAR[0])
+                except CV.CppUnknown as e: SYMUSES_UNDECIDED.append((n['op'], str(e)[:80])); return
+                if v is False: d.add(n['id'], 'S6', f"verifySymbolUses：{(msg or '').lstrip(chr(0))}")
+                return
             ref = SY.ref_of(n)
             if not ref or not isinstance(ref, str) or not ref.startswith('@'): return
             parts = [p.strip('"') for p in ref.lstrip('@').split('::@')]; CHECKED['S2'] += 1

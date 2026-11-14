@@ -35,7 +35,7 @@ def _hidden_props(op):
     """从 op 自身通用形式的 `<{…}>` 读出属性字典里没有的 Property（无 `=` 的项是单元值，记 'unit'）。"""
     if not _PROP_OPS: _PROP_OPS.append(_prop_ops())
     if op.name not in _PROP_OPS[0]: return {}
-    txt = op.get_asm(print_generic_op_form=True)
+    txt = op.get_asm(print_generic_op_form=True, assume_verified=True)   # 第 95 轮：不在打印前跑 verifier（无效 op 上 MLIR 断言会杀死本进程）；通用形式与是否校验无关
     i = txt.find('<{')
     if i < 0: return {}
     depth = 0; j = i; items = []; cur = ''

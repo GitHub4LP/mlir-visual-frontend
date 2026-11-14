@@ -24,7 +24,7 @@
 - 范围：Φ_comp 的“最大性”对顶层推导与入口边定义的区域类型流成立（以 ODS 推断与字面量为界）。
 
 ## 3. 边界（C4）：残差逐条归因
-650 op 中残差为空 461；残差条目 622（第 92 轮；第 90 轮为 474 / 601，差额来自新增的符号使用义务条目，见下），**全部落入下列有名边界，未分类 0**（`scripts/attr_residual.py`，按源码不支持构造的正则分桶，分桶本身是启发式、不是判据）。
+650 op 中残差为空 481；残差条目 592（第 95 轮；第 93 轮 464 / 610，第 92 轮 461 / 622；差额来自 shard 18 个符号使用义务移出残差，见下），**全部落入下列有名边界，未分类 0**（`scripts/attr_residual.py`，按源码不支持构造的正则分桶，分桶本身是启发式、不是判据）。
 
 | 边界 | 条目 | 性质 |
 |---|---|---|
@@ -38,7 +38,7 @@
 | 属性 CPred 未编译 | 5 | |
 | native trait 未建模 | 5 | SameOperandsAndResultRank 4、HasDefaultDLTIDataLayout 1 |
 | TypesMatchWith 变换未解释 | 2 | func.call_indirect |
-| 符号使用义务（verifySymbolUses，symtab.USES 未登记） | 21 | shard 18、transform 3。第 92 轮前不进 op 残差，导致 14 个 shard op“残差为空”偏宽（shard.grid_shape 结果个数由 grid 秩决定，MLIR 拒绝而模型接受）；现记为残差（不判） |
+| 符号使用义务（verifySymbolUses，symtab.USES 未登记） | 3 | 仅剩 transform 3（无源码）。shard 18 个使用者自第 95 轮起由 structure 义务 S6 解释执行 C++ verifySymbolUses（符号经最近符号表解析），symuses_test SU1–SU4 判定（closure §9.33/9.33a）；第 92 轮前不进 op 残差、第 92–94 轮记为残差（不判） |
 
 - 非 Transform 残差共 106 条（80 个 op）：57 条属结构层，49 条属可规范化而未做（第 90 轮前为 116 条 / 86 个 op / 59 条）。
 - 单点 Unknown（残差为空但单端口范围无法判定）：段一 243/15767≈1.5%、段二 1866/25034≈7.5%（第 88 轮）。成因：规则先读其余端口再读本端口，抽象求值遇读取即停（§9.28）。
@@ -65,3 +65,6 @@ bash scripts/check_all.sh          # 25 段，2 CPU 约 3–4 小时，日志在
 - `type(x) is …` 类检查可绕过未绑定哨兵，仅由 P5 池穷举经验守卫。
 - 值层（常量、毒值、UB）冻结，不测；DataLayout 按默认；pack/unpack 值前提只认 arith.constant；Graph 区域副作用次序、无结果 op 未覆盖。
 - SUBST_MATCH 增益 0.7pp 未达 2pp 判据，仍开启（§9.26–9.27）。第 88 轮 W2 首跑 FAIL 后修复重判为 W2'（事后修复，§9.28）。
+- 第 95 轮 S6（shard verifySymbolUses 解释执行）：SU1 18/18 完备；SU2 比较 2061（MLIR 接受 805）误拒 0；SU3 verifySymbolUses 诊断 501 全部判拒；SU4 完备 op 未定 0。均为 corpus_ext/Shard 原样+变异上的经验保证。SU2 为首跑后修订的 Z2'（§9.33a）：整数除以零（C++ UB）判拒并标 `ub-div0`，AArch64 上 MLIR 不陷入而接受的 4 例单列“平台 UB 桶”、不计误拒；首跑时曾把除零改为未定，致 Z3/Z4 FAIL，后改回判拒口径（与第 94 轮及以前全局口径一致）。新增词汇（DimV、OtherOp、迭代器、lookupNearestSymbolFrom、成员模板、axisarray 等）与 `ok_t` 访问器豁免为手工近似，靠 SU2/SU3 守卫，非证明。S6 运行时若遇 CppUnknown 只记账、不判拒。
+- 第 94 轮（EQDEC/HERED/SCALAR_W/FORCE/PATHS/PATHCTL）随第 95 轮一并合入：可靠性检验全 PASS，但预先写定的增益判据 W4/W5 均 FAIL（projcomp 段一未定 245→93、段二 1852→1674），pc3 因比较数为 0 事后删除；需求 2 的端口最大范围仍为逐点三值判定 + 公开未定率，不是闭式。
+
