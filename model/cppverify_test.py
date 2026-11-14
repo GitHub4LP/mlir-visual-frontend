@@ -39,6 +39,34 @@ def attr_variants(txt):
     if m: return [f'{int(m.group(1)) + 1} : {m.group(2)}', f'{int(m.group(1)) * 2 + 3} : {m.group(2)}']
     return out
 
+def td_variants(t):
+    """第 96 轮：方言 TypeDef（struct(params) / `<` $p `>`）类型的参数变异：类型参数取 variants，枚举参数换成其他枚举值；至多 6 个。"""
+    import cppverify as CV, re as _re
+    m = _re.fullmatch(r'!([\w.]+)<(.*)>', t.strip(), _re.S)
+    if not m or m.group(1) not in CV.typedef_index(): return []
+    k, ps, _ = CV.typedef_index()[m.group(1)]
+    if k == 'one': items = [(ps[0][0], m.group(2).strip())]
+    else:
+        items = []
+        for it in CV._split_top(m.group(2)):
+            kv = it.split('=', 1)
+            if len(kv) != 2: return []
+            items.append((kv[0].strip(), kv[1].strip()))
+    spec = dict(ps); out = []
+    for i, (nm, v) in enumerate(items):
+        sp = spec.get(nm); alts = []
+        if isinstance(sp, dict) and 'EnumParameter' in str(sp.get('!superclasses')):
+            ec = CV.enum_classes().get(CV._base(_re.sub(r'\s+', '', sp.get('cppType') or '')))
+            if ec: alts = [x for x in ec[1] if x != v][:2]
+        elif isinstance(sp, str) and CV._base(sp) in ('MemRefType', 'VectorType', 'Type', 'RankedTensorType'):
+            alts = variants(v)[:2]
+        out.append([])
+        for a2 in alts:
+            it2 = items[:i] + [(nm, a2)] + items[i + 1:]
+            out[-1].append(f'!{m.group(1)}<' + (it2[0][1] if k == 'one' else ', '.join(f'{x} = {y}' for x, y in it2)) + '>')
+    rr = [x[j] for j in range(2) for x in out if j < len(x)]       # 先每个参数一个变异，再第二个
+    return rr[:6]
+
 def run_file(path, q, seed):
     import mlir.ir as ir, irimport as I, oracle as OR, odssig as G, typesig as TS, nfrules as NF, attrsig as A, core as C, cppverify as CV
     from compcorpus_test import _funcs
@@ -82,9 +110,9 @@ def run_file(path, q, seed):
                 T0 = [tyof[v] for v in ports]
                 cases = [('原类型', T0, None)]
                 for j, t in enumerate(T0):
-                    for t2 in variants(t): cases.append(('端口', T0[:j] + [t2] + T0[j + 1:], None))
+                    for t2 in variants(t) + td_variants(t): cases.append(('端口', T0[:j] + [t2] + T0[j + 1:], None))
                 for k, (o, t) in enumerate(n['outs']):
-                    for t2 in variants(t): cases.append(('结果', T0, ('res', k, t2)))
+                    for t2 in variants(t) + td_variants(t): cases.append(('结果', T0, ('res', k, t2)))
                 at0 = (n.get('props') or {}).get('_attrs') or {}
                 for an, av in at0.items():
                     if isinstance(av, str):
