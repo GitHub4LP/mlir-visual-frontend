@@ -864,3 +864,10 @@ R_j(t) ≝ ∃ 其余端口. Φ_comp，即用户需求里“签名允许的最�
 #### §9.33a 结果
 - SU1 PASS 18/18；SU2(Z2') PASS 比较 2061，MLIR 接受 805，误拒 0，平台 UB 桶 4（上限 20.5）；SU3 PASS 501/501，未定 0；SU4 PASS 完备 op 未定 0（未定合计 27，均为判据范围外的 func.call 等）。
 - 接入：structure.py 义务 S6（解释执行 verifySymbolUses），odssig 对 symuses 完备的使用者移除“符号使用义务未登记”残差；S6 未定只记账（SYMUSES_UNDECIDED），不判拒。全量回归待 logs/r95。
+
+### §9.34 第 96 轮：解释器词汇长尾（通用机制，非逐 op）
+改动仅 model/cppverify.py、model/cppverify_test.py、scripts/fetch_cpp.sh（MLIR 9bae84b0）。新增机制：方言 TypeDef 参数访问器（assemblyFormat 为 `<` struct(params) `>` 或 `<` $p `>` 的类型，按参数 C++ 类型从打印文本取值）；方言头/源文件命名空间级 `constexpr` 整数常量；memref 内存空间作为 Attribute 参与 isa/cast/空性；方言 EnumAttr（`<` $value `>`）的 getValue → 枚举值；`ns::X` 在 mlir 命名空间内解析；内建浮点类型类（取自 builtin TypeDef）；`std::optional<T>` 的 has_value/value；operand_begin 迭代器与 `{it, it}` 范围；OpOperand / MutableOperandRange / getBeginOperandIndex，OperandRange 拷贝保留起点；Operation::hasAttr、getName（只进诊断文本）；函数体内 `using` 别名、局部 `enum class`；调用深度上限 6→12；`looks_decl` 不把含 `||`/`&&` 的表达式当模板类型。
+测试：cppverify_test 增 TypeDef 参数变异（每类型 ≤6）；新种子 corpus_ext/NVGPU/r96_seed.mlir、corpus_ext/GPU/r96_seed.mlir（手写，不推送）。
+过程（如实）：首轮全量 logs/r96 中 cv1 C3 FAIL 未定 34、C5 计“误收”15（nvgpu.device_async_copy 遇 `#gpu.address_space`：`isa<gpu::AddressSpaceAttr>` 与 `getValue` 运行时 Unknown；该段 Unknown 计为未拒绝，故记作误收），修 `ns::X` 解析与 EnumAttr getValue 后终版全量 logs/r96b 总判定 PASS（已知数量阈值 FAIL 11，同前）。
+结果：残差为空 481→496，条目 592→577，非 Transform 词汇 27→12；区域段点未定 r2 2496→934、f2 2930→1368、r1 1167→1000、s2 746→683；projcomp 段一 unknown 93→90，段二 1674→1710（分母同增，占比 7.09%→7.07%，持平）。可靠性字段（误拒/误收/不一致/违例/漏判/未定）全 0。
+局限：上述均为手工词汇，依 C1–C5 经验守卫；递归深度、looks_decl、getName 放行为启发式；linalg.fill 带隐式区域不在 cppverify_test 取样内，只有定向差分（FillOpInterface 38 比较 0/0；完整模型对 MLIR 接受的 22 例无误拒，误收检查因区域取模板而偏弱）；新方言 ext 语料结果（NVGPU C5 比较 824 0/0）跑在终版前两处修复之前。未处理：arith.scaling_extf/truncf（模板元编程）、memref.transpose/subview/global、func.func 的 FunctionOpInterface 等 12 条词汇，区域结构类 56 条，Transform 约 495 条。需求 2（最大范围）仍为逐点三值+未定率，需求 4 仍部分完成。

@@ -125,7 +125,8 @@ class P:
         j = self.i
         try:
             if self._bind_ahead() is not None: return True
-            self.typ()
+            ty_ = self.typ()
+            if '||' in ty_ or '&&' in ty_: return False                 # 第 96 轮：`a < 0 || b > c[i]` 不是模板类型（逻辑运算不出现在类型实参里）
             ok = self.pk()[0] == 'id' and (self.pk(1)[1] in ('=', ';', '{', '(', ':', ',', '['))
             return ok
         except CppUnknown: return False
@@ -188,6 +189,17 @@ class P:
                         if not arms: raise CppUnknown('parse: switch 首语句')
                         arms[-1][1].append(self.stmt())
                 self.ex('}'); return ('switch', e, arms, dflt)
+            if w == 'using' and self.pk(1)[0] == 'id' and self.isop('=', 2):      # 第 96 轮：函数体内类型别名 using X = T;（其后的 X 记号替换为 T 的记号）
+                self.nx(); nm = self.nx()[1]; self.nx(); j = self.i
+                while not self.isop(';'):
+                    if self.pk()[0] == 'eof': raise CppUnknown('parse: using 未闭合')
+                    self.nx()
+                rep = self.t[j:self.i]; self.nx()
+                rt_ = ''.join(x[1] for x in rep)
+                rest = [x for t_ in self.t[self.i:] for x in (rep if t_ == ('id', nm) else
+                        [('id', rt_ + t_[1][len(nm):])] if t_[0] == 'id' and t_[1].startswith(nm + '::') else [t_])]
+                self.t = self.t[:self.i] + rest
+                return ('block', [])
             if w in ('do', 'goto', 'try', 'case', 'default', 'using', 'typedef'):
                 raise CppUnknown(f'parse: 不支持 {w}')
             if w == 'assert':                                     # 第 82 轮：本 MLIR 构建开启断言 ⇒ assert(c) 求值，c 为假 ⇒ 崩溃（按拒绝）；原先整句跳过
@@ -484,6 +496,9 @@ def td_const(dia, name):
         for f in glob.glob(os.path.join(O.SITE, 'mlir', 'Dialect', *d.split('/')[:2], '*.td')):
             m = re.search(r'static\s+constexpr\s+(?:u?int\d*_t|int|unsigned)\s+' + re.escape(name) + r'\s*=\s*(-?\d+)\s*;', open(f, errors='ignore').read())
             if m: return int(m.group(1))
+    for f in _dialect_files(dia):                    # 第 96 轮：方言 .h/.cpp 的命名空间级 `constexpr <整型> NAME = <整数>;`（如 NVGPUDialect.h 的 kWarpSize、kMaxTMADimension）
+        m = re.search(r'(?:^|[;{}\n])\s*(?:static\s+)?constexpr\s+(?:(?:std::)?u?int\d*_t|int|unsigned|size_t)\s+' + re.escape(name) + r'\s*=\s*(-?\d+)\s*;', _file(f))
+        if m: return int(m.group(1))
     return None
 
 @functools.lru_cache(None)
@@ -605,7 +620,20 @@ def camel(nm):
 
 class V:                 # mlir::Value
     def __init__(self, t): self.t = t
-class Rng(list): pass    # ValueRange / OperandRange
+class Rng(list):          # ValueRange / OperandRange
+    base = None            # 第 96 轮：OperandRange 在 op 操作数表中的起点（getBeginOperandIndex）；未知 ⇒ None
+def _rng_at(xs, base): r = Rng(xs); r.base = base; return r
+class OpOpnd:              # 第 96 轮：OpOperand（操作数位置 + 值）
+    def __init__(self, i, v): self.i, self.v = i, v
+@functools.lru_cache(None)
+def local_enums(dia):
+    """第 96 轮：方言 .cpp/.h 里的 C++ `enum class Name { A = 0, B, … }`（非 ODS 枚举，如 Linalg 的 MatchFillResult）：名 → 成员集合。"""
+    out = {}
+    for f in _dialect_files(dia):
+        for m in re.finditer(r'\benum\s+class\s+(\w+)(?:\s*:\s*[\w:]+)?\s*\{([^}]*)\}', _file(f)):
+            mem = [x.split('=')[0].strip() for x in re.sub(r'//[^\n]*', '', m.group(2)).split(',') if x.strip()]
+            out.setdefault(m.group(1), frozenset(mem))
+    return out
 class TList(list):        # 第 82 轮：带声明元素类型的 SmallVector（仅供重载选择；空表也能区分 ArrayRef<AffineMap> 与 ReassociationIndices）
     ety = ''
 def _tlist(xs, ety):
@@ -638,7 +666,11 @@ def _layout_canon(txt, rank):
 class Space:
     def __init__(self, txt): self.txt = txt
     def __eq__(self, o): return isinstance(o, Space) and _norm_space(self.txt) == _norm_space(o.txt)
-    def __hash__(self): return 0
+    def __bool__(self): return _norm_space(self.txt) is not None     # 第 96 轮：Attribute 的空性（MemRefType 把整数 0 内存空间规范化为空）
+def _space_attr(x):
+    """第 96 轮：getMemorySpace() 的值作为 Attribute 参与 isa/cast：空 ⇒ None（null Attribute），否则 MLIR 解析的属性。"""
+    if not isinstance(x, Space): return x
+    return None if not x else Attr(_parse_attr(x.txt))
 def _norm_space(t):
     if t is None: return None
     m = re.fullmatch(r'\s*(\d+)\s*(?::\s*i64)?\s*', t)
@@ -671,6 +703,19 @@ def enum_classes():
             out.setdefault(r['className'], (vals, strs, 'BitEnum' in str(r.get('!superclasses'))))
     return out
 
+@functools.lru_cache(None)
+def enum_attr_index():
+    """第 96 轮：方言 EnumAttr 的属性名（gpu.address_space）→ 枚举 C++ 类名；只收 assemblyFormat 为 `<` $value `>` 者。"""
+    import odsjson as O
+    out = {}
+    for dia in O.DIALECTS:
+        R = O.records(dia)
+        for r in R.values():
+            if not (isinstance(r, dict) and 'EnumAttr' in r.get('!superclasses', []) and r.get('attrName')): continue
+            if O.norm(r.get('assemblyFormat') or '') != O.norm('`<` $value `>`'): continue
+            er = R.get(O.ref(r.get('enum')), {}) if O.ref(r.get('enum')) else {}
+            if er.get('className'): out[r['attrName']] = er['className']
+    return out
 class AExpr:
     """第 82 轮：mlir::AffineExpr（经 MLIR Python 的 AffineExpr）。"""
     def __init__(self, e): self.e = e
@@ -801,6 +846,20 @@ def _dialect_may_implement(ns, iface):
     for f in _dialect_files(ns):
         if key in _file(f) and re.search(r'attachInterface|TypeBase', _file(f)) and re.search(r'(attachInterface\s*<[^;]*|TypeBase\s*<[^;]*)' + key, _file(f)): return True
     return False
+@functools.lru_cache(None)
+def builtin_float_classes():
+    """第 96 轮：内建浮点 TypeDef 的 C++ 类名 → typesig 项（Float8E5M2Type → ('f', 'f8E5M2')）。"""
+    import odsjson as O
+    out = {}
+    for d in O.DIALECTS:
+        for k, r in O.records(d).items():
+            if isinstance(r, dict) and k.startswith('Builtin_Float') or isinstance(r, dict) and k == 'Builtin_BFloat16':
+                if 'TypeDef' not in r.get('!superclasses', []) or not r.get('cppClassName') or not (r.get('typeName') or '').startswith('builtin.'): continue
+                try: t = TS.parse(r['typeName'][8:])
+                except Exception: continue
+                if t[0] == 'f': out[r['cppClassName']] = t
+        if out: break
+    return out
 def _isa(cls, x):
     b = _base(cls)
     if isinstance(x, V):
@@ -810,6 +869,8 @@ def _isa(cls, x):
     if isinstance(x, Attr) and b in ('Attribute', 'OpFoldResult'): return True
     if isinstance(x, tuple):
         if b in TYPE_CLASSES: return TYPE_CLASSES[b](x)
+        fl = builtin_float_classes().get(b)                              # 第 96 轮：内建浮点类型类（Float8E5M2Type 等），取自 BuiltinTypes.td 的 TypeDef
+        if fl is not None: return x == fl
         if b in BUILTIN_IFACE_TYPES:                                      # 第 83 轮 PtrLike；第 93 轮 TensorLike/BufferLike（BufferizationDialect::initialize 的 attachInterface）
             if x[0] == BUILTIN_IFACE_TYPES[b]: return True
             if x[0] in ('tensor', 'memref', 'vector', 'index', 'i', 'f', 'complex', 'tuple', 'none', 'fn'): return False
@@ -850,7 +911,8 @@ def _attr_isa(b, a, full=None):
                                            'DenseI64ArrayAttr', 'BoolAttr', 'DenseIntElementsAttr', 'SplatElementsAttr', 'ElementsAttr', 'DenseFPElementsAttr', 'TypedAttr'):
         import attrsig as AS, odsjson as O
         nm = full if full.startswith('::') else '::' + full
-        for k in (nm, nm[2:]):
+        ks = (nm, nm[2:]) + (() if nm.startswith('::mlir::') else ('::mlir' + nm, 'mlir' + nm))   # 第 96 轮：gpu::X 在 mlir 命名空间内书写
+        for k in ks:
             try: return bool(AS._dialect_isa(k)(a))
             except O.Unknown: pass
         raise CppUnknown(f'isa<{full}>')
@@ -866,12 +928,86 @@ def _attr_isa(b, a, full=None):
         raise CppUnknown(f'isa<{b}>')
     return m[b].isinstance(a)
 
+def _split_top(s):
+    out, d, cur, q = [], 0, '', False
+    for c in s:
+        if c == '"': q = not q
+        if not q and c in '<([{': d += 1
+        if not q and c in '>)]}': d -= 1
+        if c == ',' and d == 0 and not q: out.append(cur.strip()); cur = ''
+        else: cur += c
+    if cur.strip(): out.append(cur.strip())
+    return out
+@functools.lru_cache(None)
+def typedef_index():
+    """第 96 轮：方言 TypeDef（有参数、assemblyFormat 为 `<` struct(params) `>` 或 `<` $p `>`）：类型名 → (格式, [(参数名, 参数记录或 C++ 类型串)], 方言)。"""
+    import odsjson as O
+    out = {}
+    for dia in O.DIALECTS:
+        R = O.records(dia)
+        for r in R.values():
+            if not (isinstance(r, dict) and 'TypeDef' in r.get('!superclasses', []) and r.get('typeName')): continue
+            ps = (r.get('parameters') or {}).get('args') or []
+            if not ps or r['typeName'].startswith('builtin.'): continue
+            fmt = O.norm(r.get('assemblyFormat') or '')
+            if fmt == O.norm('`<` struct(params) `>`'): k = 'struct'
+            elif len(ps) == 1 and fmt == O.norm(f'`<` ${ps[0][1]} `>`'): k = 'one'
+            else: continue
+            out[r['typeName']] = (k, [(nm, (R.get(O.ref(c), {}) if O.ref(c) else c)) for c, nm in ps], dia)
+    return out
+def _param_conv(spec, v):
+    """按参数的 C++ 类型把打印文本转成解释器值；不认识 ⇒ CppUnknown。"""
+    rec = spec if isinstance(spec, dict) else {}
+    cpp = re.sub(r'\s+', '', rec.get('cppType') or (spec if isinstance(spec, str) else ''))
+    b = _base(cpp)
+    if 'EnumParameter' in str(rec.get('!superclasses')):
+        ec = enum_classes().get(b)
+        if ec is None or ec[2] or v not in ec[1]: raise CppUnknown(f'类型参数枚举 {b}')
+        return EnumV(b, ec[1][v])
+    if b in ('Type', 'MemRefType', 'VectorType', 'RankedTensorType', 'TensorType', 'ShapedType', 'IntegerType', 'FloatType'):
+        try: return TS.parse(v)
+        except Exception: raise CppUnknown('类型参数解析')
+    if b in ('unsigned', 'int', 'int64_t', 'int32_t', 'uint64_t', 'uint32_t'):
+        if not re.fullmatch(r'-?\d+', v.strip()): raise CppUnknown('类型参数整数')
+        return int(v)
+    if b == 'StringRef':
+        v = v.strip()
+        if v.startswith('"') and v.endswith('"'): return v[1:-1]
+        raise CppUnknown('类型参数字符串')
+    if b == 'Attribute': return Attr(_parse_attr(v))
+    raise CppUnknown(f'类型参数 C++ 类型 {cpp}')
+def typedef_params(txt):
+    """第 96 轮：方言类型的打印文本 → {getX: 取值函数}（ODS 参数访问器）；不是已知格式的方言类型 ⇒ None。
+    struct(params)：`k = v` 逗号分隔、缺省值参数可省略（省略 ⇒ defaultValue）；值按参数 C++ 类型转换。"""
+    txt = txt.strip()
+    m = re.fullmatch(r'!([\w.]+)<(.*)>', txt, re.S)
+    if not m or m.group(1) not in typedef_index(): return None
+    k, ps, _ = typedef_index()[m.group(1)]
+    if k == 'one': vals = {ps[0][0]: m.group(2)}
+    else:
+        vals = {}
+        for it in _split_top(m.group(2)):
+            kv = it.split('=', 1)
+            if len(kv) != 2: return None
+            vals[kv[0].strip()] = kv[1].strip()
+    out = {}
+    for nm, spec in ps:
+        g = 'get' + camel(nm)
+        if nm in vals: out[g] = (lambda spec=spec, v=vals[nm]: _param_conv(spec, v))
+        elif isinstance(spec, dict) and (spec.get('defaultValue') or '').strip():
+            out[g] = (lambda spec=spec: _param_conv(spec, spec['defaultValue'].strip()))
+        else: out[g] = (lambda nm=nm: (_ for _ in ()).throw(CppUnknown(f'类型参数 {nm} 缺省')))
+    return out
+@functools.lru_cache(None)
+def typedef_accessors():
+    return frozenset('get' + camel(nm) for _, ps, _ in typedef_index().values() for nm, _ in ps)
+
 # ───────────────────────── 解释器
 TYPE_METHODS = {'getRank', 'getShape', 'getElementType', 'getDimSize', 'isDynamicDim', 'getNumDynamicDims', 'hasStaticShape', 'hasRank',
                 'getNumElements', 'getMemorySpace', 'getLayout', 'getTypeID', 'isIndex', 'isInteger', 'isSignlessInteger', 'isSignless', 'isUnsigned', 'isSigned',
                 'isIntOrFloat', 'isIntOrIndex', 'isIntOrIndexOrFloat', 'isF16', 'isF32', 'isF64', 'isBF16', 'getIntOrFloatBitWidth', 'getWidth',
                 'getScalableDims', 'isScalable', 'getElementTypeBitWidth', 'isSignedInteger', 'isUnsignedInteger', 'getNumScalableDims', 'isSignlessIntOrIndex',
-                'isSignlessIntOrIndexOrFloat', 'isSignlessIntOrFloat', 'getDynamicDimIndex'}
+                'isSignlessIntOrIndexOrFloat', 'isSignlessIntOrFloat', 'getDynamicDimIndex', 'isTF32'}
 FREE_FNS = {'success', 'failure', 'failed', 'succeeded', 'isa', 'cast', 'dyn_cast', 'dyn_cast_or_null', 'cast_or_null', 'isa_and_nonnull', 'dyn_cast_if_present',
             'static_cast', 'size', 'any_of', 'all_of', 'none_of', 'count_if', 'count', 'enumerate', 'zip', 'zip_equal', 'is_contained', 'isPowerOf2_32',
             'isPowerOf2_64', 'max', 'min', 'abs', 'isDynamic', 'isStatic', 'emitOpError', 'emitError', 'getOperation', 'getNumOperands', 'getNumResults',
@@ -921,7 +1057,8 @@ class Interp:
                 v = _conv(h[2], v)
                 if isinstance(v, list) and '&' not in (h[2] or ''):                # 值语义：SmallVector/auto 拷贝
                     m_ = re.match(r'(?:llvm::)?SmallVector\s*<\s*([\w:]+)', h[2] or '')
-                    v = _tlist(v, m_.group(1)) if m_ else _tlist(v, v.ety) if isinstance(v, TList) else list(v)
+                    v = _tlist(v, m_.group(1)) if m_ else _tlist(v, v.ety) if isinstance(v, TList) \
+                        else _rng_at(v, v.base) if isinstance(v, Rng) and re.search(r'\bOperandRange\b', h[2] or '') else list(v)   # 第 96 轮：OperandRange 保留起点
                 env[h[1]] = v
                 st_ = _static_ty(h[2], init)                                  # 第 93 轮：局部变量的静态类型（只用于 unranked 上 getShape 的分派）
                 if st_ is not None: env['\x00ty:' + h[1]] = st_
@@ -1088,6 +1225,10 @@ class Interp:
         if k == 'brace':                               # T x{a, b} / = {a, b} / return {a, b}：列表初始化，无 (n, v) 计数语义
             args = [self.ev(a, env) for a in e[2]]
             b = _base(e[1] or '')
+            if e[1] is None and len(args) == 2 and _is_it(args[0]) and _is_it(args[1]) and args[0][1] is args[1][1]:   # 第 96 轮：{begin+i, begin+j} 迭代器对构造范围（OperandRange 等）
+                c_, i_, j_ = args[0][1], args[0][2], args[1][2]
+                if not 0 <= i_ <= j_ <= len(c_): _crash()                     # 越界迭代器 = UB，同崩溃口径
+                return Rng(c_[i_:j_])
             if e[1] is None or b == 'auto' or re.match(r'(llvm::|std::)?(SmallVector|ArrayRef|vector|pair|tuple|array)\b', e[1].strip()):
                 return list(args)
             if len(args) == 1: return _conv(e[1], args[0])
@@ -1182,6 +1323,7 @@ class Interp:
         q = n.split('::')
         if len(q) >= 2 and q[-2] in enum_classes() and not enum_classes()[q[-2]][2]:
             if q[-1] in enum_classes()[q[-2]][1].values(): return EnumV(q[-2], q[-1])
+        if len(q) >= 2 and q[-1] in local_enums(self.op.dia).get(q[-2], ()): return EnumV(q[-2], q[-1])   # 第 96 轮
         if CUR.get('loose_enum') and len(q) >= 2 and q[-2][:1].isupper() and q[-1][:1].isupper(): return EnumV(q[-2], q[-1])   # 方言 .cpp 内的 C++ enum class
         if re.fullmatch(r'(?:\w+::)*\w+Kind::\w+', n) or re.fullmatch(r'\w+::\w+', n): raise CppUnknown(f'枚举/限定名 {n}')
         raise CppUnknown(f'未知名字 {n}')
@@ -1226,13 +1368,13 @@ class Interp:
         targs = _expand_targs(targs, env)
         args = self.evargs(args_e, env)
         if n in ('isa', 'isa_and_nonnull', 'isa_and_present'):
-            x = args[0]
+            x = _space_attr(args[0])
             if x is None: 
                 if n == 'isa': _crash()
                 return False
             return any(_isa(_resolve_t(c, env), x) for c in targs)
         if n in ('cast', 'dyn_cast', 'dyn_cast_or_null', 'cast_or_null', 'dyn_cast_if_present'):
-            x = args[0]
+            x = _space_attr(args[0])
             if x is None:
                 if n in ('cast', 'dyn_cast'): _crash()
                 return None
@@ -1432,6 +1574,14 @@ class Interp:
             if m == 'isDynamic' and not args: return recv.isdyn()
             raise CppUnknown(f'DimensionSize.{m}')
         if isinstance(recv, V) and m == 'getLoc' and not args: return Loc()
+        if isinstance(recv, OpOpnd):                                      # 第 96 轮
+            if m == 'get' and not args: return recv.v
+            if m == 'getOwner' and not args: return Self()
+            if m == 'getOperandNumber' and not args: return recv.i
+            raise CppUnknown(f'OpOperand.{m}')
+        if isinstance(recv, Rng) and m == 'getBeginOperandIndex' and not args:
+            if recv.base is None: raise CppUnknown('getBeginOperandIndex（范围起点未知）')
+            return recv.base
         if isinstance(recv, int) and not isinstance(recv, bool) and m in ('getSExtValue', 'getZExtValue', 'getLimitedValue') and not args:
             if m == 'getZExtValue' and recv < 0: raise CppUnknown('APInt 负值的 getZExtValue')
             return recv
@@ -1559,6 +1709,12 @@ class Interp:
         import mlir.ir as ir
         if m in ('getInt', 'getSInt', 'getUInt') and ir.IntegerAttr.isinstance(x): return ir.IntegerAttr(x).value
         if m == 'getValue' and ir.IntegerAttr.isinstance(x): return ir.IntegerAttr(x).value
+        if m == 'getValue':                                                  # 第 96 轮：方言 EnumAttr（#dia.mn<sym>，assemblyFormat `<` $value `>`）⇒ 枚举值
+            e_ = enum_attr_index().get(re.sub(r'<.*', '', str(x))[1:])
+            mt = re.fullmatch(r'#[\w$.]+<\s*([\w$]+)\s*>', str(x))
+            if e_ and mt:
+                ec = enum_classes().get(e_)
+                if ec and not ec[2] and mt.group(1) in ec[1]: return EnumV(e_, ec[1][mt.group(1)])
         if m in ('getValue', 'getLeafReference', 'getRootReference') and ir.FlatSymbolRefAttr.isinstance(x): return ir.FlatSymbolRefAttr(x).value   # 第 95 轮（只进诊断文本）
         if m in ('size', 'getNumElements', 'empty'):
             n_ = len(_attr_list(x)); return n_ == 0 if m == 'empty' else n_
@@ -1577,6 +1733,10 @@ class Interp:
             ins, outs = _fn_parts(t[1])
             r = ins if m in ('getInputs', 'getNumInputs') else outs
             return len(r) if m.startswith('getNum') else list(r)
+        if m in ('has_value', 'value') and not args: return True if m == 'has_value' else t   # 第 96 轮：std::optional<XxxType> 形参的有值（无值为 None，见 method）
+        if t[0] == 'opaque':                                              # 第 96 轮：方言 ODS TypeDef 的参数访问器（按 assemblyFormat 从打印文本取参数）
+            pv = typedef_params(t[1])
+            if pv is not None and m in pv: return pv[m]()
         mm = _mma(t)
         if mm is not None:
             if m == 'getOperand': return mm[2]
@@ -1620,6 +1780,14 @@ class Interp:
             p = 1
             for x in t[1]: p *= x
             return p
+        if m == 'getMemorySpaceAsInt':                                    # 第 96 轮：BaseMemRefType::getMemorySpaceAsInt（空 ⇒ 0；非整数属性 ⇒ 断言）
+            if t[0] != 'memref': _crash()
+            sp_ = _norm_space(_mods(t).get('space'))
+            if sp_ is None: return 0
+            a_ = _parse_attr(_mods(t).get('space'))
+            import mlir.ir as ir
+            if not ir.IntegerAttr.isinstance(a_): _crash()
+            return ir.IntegerAttr(a_).value
         if m == 'getMemorySpace':
             if t[0] != 'memref': _crash()
             return Space(_mods(t).get('space'))
@@ -1656,7 +1824,7 @@ class Interp:
         if m == 'isSignlessIntOrIndex': return (t[0] == 'i' and t[2] == '') or t[0] == 'index'
         if m == 'isSignlessIntOrIndexOrFloat': return (t[0] == 'i' and t[2] == '') or t[0] in ('index', 'f')
         if m == 'isSignlessIntOrFloat': return (t[0] == 'i' and t[2] == '') or t[0] == 'f'
-        if m in ('isF16', 'isF32', 'isF64', 'isBF16'): return t == ('f', m[2:].lower())
+        if m in ('isF16', 'isF32', 'isF64', 'isBF16', 'isTF32'): return t == ('f', m[2:].lower())
         if m == 'getIntOrFloatBitWidth':
             if t[0] == 'i': return t[1]
             if t[0] == 'f': return _fwidth(t)
@@ -1727,6 +1895,15 @@ class Interp:
             if not 0 <= i < len(op.ins): _crash()
             return V(op.ins[i])
         if m == 'getOperands': return Rng(V(t) for t in op.ins)
+        if m == 'getOpOperand' and len(args) == 1:                        # 第 96 轮
+            i = _num(args[0])
+            if not 0 <= i < len(op.ins): _crash()
+            return OpOpnd(i, V(op.ins[i]))
+        if m == 'getOpOperands' and not args: return [OpOpnd(i, V(t)) for i, t in enumerate(op.ins)]
+        if m in ('operand_begin', 'operand_end') and not args:            # 第 96 轮：Operation::operand_begin()（迭代器；与 {a, b} 范围构造配合）
+            c_ = op.__dict__.get('_opnd_rng')
+            if c_ is None: c_ = op._opnd_rng = Rng(V(t) for t in op.ins)   # 同一 op 的多次调用共享容器（迭代器同源判定）
+            return ('\x00it', c_, 0 if m == 'operand_begin' else len(c_))
         if m == 'getResults': return Rng(V(t) for t in op.outs)
         if m == 'getOperandTypes': return list(op.ins)
         if m == 'getResultTypes': return list(op.outs)
@@ -1748,6 +1925,10 @@ class Interp:
             a_ = Attr(_parse_attr(txt))
             return a_ if not targs or _isa(targs[0], a_) else None
         if m == 'getLoc' and not args: return Loc()                      # 第 95 轮：只用于 emitError(loc)
+        if m == 'hasAttr' and len(args) == 1 and isinstance(args[0], str):   # 第 96 轮：Operation::hasAttr（固有属性 + 可丢弃属性，按名）
+            if op.attrs is None: raise CppUnknown('查询未提供属性')
+            return args[0] in op.attrs
+        if m == 'getName' and not args and getattr(op, 'opname', None): return op.opname   # 第 96 轮：OperationName（只进诊断文本）
         if m in ('getParentOp', 'getParentOfType', 'getParentWithTrait', 'getBlock', 'getRegion', 'getBody', 'getRegions', 'getLoc', 'getContext', 'walk'):
             raise CppUnknown(f'op.{m}（父/区域）')
         # ODS 端口访问器 getFoo()
@@ -1758,7 +1939,9 @@ class Interp:
                     if len(g) != 1: _crash()
                     return V(g[0])
                 if kind == 'optional': return V(g[0]) if g else None
-                return Rng(V(t) for t in g)
+                return _rng_at([V(t) for t in g], self._grp_base(nm))
+            if m == 'get' + camel(nm) + 'Mutable' and nm not in op.isres and op.kinds[nm] != 'one':   # 第 96 轮：MutableOperandRange（只作 OperandRange 用）
+                return _rng_at([V(t) for t in op.groups[nm]], self._grp_base(nm))
             if m == 'getNum' + camel(nm) and op.kinds[nm] != 'one': return len(op.groups[nm])
         # ODS 属性访问器
         for nm, (c, kind, req) in op.attr_decl.items():
@@ -1777,6 +1960,12 @@ class Interp:
         ff = find_function(op.dia, _base(m), nargs=len(args))
         if ff is not None: return self.invoke(ff[1], ff[2], args, ff[0], targs=targs)
         raise CppUnknown(f'op 方法 {m}')
+    def _grp_base(self, nm):
+        op = self.op; k = 0
+        for nm2, *_ in op.S['ins']:
+            if nm2 == nm: return k
+            k += len(op.groups[nm2])
+        return None
     def attr_get(self, nm, c, kind, req, raw):
         r = self._attr_get0(nm, c, kind, req, raw)
         if not raw and isinstance(r, list) and not isinstance(r, Rng):       # 第 95 轮：std::optional<ArrayRef<…>> 的值带“有值”真值
@@ -1839,7 +2028,7 @@ class Interp:
             return Attr(a)
         raise CppUnknown(f'属性 {nm} 的返回类型 {rt or kind}')
     def invoke(self, params_txt, body, args, tparams, targs=None):
-        if self.depth > 6: raise CppUnknown('调用过深')
+        if self.depth > 12: raise CppUnknown('调用过深')   # 第 96 轮：6 → 12（dma_start 的内联访问器链深 8；仍防无穷递归）
         ps = _params(params_txt)
         env = {}
         if ps and '...' in ps[-1][0]:                       # 函数形参包：其余实参
@@ -1963,6 +2152,7 @@ def _eq(a, b):
     if isinstance(a, V): a = a.t
     if isinstance(b, V): b = b.t
     if isinstance(a, Self) and b is None or isinstance(b, Self) and a is None: return False   # 第 82 轮：op != nullptr（被校验 op 非空）
+    if isinstance(a, Self) and isinstance(b, Self): return True             # 第 96 轮：同一个被校验 op（OpOperand::getOwner() == *this）
     if isinstance(a, Self) or isinstance(b, Self): raise CppUnknown('op 比较')
     if isinstance(a, Attr) and isinstance(b, Attr): return str(a.a) == str(b.a)
     if isinstance(a, (list, Rng)) and isinstance(b, (list, Rng)):
@@ -2371,7 +2561,7 @@ KNOWN_METHODS = TYPE_METHODS | {'setShape', 'setElementType', 'assign', 'equals'
                                 'asArrayRef', 'getNumElements', 'failed', 'succeeded', 'getOperation', 'getNumOperands', 'getNumResults', 'getOperand',
                                 'getOperands', 'getResults', 'getOperandTypes', 'getResultTypes', 'getResult', 'emitOpError', 'emitError', 'isa', 'cast', 'dyn_cast',
                                 'index', 'asInteger', 'desaturate', 'saturated', 'getStridesAndOffset', 'resize', 'begin', 'end', 'getPosition', 'walk', 'getResults'} \
-               | {'lookupNearestSymbolFrom', 'getLoc', 'getSExtValue', 'getZExtValue', 'next', 'prev', 'sort', 'DimensionSize', 'dynamic', 'int64_t', 'isDynamicShape', 'isStaticShape', 'isDynamic'}   # 第 82 轮；第 95 轮
+               | {'lookupNearestSymbolFrom', 'getLoc', 'getSExtValue', 'getZExtValue', 'next', 'prev', 'sort', 'DimensionSize', 'dynamic', 'int64_t', 'isDynamicShape', 'isStaticShape', 'isDynamic', 'hasAttr', 'getName', 'getOpOperand', 'getOpOperands', 'getOwner', 'getBeginOperandIndex', 'getOperandNumber', 'operand_begin', 'operand_end', 'getMemorySpaceAsInt', 'size_t', 'int', 'int32_t', 'uint64_t'}   # 第 82 轮；第 95 轮
 @functools.lru_cache(None)
 def completeness(dia, opname, which='verify'):
     """静态完备性：→ (完备?, 不支持的名字集合)。递归展开 op 方法与方言内自由函数。
@@ -2395,7 +2585,8 @@ def completeness(dia, opname, which='verify'):
     CUR['dia'] = dia; CUR['opname'] = opname
     if body is None: return (False, frozenset({'<无源码>'}))
     S = G.sig(dia, opname)
-    acc = {'get' + camel(nm) for nm, *_ in S['ins'] + S['outs']} | {'getNum' + camel(nm) for nm, *_ in S['ins'] + S['outs']}
+    acc = {'get' + camel(nm) for nm, *_ in S['ins'] + S['outs']} | {'getNum' + camel(nm) for nm, *_ in S['ins'] + S['outs']} \
+        | {'get' + camel(nm) + 'Mutable' for nm, _, k_, _ in S['ins'] if k_ != 'one'}   # 第 96 轮
     for nm, *_ in S['attrs']:
         cm = camel(nm); acc |= {'get' + cm, 'get' + cm + 'Attr', 'get' + cm + 'AttrName', 'get' + cm + 'AttrStrName'}
     bad = set(); seen = set(); srcs = []
@@ -2424,6 +2615,8 @@ def completeness(dia, opname, which='verify'):
             if k == 'fn' and n in lam: continue
             if k == 'fn' and n == 'SaturatedInteger::wrap': continue
             if b in KNOWN_METHODS or b in FREE_FNS - {'getConstantIntValue'} or b in acc: continue
+            if k == 'm' and b in typedef_accessors(): continue
+            if k == 'm' and b == 'get': continue                          # 第 96 轮：OpOperand::get()（运行时只对 OpOperand 解释，其余 ⇒ CppUnknown）          # 第 96 轮：方言 TypeDef 参数访问器（运行时按打印文本取参数；非该类型 ⇒ CppUnknown）
             if td_const(dia, b) is not None: continue
             if re.fullmatch(r'stringify\w+', b): continue
             if k == 'fn' and b.endswith('Type') and b[:1].isupper(): continue
@@ -2476,8 +2669,10 @@ def _scan_stmts(node, bad, tag):
         if node and node[0] == 'id' and re.fullmatch(r'(?:\w+::)+\w+', node[1]) and _base(node[1]) not in FREE_FNS and _base(node[1]) != 'kDynamic' \
                 and not (node[1].split('::')[-1] == 'get' and (node[1].split('::')[-2] in CTORS or _nullary_type(node[1].split('::')[-2], CUR['dia'] or '') is not None)) \
                 and not (node[1].split('::')[-2] in enum_classes() and not enum_classes()[node[1].split('::')[-2]][2]) \
+                and not (node[1].split('::')[-1] in local_enums(CUR['dia'] or '').get(node[1].split('::')[-2], ())) \
                 and not re.fullmatch(r'stringify\w+', _base(node[1])) and _base(node[1]) not in ('tie', 'equal', 'swap', 'zip_first') and node[1] != 'SaturatedInteger::wrap' \
                 and node[1] not in QUAL95 \
+                and not (len(node[1].split('::')) == 2 and node[1].split('::')[0].endswith('Dialect') and (find_function(CUR['dia'] or '', _base(node[1])) is not None or td_const(CUR['dia'] or '', _base(node[1])) is not None)) \
                 and not TB_RE.match(node[1]) \
                 and not _base(node[1]).startswith(('get', 'verify', 'is', 'compute', 'infer')):
             bad.add(f'限定名 {node[1]}')

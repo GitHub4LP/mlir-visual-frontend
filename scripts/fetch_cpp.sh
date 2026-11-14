@@ -55,6 +55,7 @@ for p in \
   mlir/lib/Dialect/Linalg/IR/LinalgOps.cpp \
   mlir/lib/Dialect/Linalg/IR/ValueBoundsOpInterfaceImpl.cpp \
   mlir/lib/Dialect/NVGPU/IR/NVGPUDialect.cpp \
+  mlir/include/mlir/Dialect/NVGPU/IR/NVGPUDialect.h \
   mlir/lib/Dialect/Shard/IR/ShardOps.cpp \
   mlir/lib/Interfaces/AlignmentAttrInterface.cpp \
   mlir/lib/Interfaces/CallInterfaces.cpp \
