@@ -24,3 +24,6 @@ n2e packconst_test
 n2f winograd_test
 scf scf_test
 pt predtrait_test
+pc1 projcomp_test 4 125 0
+pc2 projcomp_test 4 400 125
+su symuses_test

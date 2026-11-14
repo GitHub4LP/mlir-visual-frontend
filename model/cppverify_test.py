@@ -169,7 +169,7 @@ def run_file(path, q, seed):
                         st[f'判定/{tag}'] += 1; st[f'拒绝/{tag}'] += (verdict is False)
                         if ok and verdict is False: st['C1 误拒'] += 1; note('C1 误拒', f"{n['op']} {kind} {T} {mu} {msgv!r}")
                         if vd and verdict is not False and complete: st['C2 漏判'] += 1; note('C2 漏判', f"{n['op']} {kind} {T} {mu} {' '.join(d[1] for d in diags)[:100]}")
-                        if vd and verdict is False and msgv and msgv != '\x00crash':
+                        if vd and verdict is False and msgv and not msgv.startswith('\x00'):   # \x00crash / \x00ub-div0（第 95 轮）
                             st['消息比较'] += 1; st['消息一致'] += any(msgv[:20] in m_ for _, m_ in diags)
                     if full:
                         old = C.ORACLE_ON; C.ORACLE_ON = False

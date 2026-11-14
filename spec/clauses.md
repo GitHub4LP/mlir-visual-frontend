@@ -30,7 +30,7 @@
 | M2.1 | 结构层有拒绝权 | structure | obligations_test:Z2 变异差分; obligations_test:Z1 触发数 | L39 | A | 检验 | |
 | M2.2 | 自动签名有拒绝权 | odssig | odssig_test:L1 按账目 | L29 | A | 检验 | |
 | M2.3 | 属性层有拒绝权 | attrsig | attrsig_test:A1 真实属性 | L34a/b | A | 检验 | A1 14984 实例误拒 0；A2 变异 25395 误拒 0、ODS 属性层漏判 465（第 46 轮） |
-| M2.4 | 符号层有拒绝权 | symtab | symtab_test:Y1 误拒 | L36a/b | A | 检验 | |
+| M2.4 | 符号层有拒绝权 | symtab | symtab_test:Y1 误拒; symuses_test:SU1 符号义务完备; symuses_test:SU2 符号义务无误拒; symuses_test:SU3 符号义务诊断必拒; symuses_test:SU4 符号义务无未定 | L36a/b | A | 检验 | |
 | M2.5 | 预言机是最终权威 | oracle | modular_test:M3 单元级预言机; oracle_test:O1/O2 判定与分工 | L42 | A | 检验 | |
 | M2.6 | typesig 无拒绝权，只警告 | typesig | typesig_test:T4 接入 core | L33 | D | 检验 | 元规则，由 A 级数据支撑 |
 | M2.7 | 值层/效应/caps 无拒绝权；必然 UB 的程序合法 | core、structure | clauses_test:M2.7 | — | A | 检验 | 本轮新增回归：MLIR 接受 + 结构层无诊断 + 推导不抛异常 + UB 恒真 |

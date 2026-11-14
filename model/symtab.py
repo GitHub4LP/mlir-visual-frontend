@@ -148,3 +148,71 @@ def func_scopes(g):
                 for m in b['ops']: rec(m, syms, mattrs)
     rec(g, {}, {})
     return out
+
+# ── 第 95 轮：verifySymbolUses 的解释执行（cppverify.decide_symuses）所用的符号解析，照 SymbolTable.cpp：
+#   getNearestSymbolTable(from)：从 from 自身起向上找第一个带 SymbolTable trait 的 op；
+#   lookupSymbolIn(table, @a)：只在该表的直接子 op 中按 sym_name 找（不上溯）；@a::@b：逐表下行。
+def parent_map(root):
+    par = {}
+    def rec(n):
+        for r in n.get('regions') or []:
+            for b in r:
+                for m in b['ops']: par[id(m)] = n; rec(m)
+    rec(root); return par
+
+def _name_any(m):
+    nm = sym_of(m)
+    if nm is None and ((m.get('props') or {}).get('_attrs') or {}).get('sym_name'): nm = _unq(m['props']['_attrs']['sym_name'])
+    return nm
+
+def lookup_in(table, parts):
+    for r in (table.get('regions') or [])[:1]:
+        for b in r[:1]:
+            for m in b['ops']:
+                if _name_any(m) == parts[0]:
+                    if len(parts) == 1: return m
+                    return lookup_in(m, parts[1:]) if is_table(m['op']) else None
+    return None
+
+def nearest_table(n, par):
+    while n is not None and not is_table(n['op']): n = par.get(id(n))
+    return n
+
+def resolver(root, n, par=None):
+    """→ f(名字) → 目标节点 | None（lookupNearestSymbolFrom 的模型）。"""
+    par = par if par is not None else parent_map(root)
+    t = nearest_table(n, par)
+    return lambda nm: None if t is None else lookup_in(t, [p.strip('"') for p in nm.split('::@')])
+
+def has_symuses(op):
+    import cppverify as CV
+    dia = op.split('.')[0]
+    try: return CV.symuses_source(dia, op)[1] is not None
+    except Exception: return False
+
+def symuses_decide(root, n, par=None):
+    """节点 n 的 verifySymbolUses 判定：(True | False, 消息)；不支持 ⇒ cppverify.CppUnknown。"""
+    import cppverify as CV, odssig as G, typesig as TS, irimport as I
+    dia = n['op'].split('.')[0]
+    lk = G.lookup(n['op'])
+    if lk is None: raise CV.CppUnknown('无签名')
+    S = lk[1]
+    p = n.get('props') or {}
+    tys = p.get('_types')
+    if tys is None: raise CV.CppUnknown('无操作数类型')
+    try: ins_t = [TS.parse(t) for t in tys]; outs_t = [TS.parse(t) for _, t in n['outs']]
+    except Exception: raise CV.CppUnknown('类型不可解析')
+    a_ = (p.get('_attrs') or {}).get('operandSegmentSizes'); seg = I._segs(a_) if a_ else None
+    gi = G.bind(S, ins_t, S['ins'], seg or None); go = G.bind(S, outs_t, S['outs'])
+    if gi is None or go is None: raise CV.CppUnknown('端口不可绑定')
+    attrs = dict(p.get('_attrs') or {}); attrs.update({k: v for k, v in (p.get('_props') or {}).items() if k not in attrs})
+    return CV.decide_symuses(dia, n['op'], S, gi + go, attrs, resolver(root, n, par))
+
+
+@functools.lru_cache(None)
+def symuses_complete(op):
+    """第 95 轮：op 的 verifySymbolUses 有源码且解释器静态完备。"""
+    import cppverify as CV
+    if not has_symuses(op): return False
+    try: return bool(CV.completeness(op.split('.')[0], op, 'symuses')[0])
+    except Exception: return False

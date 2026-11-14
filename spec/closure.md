@@ -809,3 +809,58 @@ R_j(t) ≝ ∃ 其余端口. Φ_comp，即用户需求里“签名允许的最�
 - 修复后全量回归（logs/r93b，26 段 100 判据行）：总判定 PASS；可靠性字段全 0；已知数量阈值 FAIL 11 条与第 92 轮相同；cv2 计数与第 92 轮逐数相同。扩展方言 S1–S4、R1、R2 PASS（数字同第 92 轮）。运行中沙箱重置约 4 次，由断点续跑补齐。
 - 残差（logs/attr.json）：op 650，残差为空 461→464，条目 622→610。条目减少部分来自归因改桶（verifyWithRegions 原误记为“无源码”），不全是规范化增量。非 Transform 的可规范化残差：词汇 27、类型 CPred 4、属性 CPred 5、native trait 1，合计 37（第 92 轮口径 49）；另有符号使用义务 18 条（shard）未做。
 - 已知局限：类型原子运行时未定仍按上近似取真（未导入方言类型）；unranked getShape 的接收者静态类型只跟踪显式声明与 `auto x = cast<T>(…)`。
+
+### §9.31 第 94 轮：常量成员的等式关系分解 + 遗传关系的子集检查（判据写定于 2026-11-14 上午，运行前）
+- 动机（基线 work/dev94/pc_a.log，第 93 轮代码）：projcomp 段一 range3 unknown 245/15792；端口精确 1835、上近似 1329。抽查未定点：arith.addui_extended 的结果类型不由推断给出，是图中字面量，`same(lhs, rhs, sum=字面量)` 实际把 lhs、rhs 定为该字面量，但 project 只合并“全是端口”的等式，abstract_out 先读到未绑定的 rhs 就停，结果既不是精确也判不出 out。另有 math.fpowi、arith.select 的见证缺“t 为标量时取其余端口的元素类型 / i1”。
+- 机制（批量，不按 op）：
+  1. simplify：可传递的等式族（same、same_ops、elt_eq、elt_ops、elt_all、rank_eq、shape_eq）中有字面量成员 k 时，原子等价于“每个成员 F(e)=F(k)”，改写为逐成员一元原子（精确改写）；samec_all 以字面量结果为参照时同样精确分解。project 把“端口 = 字面量”的一元原子当作单值类（与第 84 轮单值类同一处理）。
+  2. abstract_out：两两型关系（上述各族及 shape_ops、shape_all、rank_all）对成员子集是遗传的（全体成立 ⇒ 任一子集成立），只在已绑定成员上求值，为假即 out。
+  3. 见证候选：t 为标量时补“其余端口原类型的元素类型”与 i1。只影响找见证，in 仍须 evaluate 为真并经 P4 核对。
+- 判据 W4（单段判定，不合计）：projcomp 两段（`4 125 0`、`4 1000 125`）各自 range3 unknown 相对同代码基线（pc_a 245、pc_b 1852，均为第 93 轮代码、改动前跑出；补记于 pc_b 完成后、改代码前）下降 ≥ 30%，且 P1/P4 不一致 0、P2/P5 违例 0。
+- 守卫：odscomp_test 两段 S1（化简≡原始）、S2、S3、S4 PASS；projexact_test Y1/Y2 可靠性字段 0。
+- 只报告：端口“精确”占比变化（需求 2 闭式表示的进展），不作判据。
+- 结果：**W4 FAIL**。段一 unknown 245→180（−26.5%，未达 30%）；段二 1852→1852（0%）。两段 P1/P4 不一致 0、P2/P5 违例 0（可靠性保持）。精确端口：段一 1835→1843，段二 2980→2982（只报告）。
+- 段一剩余未定逐条诊断（work/dev94/diag_a.log）：memref.store 值端口取 memref 时，见证须把 t 整体作 memref 的元素（候选里只有“装 t 的元素”）；arith.shrsi+trunci 等由 samec_all 把标量端口强制为同一类型、再由下游规则拒绝，现有抽象求值遇未绑定端口即停，推不出；vector.transfer_read 的结果类型是字面量，padding/source 被它间接定死。
+- 事后修复（W4 FAIL 后，判据不变，记为 W4'）：①强制取值传播（odscomp._propagate）：same/same_ops 有已绑定成员、samec_all 有已绑定标量成员、TypesMatchWith 源已绑定 ⇒ 目标类唯一确定，代入后再做抽象求值，见证搜索里该类只试这一个值；②见证候选补“t 整体作其余端口的元素”。
+- W4' 结果：段一 245→96（−60.8%）PASS；段二 1852→1841（−0.6%）FAIL（段二用 work/dev94/pc_diag.py，即 projcomp_test 加大示例条数、计数不变）。两段 P1/P4 不一致 0、P2/P5 违例 0。**W4' 总判定 FAIL（段二）**。
+- 段二剩余 1841 的主体是 vector/tensor/linalg 的 C++ verify（transfer_read 317、insert 137、insert_strided_slice 102、outerproduct 88、transfer_write 85、gather、from_elements、pack/unpack、concat…）：规则在读本端口前先读未绑定端口，第 88 轮的抽象求值在第一次读取时整条放弃。
+
+### §9.32 第 94 轮（续）：未绑定端口下的路径枚举（判据写定于 2026-11-14 上午，W5 运行前）
+- 机制：cppverify 解释器在控制器开启时，依赖未绑定端口的条件（if/for/while/assert）两边都走，依赖未绑定端口的局部变量记为未绑定，被中断的求值改写过的变量一律记为未绑定；在条件以外（表达式语句、return、范围 for、switch）读到未绑定端口 ⇒ 该原子不作结论。odscomp.abstract_out 对 nf 原子枚举全部路径（≤ 64 条，分支深度 ≤ 12），每条都拒绝 ⇒ out。可靠性论证：任一具体补全走的路径都在被枚举的路径之中；记为未绑定的变量只会让更多分支被走到。已知绕过：`type(x) is`、`x is None` 不触发读取（同 §9.28），由 P5 守卫。
+- 判据 W5（单段判定）：projcomp 两段 range3 unknown 相对 W4' 代码的数（段一 96、段二 1841）下降 ≥ 30%，且 P1/P4 不一致 0、P2/P5 违例 0。守卫同 §9.31（odscomp S1–S4、projexact Y1/Y2 可靠性字段 0），另加 cppverify 一段（控制器默认关闭，结果须与第 93 轮逐数相同）。
+- W5 首跑段一（work/dev94/w5_a_defect.log）含缺陷：_snap 对已记为未绑定的变量用 isinstance，触发哨兵，路径枚举在第二个条件处中断（结果 96，未变）。改用 type() 后重跑，记为正式结果。
+- W5 结果：段一 96→93（−3.1%）FAIL；段二 1841→1674（−9.1%）FAIL。两段 P1/P4 不一致 0、P2/P5 违例 0（段二 P5 检查 11946，比 W4' 多 167 个 out，违例 0）。**W5 FAIL**。
+- 原因：段二未定点约一半（842/1841）涉及第 66–76 轮手写的 Python nf 规则（transfer_read/write、insert_slice、pack/unpack 等），控制器只作用于解释执行的 C++，不覆盖 Python 规则；其余是某条路径接受（多为其实可连、见证没找到，如 vector.insert 的标量插入需要换低秩目标）或在条件以外读到未绑定端口。
+- 第 94 轮累计（相对第 93 轮代码）：段一 245→93（−62%），段二 1852→1674（−9.6%），两段合计 2097→1767（−15.7%）；可靠性字段全 0。精确端口占比基本不变（段一 1835→1843）。
+- 回归缺口补上：projcomp 此前不在 check_all 段表内（第 87/88/94 轮改动 range3 却没有全量守卫），本轮加入 pc1–pc3 三段。
+- 全量回归（logs/r94，第 94 轮代码）：原 25 段 VERDICT 行与 logs/r93b 逐行相同；新增 pc1/pc2 PASS（P1/P4 不一致 0，P2/P5 违例 0）。首次汇总 FAIL 仅因 pc3（400–1000）为空区间（比较 0），属段表设计错误，已删去该段后重新汇总（事后修复）：总判定 PASS，已知数量阈值 FAIL 11 同前。cppverify 五段与第 93 轮逐数相同。
+- 结论：可靠性未退化，但 W4、W5 增益判据均 FAIL；按第 91 轮先例，第 94 轮代码暂不合并 main，待用户决定路线。
+
+### §9.33 第 95 轮：verifySymbolUses 解释执行（shard 18 条符号使用义务；判据写定于 2026-11-14 午后，实现前）
+- 目标（需求 4、5）：SymbolUserOpInterface::verifySymbolUses 与 verify 同一条路径解释执行（扩词汇，不逐 op 手写），被引用符号由模型自身的最近符号表解析交给解释器；静态完备的 op 移出残差。
+- 判据 Z（新增 model/symuses_test.py，语料 corpus_ext/Shard 全部段 + 对 MLIR 接受段的变异：被引用 grid 的 shape、引用名、使用者的轴/设备/维属性）：
+  - Z1 完备：18 个 shard 使用者 completeness('symuses') 全部完备，残差中“符号使用义务”桶 18→0。
+  - Z2 不误拒：MLIR 接受的模块上，模型对任一使用者判拒 = 0。
+  - Z3 不漏判：MLIR 诊断出自 verifySymbolUses 源码字面量的模块，模型对该模块全部使用者都判过 = 0。
+  - Z4 无未定：完备 op 上解释器未定 = 0、Python 异常 = 0。
+  - 分母要求：变异比较 ≥ 200，其中 MLIR 拒绝 ≥ 50；不足即判 FAIL（不事后放宽）。
+
+#### §9.33 结果（第 95 轮，判据未通过）
+- 运行：`SU_OUT=work/dev95/su PYTHONPATH=model python3 model/symuses_test.py`（corpus_ext/Shard 15 个文件，96 段；invalid.mlir 80 段为解析期拒绝而跳过）。
+- Z1 PASS：18 个使用者全部完备。
+- Z2 PASS：比较 2061（变异 2046），MLIR 接受 805，误拒 0，文件崩溃 0。
+- Z3 FAIL：变异 MLIR 拒绝 1256，其中诊断出自 verifySymbolUses 501；模型判拒 497，漏判 0，因未定未判 4。
+- Z4 FAIL：完备 op 上未定 19（已记录的 14 例全部为整数除以零），未定合计 46（另 27 为 func.call 等不在本判据范围的使用者），Python 异常 0。
+- 事中修改（须披露）：首跑见 2 例 Z2 误拒（grid 某轴尺寸为 0 ⇒ 设备组大小 0 ⇒ C++ `%`/`/` 除以零；本机 AArch64 不陷入，MLIR 接受）。随后把 cppverify 全局的整数除零从“按崩溃计（判拒）”改为 CppUnknown（C++ 未定义行为，依平台）。该改动作用于全部 cppverify 路径，须全量回归。
+- 测试基础设施修正（非判定口径）：MLIR verify 在 fork 子进程跑（断言崩溃按拒绝计，60 s 超时不计入）；fork 前关闭 Context 多线程（否则子进程死锁）；模型侧只导入原样模块、变异施加于导入图属性文本（无效 IR 上 AsmState 会先跑 verifier 并断言崩溃）；irimport `_hidden_props` 改为 `assume_verified=True`；不变异 operandSegmentSizes/resultSegmentSizes。
+- 结论：未通过，symuses 暂不接入 structure.py 残差；odssig“符号使用义务未登记”桶仍为 18。待定：除零 UB 的建模口径。
+
+#### §9.33a 修订判据 Z'（写定于首跑 FAIL 之后、重跑之前；属事后修订，须披露）
+- 口径：整数除以零恢复第 94 轮及以前的全局口径“按崩溃计 ⇒ 判拒”，诊断标为 `\x00ub-div0`。理由：C++ 未定义行为，x86 上 MLIR 进程陷入崩溃；前端不得生成依赖平台的 IR；且不改动既有回归基线。
+- Z1、Z3、Z4 原文不变。
+- Z2'：MLIR 接受而模型判拒者，若模型的全部判拒理由均为 `ub-div0`，计入“平台 UB 桶”（单列报告，不计误拒）；其余判拒计误拒，须为 0。平台 UB 桶 ≤ 变异比较数的 1%，否则 FAIL。
+- 分母要求不变（变异比较 ≥ 200，MLIR 拒绝 ≥ 50）。
+
+#### §9.33a 结果
+- SU1 PASS 18/18；SU2(Z2') PASS 比较 2061，MLIR 接受 805，误拒 0，平台 UB 桶 4（上限 20.5）；SU3 PASS 501/501，未定 0；SU4 PASS 完备 op 未定 0（未定合计 27，均为判据范围外的 func.call 等）。
+- 接入：structure.py 义务 S6（解释执行 verifySymbolUses），odssig 对 symuses 完备的使用者移除“符号使用义务未登记”残差；S6 未定只记账（SYMUSES_UNDECIDED），不判拒。全量回归待 logs/r95。

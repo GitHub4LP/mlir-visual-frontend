@@ -349,7 +349,12 @@ def simplify(P):
     """返回新 Phi：常量原子求值（假 ⇒ ⊥）；同一表达式上的同名约束去重；全同表达式上的自反关系删去；属性原子不涉及端口的求值。"""
     Q = Phi(P.n); Q.residual = list(P.residual); Q.ground = list(P.ground); Q.bottom = P.bottom; Q.outs_e = getattr(P, 'outs_e', [])
     seen = set()
-    for a in P.atoms:
+    work = list(P.atoms)
+    while work:
+        a = work.pop(0)
+        if EQDEC and a[0] == 'rel':
+            d = _eqdecomp(a)
+            if d is not None: work[:0] = d; continue
         es = _aexprs(a)
         allx = es if a[0] != 'rel' else [e for g in a[3] for e in g] + a[4] + a[5] + _tterm_e(a)
         if not any(ports_of(e) for e in allx):               # 不依赖端口 ⇒ 常量（须连未引用的组一起不依赖端口，holds 才能在空 T 上求值）
@@ -369,6 +374,66 @@ def simplify(P):
             seen.add(k)
         Q.atoms.append(a)
     return Q
+
+EQDEC = True   # 第 94 轮（§9.31）
+_ELT = lambda t: t[2] if TS.shaped(t) else t
+_EQFEAT = {'same': lambda u, k: u == k, 'same_ops': lambda u, k: u == k,
+           'elt_eq': lambda u, k: _ELT(u) == _ELT(k), 'elt_ops': lambda u, k: _ELT(u) == _ELT(k), 'elt_all': lambda u, k: _ELT(u) == _ELT(k),
+           'rank_eq': lambda u, k: TS.ranked(u) and TS.ranked(k) and len(u[1]) == len(k[1]),
+           'shape_eq': lambda u, k: TS.ranked(u) and TS.ranked(k) and u[1] == k[1]}
+def _samec_k(u, k):
+    """MLIR verifySameOperandsAndResultType 逐个对照 result(0)；参照为字面量 k 时每个成员的条件与其余成员无关（编码：同为 tensor 时须等于 k 的编码）。"""
+    return _ELT(u) == _ELT(k) and TS.compat_shape(u, k) and u[0] == k[0] and (k[0] != 'tensor' or TS.encoding(u) == TS.encoding(k))
+def _members(a):
+    """两两型 ODS 关系的成员表达式与参照（samec_all）；部分模式或无参的命名关系 ⇒ None（不处理）。与 odssig.check 的取值方式一致。"""
+    k = a[1][0]; mini = a[2][2]; ni = len(mini['ins'])
+    if a[2][3]: return None
+    opd = [e for g in a[3][:ni] for e in g]; res = [e for g in a[3][ni:] for e in g]
+    if k in ('same_ops', 'elt_ops', 'shape_ops'): return opd, None
+    if k in ('elt_all', 'shape_all', 'rank_all'): return opd + res, None
+    if k == 'samec_all': return opd + res, (res or opd)[:1]
+    if k in ('same', 'elt_eq', 'rank_eq', 'shape_eq'):
+        if not a[1][1]: return None
+        return [e for g in _relgroups(a) for e in g], None
+    return None
+def _eqdecomp(a):
+    """可传递等式族有字面量成员 k（samec_all：字面量参照）⇒ 原子 ≡ ⋀ 成员 F(e)=F(k)。返回一元原子表或 None。"""
+    x = a[1][0]
+    if x not in _EQFEAT and x != 'samec_all': return None
+    m = _members(a)
+    if m is None or not m[0]: return None
+    mem, ref = m
+    if x == 'samec_all':
+        if not ref or ref[0][0] != 'k': return None
+        kt, f = ref[0][1], _samec_k
+    else:
+        ks = [e for e in mem if e[0] == 'k']
+        if not ks: return None
+        kt, f = ks[0][1], _EQFEAT[x]
+    return [('pred', f'{x}={TS.show(kt)}', (lambda t, kt=kt, f=f: isinstance(t, tuple) and bool(f(t, kt))), e, ('eqdec', x, kt)) for e in mem]
+
+def _hered_false(a, T):
+    """两两型关系对成员子集遗传：只在已绑定成员上求值（读到未绑定端口或无定义的成员跳过），为假 ⇒ 原子对一切补全为假。"""
+    m = _members(a) if a[0] == 'rel' else None
+    if m is None: return False
+    x = a[1][0]; mem, ref = m
+    vals = []
+    for e in mem:
+        try:
+            v = ev(e, T)
+            if isinstance(v, tuple): vals.append(v)
+        except (_Unbound, Exception): continue
+    if x == 'samec_all':
+        try:
+            r = ev(ref[0], T) if ref else None
+            r = r if isinstance(r, tuple) else None
+        except (_Unbound, Exception): r = None
+        if r is not None and any(not (_ELT(u) == _ELT(r) and TS.compat_shape(u, r) and u[0] == r[0]) for u in vals): return True
+        return len({TS.encoding(u) for u in vals if u[0] == 'tensor'}) > 1
+    if x in _EQFEAT: return any(not _EQFEAT[x](u, v) for u in vals for v in vals)
+    if x in ('shape_ops', 'shape_all'): return any(not TS.compat_shape(u, v) for i, u in enumerate(vals) for v in vals[i + 1:])
+    if x == 'rank_all': return len({len(u[1]) for u in vals if TS.ranked(u)}) > 1
+    return False
 
 def _label(a):
     if a[0] == 'pred': return a[1]
@@ -402,8 +467,9 @@ def _fixed(Q, cls):
     out = {}
     if not FIX_SINGLETON: return out
     for a in Q.atoms:
-        if a[0] == 'pred' and a[3][0] == 'p' and a[1] in SINGLETON:
-            c = cls[a[3][1]]; t = TS.parse(SINGLETON[a[1]].strip('()'))
+        eqk = a[0] == 'pred' and a[3][0] == 'p' and isinstance(a[4], tuple) and a[4][:1] == ('eqdec',) and a[4][1] in ('same', 'same_ops')   # 第 94 轮
+        if eqk or a[0] == 'pred' and a[3][0] == 'p' and a[1] in SINGLETON:
+            c = cls[a[3][1]]; t = a[4][2] if eqk else TS.parse(SINGLETON[a[1]].strip('()'))
             if out.get(c, t) != t: out[c] = None          # 两个不同的单值约束 ⇒ 该类为空；不作代入（保守地不消去）
             else: out[c] = t
     return {c: t for c, t in out.items() if t is not None}
@@ -573,12 +639,13 @@ def range3(Q, j, t, hints, maxw=1024):
     try: tp = TS.parse(t) if isinstance(t, str) else t
     except Exception: return ('unknown', None)
     if range_holds(Q, cls, rg, j, tp) is False: return ('out', None)
-    if ABS_OUT and abstract_out(Q, cls, j, tp): return ('out', None)
+    forced = {}
+    if ABS_OUT and abstract_out(Q, cls, j, tp, forced): return ('out', None)
     others = sorted({cls[i] for i in range(Q.n)} - {cls[j]})
     rep = {c: next(i for i in range(Q.n) if cls[i] == c) for c in others}
     T = exact_witness(Q, cls, j, tp, [hints[rep[cls[i]]] if cls[i] != cls[j] else None for i in range(Q.n)])
     if T is not None and evaluate(Q, T) is True: return ('in', [TS.show(x) for x in T])   # 与组合搜索一致：见证以类型文本返回
-    pools = [_wcands(hints[rep[c]], t, tp) for c in others]
+    pools = [[TS.show(forced[c])] if c in forced else _wcands(hints[rep[c]], t, tp) for c in others]   # 第 94 轮：强制类只有一个可能取值
     for k, combo in enumerate(itertools.product(*pools)):
         if k >= maxw: break
         asg = dict(zip(others, combo)) | {cls[j]: t}
@@ -599,18 +666,85 @@ class _U:
     def __class__(self): raise _Unbound()          # isinstance(U, X) 也触发（第 88 轮首跑 P5 违例：memref.distinct_objects 经 isinstance 绕过哨兵）
 UNBOUND = _U()
 ABS_OUT = True
-def abstract_out(Q, cls, j, tp):
+HERED = True   # 第 94 轮（§9.31）
+PATHS = True   # 第 94 轮（§9.32）
+def _all_paths_false(a, T, maxp=64):
+    """nf 原子（解释执行的 C++ verify）在未绑定端口下枚举全部路径：依赖未绑定端口的条件两边都走；每条路径都拒绝 ⇒ 对一切补全为假。
+    任何路径接受、未定、或在条件以外读到未绑定端口 ⇒ 不作结论。"""
+    import cppverify as CV
+    stack = [[]]; n = 0
+    while stack:
+        pre = stack.pop(); n += 1
+        if n > maxp: return False
+        ctl = CV._PathCtl(pre); CV.PATHCTL[0] = ctl
+        try: h = holds(a, T)
+        except _Unbound: return False
+        finally: CV.PATHCTL[0] = None
+        if h is not False: return False
+        stack.extend(ctl.alts)
+    return True
+FORCE = True   # 第 94 轮（§9.31 事后）
+def _bound(e, T):
+    """表达式在部分绑定的 T 下的值：读到未绑定端口或无定义 ⇒ None。"""
+    try:
+        v = ev(e, T)
+        return v if isinstance(v, tuple) else None
+    except (_Unbound, Exception): return None
+def _propagate(Q, cls, T, forced):
+    """强制取值：给定 t 后由函数依赖唯一确定的类。规则（每条都是“其余取值必为此值”，故代入不改变 ∃）：
+    same/same_ops：有已绑定成员 v ⇒ 未绑定的单端口成员 = v；samec_all：有已绑定非 shaped 成员 v ⇒ 各成员 = v（标量的兼容即相等）；
+    TypesMatchWith（非可选、两组各一个表达式）：源已绑定 ⇒ 目标单端口 = f(源)。"""
+    n = len(T)
+    def setc(c, v):
+        forced[c] = v
+        for i in range(n):
+            if cls[i] == c: T[i] = v
+    for _ in range(n + 1):
+        ch = False
+        for a in Q.atoms:
+            if a[0] != 'rel': continue
+            x = a[1][0]
+            if x in ('same', 'same_ops', 'samec_all'):
+                m = _members(a)
+                if m is None: continue
+                vals = [v for v in (_bound(e, T) for e in m[0]) if v is not None]
+                if not vals: continue
+                if x == 'samec_all':
+                    vals = [v for v in vals if not TS.shaped(v)]
+                    if not vals: continue
+                v = vals[0]
+                for e in m[0]:
+                    if e[0] == 'p' and cls[e[1]] not in forced and _bound(e, T) is None: setc(cls[e[1]], v); ch = True
+            elif x == 'match' and not a[1][4] and not a[2][3]:
+                g = _relgroups(a) if a[1][1] else []
+                if len(g) != 2 or len(g[0]) != 1 or len(g[1]) != 1 or g[1][0][0] != 'p': continue
+                c = cls[g[1][0][1]]
+                if c in forced or _bound(g[1][0], T) is not None: continue
+                src = _bound(g[0][0], T)
+                if src is None: continue
+                try: w = a[1][3](src)
+                except Exception: continue
+                if isinstance(w, tuple): setc(c, w); ch = True
+        if not ch: break
+    return forced
+
+def abstract_out(Q, cls, j, tp, forced=None):
     """其余类未绑定时的抽象求值：某原子在未读取任何未绑定端口的情况下得 False ⇒ 该原子对所有补全都为 False ⇒ out。
     读到未绑定端口 ⇒ 该原子不作结论（UNK）。只用 Φ 的全部原子（含 nf/C++ 解释规则），不读残差。"""
     fx = getattr(Q, '_fixed', {})
     ub = {}                                                   # 每个未绑定类一个实例：同类端口同一对象（容器比较的同一性捷径只在同类间成立）
     T = [tp if cls[i] == cls[j] else fx[cls[i]] if cls[i] in fx else ub.setdefault(cls[i], _U()) for i in range(Q.n)]
+    if FORCE: _propagate(Q, cls, T, forced if forced is not None else {})
     for a in Q.atoms:
         try:
             if holds(a, T) is False: return True
-        except _Unbound: continue
+        except _Unbound:
+            if HERED and _hered_false(a, T): return True
+            if PATHS and a[0] == 'rel' and a[1][0] == 'nf' and _all_paths_false(a, T): return True
+            continue
     return False
 
+SCALAR_W = True   # 第 94 轮（§9.31）
 TRANSPLANT = True   # 第 87 轮：见证候选加入“特征移植”——把 t 的元素类型/形状移植进其余端口的原类型（容器⇄元素、同形异元、i1 同形）
 def _wcands(h, t, tp):
     """其余端口的见证候选：原类型 h、t 本身（第 86 轮及以前只有这两个），再加特征移植。只用于找见证，'in' 仍须 evaluate 为真。"""
@@ -624,7 +758,9 @@ def _wcands(h, t, tp):
     if sh and st and tp[1] is not None:
         c.append((hp[0], tp[1], hp[2]) + (tp[3:] if hp[0] == tp[0] else ()))   # t 的形状装 h 的元素
     if not sh and st: c.append(TS.elt(tp))                          # 取 t 的元素
-    if st: c.append(TS.i1same(tp))                                  # 同形 i1（掩码、条件）
+    if sh and st and SCALAR_W: c.append(hp[:2] + (tp,) + hp[3:])     # 第 94 轮：t 整体作 h 的元素（memref 的元素可为 memref / vector）
+    if sh and not st and SCALAR_W: c.append(TS.elt(hp))             # 第 94 轮：t 为标量 ⇒ 其余端口取其元素（同为标量形态）
+    if st or SCALAR_W: c.append(TS.i1same(tp))                      # 同形 i1（掩码、条件）；第 94 轮起 t 为标量时即 i1
     for x in c:
         try: s_ = TS.show(x)
         except Exception: continue
