@@ -65,6 +65,6 @@ bash scripts/check_all.sh          # 25 段，2 CPU 约 3–4 小时，日志在
 - `type(x) is …` 类检查可绕过未绑定哨兵，仅由 P5 池穷举经验守卫。
 - 值层（常量、毒值、UB）冻结，不测；DataLayout 按默认；pack/unpack 值前提只认 arith.constant；Graph 区域副作用次序、无结果 op 未覆盖。
 - SUBST_MATCH 增益 0.7pp 未达 2pp 判据，仍开启（§9.26–9.27）。第 88 轮 W2 首跑 FAIL 后修复重判为 W2'（事后修复，§9.28）。
-- 第 95 轮 S6（shard verifySymbolUses 解释执行）：SU1 18/18 完备；SU2 比较 2061（MLIR 接受 805）误拒 0；SU3 verifySymbolUses 诊断 501 全部判拒；SU4 完备 op 未定 0。均为 corpus_ext/Shard 原样+变异上的经验保证。SU2 为首跑后修订的 Z2'（§9.33a）：整数除以零（C++ UB）判拒并标 `ub-div0`，AArch64 上 MLIR 不陷入而接受的 4 例单列“平台 UB 桶”、不计误拒；首跑时曾把除零改为未定，致 Z3/Z4 FAIL，后改回判拒口径（与第 94 轮及以前全局口径一致）。新增词汇（DimV、OtherOp、迭代器、lookupNearestSymbolFrom、成员模板、axisarray 等）与 `ok_t` 访问器豁免为手工近似，靠 SU2/SU3 守卫，非证明。S6 运行时若遇 CppUnknown 只记账、不判拒。
+- 第 95 轮 S6（shard verifySymbolUses 解释执行）：SU1 18/18 完备；SU2 比较 2061（MLIR 接受 805）误拒 0；SU3 verifySymbolUses 诊断 501 全部判拒；SU4 完备 op 未定 0。均为 corpus_ext/Shard 原样+变异上的经验保证。SU2 为首跑后修订的 Z2'（§9.33a）：整数除以零（C++ UB）判拒并标 `ub-div0`，首跑中 MLIR 接受的 4 例曾单列“平台 UB 桶”、不计误拒——第 98 轮查明这 4 例实为解释器复合赋值缺陷（`x += 0` 误触发除零），修复后桶为 0（§9.35）；首跑时曾把除零改为未定，致 Z3/Z4 FAIL，后改回判拒口径（与第 94 轮及以前全局口径一致）。新增词汇（DimV、OtherOp、迭代器、lookupNearestSymbolFrom、成员模板、axisarray 等）与 `ok_t` 访问器豁免为手工近似，靠 SU2/SU3 守卫，非证明。S6 运行时若遇 CppUnknown 只记账、不判拒。
 - 第 94 轮（EQDEC/HERED/SCALAR_W/FORCE/PATHS/PATHCTL）随第 95 轮一并合入：可靠性检验全 PASS，但预先写定的增益判据 W4/W5 均 FAIL（projcomp 段一未定 245→93、段二 1852→1674），pc3 因比较数为 0 事后删除；需求 2 的端口最大范围仍为逐点三值判定 + 公开未定率，不是闭式。
 

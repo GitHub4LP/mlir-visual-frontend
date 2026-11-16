@@ -871,3 +871,11 @@ R_j(t) ≝ ∃ 其余端口. Φ_comp，即用户需求里“签名允许的最�
 过程（如实）：首轮全量 logs/r96 中 cv1 C3 FAIL 未定 34、C5 计“误收”15（nvgpu.device_async_copy 遇 `#gpu.address_space`：`isa<gpu::AddressSpaceAttr>` 与 `getValue` 运行时 Unknown；该段 Unknown 计为未拒绝，故记作误收），修 `ns::X` 解析与 EnumAttr getValue 后终版全量 logs/r96b 总判定 PASS（已知数量阈值 FAIL 11，同前）。
 结果：残差为空 481→496，条目 592→577，非 Transform 词汇 27→12；区域段点未定 r2 2496→934、f2 2930→1368、r1 1167→1000、s2 746→683；projcomp 段一 unknown 93→90，段二 1674→1710（分母同增，占比 7.09%→7.07%，持平）。可靠性字段（误拒/误收/不一致/违例/漏判/未定）全 0。
 局限：上述均为手工词汇，依 C1–C5 经验守卫；递归深度、looks_decl、getName 放行为启发式；linalg.fill 带隐式区域不在 cppverify_test 取样内，只有定向差分（FillOpInterface 38 比较 0/0；完整模型对 MLIR 接受的 22 例无误拒，误收检查因区域取模板而偏弱）；新方言 ext 语料结果（NVGPU C5 比较 824 0/0）跑在终版前两处修复之前。未处理：arith.scaling_extf/truncf（模板元编程）、memref.transpose/subview/global、func.func 的 FunctionOpInterface 等 12 条词汇，区域结构类 56 条，Transform 约 495 条。需求 2（最大范围）仍为逐点三值+未定率，需求 4 仍部分完成。
+
+### §9.35 第 98 轮：cppverify 三处真缺陷修复（随试验 4 发现）
+- 缺陷 1（复合赋值先算全部分支）：`+= -= *= /=` 原用字典字面量求值，`/=` 分支在 `b == 0` 时也被求出，`x += 0` 即触发除零判拒（`ub-div0`）。改为逐项求值；其余复合运算符抛 CppUnknown（原为 KeyError），未扩展语义。
+- 缺陷 2（整数除法经浮点）：`/`、`%`、`/=` 原为 `int(a / b)`，|a| > 2^53 时失真。新增 `_tdiv`：纯 int 精确向零截断；浮点与 int 子类沿原路径。
+- 改动 3（非缺陷，等价改写）：`isa<方言 TypeDef>` 对内建类型（tensor/memref/vector/index/i/f/complex/tuple/none/fn）直接为假，与原按打印文本比较等价，免去转文本。
+- **更正 §9.33a**：§9.33a 的“平台 UB 桶”4 例（shard.all_slice ×2、shard.sharding ×2，grid 维为 0）并非 AArch64 平台 UB，而是缺陷 1：`numShards += gridShape[i]` 在 gridShape[i] = 0 时被误判除零。修复后 SU2 平台 UB 桶 4 → 0、误拒 0。Z2' 的事后修订因此掩盖了一个模型缺陷，今后不以“平台 UB”解释模型判拒，除非 MLIR 源码路径确有除零。
+- 验证：全量 logs/r98 总判定 PASS（判据行 112，已知数量阈值 FAIL 11 同前）；除 su 段外各段 VERDICT 行与 logs/r96b 逐字相同；su 段仅 SU2 平台 UB 桶 4 → 0。
+

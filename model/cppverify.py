@@ -880,6 +880,8 @@ def _isa(cls, x):
         import odsjson as O                      # 方言 ODS 类型（!shape.size 等）：按 TypeDef 的拼写判定
         m_ = re.fullmatch(r'(?:::)?(?:mlir::)?(\w+)::(\w+)', cls)
         ns = m_.group(1) if m_ else CUR['dia']
+        f = O._typedef_isa(ns, b) if ns else None
+        if f is not None and x[0] in ('tensor', 'memref', 'vector', 'index', 'i', 'f', 'complex', 'tuple', 'none', 'fn'): return False   # 第 98 轮：内建类型不是方言 TypeDef 的实例（与按打印文本比较等价，免去转文本）
         xo = x if x[0] == 'opaque' else ('opaque', TS.show(x))          # typesig 给部分方言类型专门的项（('shape.shape',)）：按打印文本比较
         f = O._typedef_isa(ns, b) if ns else None
         if f is not None: return f(xo)
@@ -1204,7 +1206,10 @@ class Interp:
             if e[1] == '=': v = self.ev(e[3], env)
             else:
                 a, b = _num(self.ev(e[2], env)), _num(self.ev(e[3], env))
-                v = {'+=': a + b, '-=': a - b, '*=': a * b, '/=': (int(a / b) if b else _div0())}[e[1]]
+                # 第 98 轮：逐项求值（原字典字面量会先算全部分支：x += 0 也触发除零判拒）；整数除法按 C++ 截断、不经浮点
+                op_ = e[1]
+                if op_ not in ('+=', '-=', '*=', '/='): raise CppUnknown(f'复合赋值 {op_}')
+                v = a + b if op_ == '+=' else a - b if op_ == '-=' else a * b if op_ == '*=' else _tdiv(a, b)
             self.store(e[2], v, env); return v
         if k == 'cast_c':
             v_ = self.ev(e[2], env)
@@ -1303,8 +1308,8 @@ class Interp:
         if op == '+': return a + b
         if op == '-': return a - b
         if op == '*': return a * b
-        if op == '/': return int(a / b) if b else _div0()
-        if op == '%': return (a - int(a / b) * b) if b else _div0()
+        if op == '/': return _tdiv(a, b)
+        if op == '%': return a - _tdiv(a, b) * b
         if op == '&': return a & b
         if op == '|': return a | b
         if op == '^': return a ^ b
@@ -2129,6 +2134,12 @@ def _params(txt):
     return out
 
 def _crash(): raise _Crash(Diag('\x00crash'))
+def _tdiv(a, b):
+    # C++ 整数除法向零截断；纯 int 用精确整数运算（int(a / b) 经浮点，|a| > 2^53 时失真）；浮点与 int 子类保持原路径
+    if not b: _div0()
+    if type(a) in (int, bool) and type(b) in (int, bool):
+        q = abs(a) // abs(b); return q if (a < 0) == (b < 0) else -q
+    return int(a / b)
 def _div0(): raise _Crash(Diag('\x00ub-div0'))   # 第 95 轮（§9.33a）：整数除零 = C++ UB；同崩溃口径判拒，诊断单独标记
 def _num(v):
     if isinstance(v, bool): return int(v)
